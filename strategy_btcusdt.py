@@ -8,11 +8,19 @@ Architecture:
   MTF  (4H)       → intermediate setup quality
   LTF  (1H)       → entry timing + volume confirmation
   OI              → positioning pressure (synthetic, realistic)
-  Funding         → contrarian sentiment
+  Funding         → real from Binance Vision CDN (fallback: synthetic)
   Cyclicality     → seasonal edge (monthly + DoW)
 
+Data sources:
+  1H OHLCV  : Binance Vision CDN (real BTCUSDT perp, 2022-present)
+  4H        : resampled from 1H
+  1D / 1W   : Yahoo Finance (4 years, macro context)
+  Funding   : Binance Vision CDN (real, 8-hourly)
+  OI        : synthetic (no long-history free source)
+
 Run:
-  python strategy_btcusdt.py [--no-charts]
+  python strategy_btcusdt.py [--no-charts] [--no-report] [--mc-sims N]
+                             [--quick]  # skip WFO for fast iteration
 """
 from __future__ import annotations
 
@@ -30,12 +38,15 @@ import pandas as pd
 # ── Local modules ──────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.strategy.data_fetcher  import fetch_all_timeframes, generate_oi, generate_funding
-from src.strategy.indicators    import add_indicators
-from src.strategy.signals       import build_signal_matrix
-from src.strategy.engine        import run_backtest, INIT_CAP
+from src.strategy.data_fetcher   import (fetch_extended_data, fetch_real_funding,
+                                          generate_oi, generate_funding,
+                                          fetch_all_timeframes)
+from src.strategy.indicators     import add_indicators
+from src.strategy.signals        import build_signal_matrix
+from src.strategy.engine         import run_backtest, INIT_CAP
 from src.strategy.optimizer      import run_comparison
 from src.strategy.monte_carlo    import run_monte_carlo, mc_summary_table
+from src.strategy.walk_forward   import run_walk_forward
 from src.strategy.leverage_study import run_leverage_grid, best_configs, STUDY_SCENARIOS
 from src.strategy.report         import generate_pdf, TOP3_SCENARIOS
 from src.strategy import analytics as ana
@@ -55,7 +66,6 @@ def _banner(title: str):
 
 
 def _print_kpis(kpis: dict):
-    """Pretty-print the backtest KPI block."""
     _hline()
     print(f"  {'PERFORMANCE SUMMARY':^64}")
     _hline()
@@ -102,41 +112,60 @@ def main():
                     help="Skip unified PDF report generation")
     ap.add_argument("--mc-sims", type=int, default=1000,
                     help="Number of Monte Carlo simulations (default: 1000)")
+    ap.add_argument("--quick", action="store_true",
+                    help="Skip walk-forward (faster iteration)")
     args = ap.parse_args()
 
+    STEPS = 13
     t0 = time.time()
-    _banner("BTCUSDT Multi-Timeframe Quant Strategy")
+    _banner("BTCUSDT Multi-Timeframe Quant Strategy  [2022 – present]")
 
-    # ── 1. Data ──────────────────────────────────────────────────────────────
-    print("\n[1/10] Fetching OHLCV data …")
-    tf_data = fetch_all_timeframes("BTC-USD")
-    if "1H" not in tf_data or len(tf_data["1H"]) < 50:
+    # ── 1. Extended data (Binance Vision + yfinance) ─────────────────────────
+    print(f"\n[1/{STEPS}] Fetching 2-year multi-TF dataset …")
+    try:
+        tf_data = fetch_extended_data(start_year=2022, start_month=1, workers=8)
+    except Exception as e:
+        print(f"  ⚠ fetch_extended_data failed ({e}), falling back to yfinance")
+        tf_data = fetch_all_timeframes("BTC-USD")
+
+    if "1H" not in tf_data or len(tf_data["1H"]) < 200:
         sys.exit("ERROR: Insufficient 1H data. Check internet connection.")
 
-    # ── 2. Indicators ────────────────────────────────────────────────────────
-    print("\n[2/10] Computing technical indicators …")
-    for tf in tf_data:
-        tf_data[tf] = add_indicators(tf_data[tf])
+    df_1h_full = tf_data["1H"]
+    print(f"\n  1H dataset: {len(df_1h_full):,} bars  "
+          f"[{df_1h_full.index[0].date()} → {df_1h_full.index[-1].date()}]")
 
-    # Synthetic OI and funding on the daily timeframe
-    oi_df   = generate_oi(tf_data["1D"]["close"])
-    funding = generate_funding(tf_data["1D"]["close"])
+    # ── 2. Indicators ────────────────────────────────────────────────────────
+    print(f"\n[2/{STEPS}] Computing technical indicators …")
+    for tf in tf_data:
+        if not tf_data[tf].empty:
+            tf_data[tf] = add_indicators(tf_data[tf])
+
+    # ── 3. OI + Funding ─────────────────────────────────────────────────────
+    print(f"\n[3/{STEPS}] Loading OI and funding data …")
+    oi_df = generate_oi(tf_data["1D"]["close"])
     print(f"  OI range: ${oi_df['oi'].min()/1e9:.1f}B – ${oi_df['oi'].max()/1e9:.1f}B")
 
-    # ── 3. Signals ───────────────────────────────────────────────────────────
-    print("\n[3/10] Building multi-timeframe signal matrix …")
+    funding, is_real = fetch_real_funding(df_1h_full, tf_data["1D"])
+    src_label = "Binance Vision (real)" if is_real else "synthetic (fallback)"
+    print(f"  Funding : {src_label}  "
+          f"mean={funding.mean()*100:.4f}%  "
+          f"range=[{funding.min()*100:.3f}%, {funding.max()*100:.3f}%]")
+
+    # ── 4. Signals ───────────────────────────────────────────────────────────
+    print(f"\n[4/{STEPS}] Building multi-timeframe signal matrix …")
     signals = build_signal_matrix(tf_data, oi_df, funding)
 
     n_long    = int((signals["signal"] == 1).sum())
     n_short   = int((signals["signal"] == -1).sum())
     n_neutral = int((signals["signal"] == 0).sum())
-    print(f"  Signals on 1H index: {len(signals)} bars")
+    print(f"  Signals on 1H index: {len(signals):,} bars")
     print(f"  Long={n_long}  Short={n_short}  Neutral={n_neutral}")
     print(f"  Composite range: [{signals['composite'].min():.1f}, "
           f"{signals['composite'].max():.1f}]")
 
-    # ── 4. Backtest ──────────────────────────────────────────────────────────
-    print("\n[4/10] Running backtest …")
+    # ── 5. Baseline backtest (full dataset) ──────────────────────────────────
+    print(f"\n[5/{STEPS}] Running baseline backtest (full dataset) …")
     bt = run_backtest(tf_data["1H"], signals)
 
     _print_kpis(bt["kpis"])
@@ -150,8 +179,8 @@ def main():
             print(f"    {reason:<15}  {len(grp):>3} trades  "
                   f"ΣPnL=${pnl_sum:+,.0f}")
 
-    # ── 5. Analytics ─────────────────────────────────────────────────────────
-    print("\n[5/10] Running statistical analysis …")
+    # ── 6. Analytics ─────────────────────────────────────────────────────────
+    print(f"\n[6/{STEPS}] Running statistical analysis …")
 
     fwd_returns = ana.forward_returns(tf_data["1H"])
     decay_df    = ana.alpha_decay(signals, fwd_returns)
@@ -160,7 +189,6 @@ def main():
     dow_seas    = ana.dow_seasonality(tf_data["1D"]["close"])
     hour_seas   = ana.hour_seasonality(tf_data["1H"]["close"])
     cycles_df   = ana.detect_cycles(tf_data["1D"]["close"])
-    rolling     = ana.compute_rolling_metrics(bt["equity"])
     month_pnl   = ana.monthly_pnl(bt["equity"])
     regime_df   = ana.regime_stats(trades)
     sess_df     = ana.session_stats(trades)
@@ -180,7 +208,6 @@ def main():
         "score_out":      score_out,
     }
 
-    # Print alpha-decay summary
     print("\n  Alpha-Decay (Long signals) – mean fwd return vs horizon:")
     long_decay = decay_df[decay_df["signal"] == "Long"].sort_values("horizon_h")
     for _, row in long_decay.iterrows():
@@ -189,11 +216,6 @@ def main():
         print(f"    {row['horizon_h']:>3}h  {row['mean_ret']*100:+.3f}%  "
               f"IC={row['IC_spearman']:+.3f}  p={row['p_value']:.3f} {sig}  {bar}")
 
-    print("\n  Top dominant cycles (daily bars):")
-    for _, row in cycles_df.head(5).iterrows():
-        print(f"    Period={row['period_bars']:.1f} bars  "
-              f"Amplitude={row['amplitude']:.4f}")
-
     print("\n  Monthly seasonality (historical avg):")
     for month_name, row in month_seas.iterrows():
         bar = "▪" * max(0, int(row["avg_ret"] * 500))
@@ -201,15 +223,14 @@ def main():
         print(f"    {month_name:<4}  {row['avg_ret']*100:+.2f}%  "
               f"{'▸' if row['avg_ret'] > 0 else '◂'}{bar}{neg}")
 
-    # ── 6. Scenario comparison ───────────────────────────────────────────────
-    print("\n[6/10] Running improvement scenario comparison …")
+    # ── 7. Scenario comparison ───────────────────────────────────────────────
+    print(f"\n[7/{STEPS}] Running scenario comparison …")
     comp_df, results_store = run_comparison(tf_data["1H"], signals)
 
     print("\n  Scenario Comparison:")
     _hline()
-    # Print a concise comparison table
-    key_cols = ["# Trades", "Win Rate (%)", "Total Ret (%)", "Sharpe",
-                "Max DD (%)", "Profit Factor", "Final Equity ($)"]
+    key_cols  = ["# Trades", "Win Rate (%)", "Total Ret (%)", "Sharpe",
+                 "Max DD (%)", "Profit Factor", "Final Equity ($)"]
     available = [c for c in key_cols if c in comp_df.columns]
     print(f"  {'Scenario':<22}", end="")
     for col in available:
@@ -219,13 +240,12 @@ def main():
     for scenario, row in comp_df.iterrows():
         print(f"  {scenario:<22}", end="")
         for col in available:
-            val = row.get(col, 0)
-            print(f"  {val:>16}", end="")
+            print(f"  {row.get(col, 0):>16}", end="")
         print()
     _hline()
 
-    # ── 7. Monte Carlo simulation ─────────────────────────────────────────────
-    print(f"\n[7/10] Running Monte Carlo ({args.mc_sims:,} simulations) …")
+    # ── 8. Monte Carlo (in-sample, Top-3 scenarios) ──────────────────────────
+    print(f"\n[8/{STEPS}] Running Monte Carlo ({args.mc_sims:,} sims, in-sample) …")
     mc_store: dict = {}
     init_cap = INIT_CAP
     for sc_name in TOP3_SCENARIOS:
@@ -253,20 +273,50 @@ def main():
         print(summ.to_string())
         _hline()
 
-    # ── 9. Leverage & Sizing Grid ────────────────────────────────────────────
-    print("\n[9/10] Running leverage × sizing grid "
+    # ── 9. Walk-Forward Validation ───────────────────────────────────────────
+    wf_result: dict = {}
+    if not args.quick:
+        print(f"\n[9/{STEPS}] Running walk-forward validation …")
+        print(f"  (train=6m, test=2m, step=2m, scenario=Session 08-21)")
+        wf_result = run_walk_forward(
+            df_1h          = tf_data["1H"],
+            signals_full   = signals,
+            scenario_name  = "Session 08-21",
+            train_months   = 6,
+            test_months    = 2,
+            step_months    = 2,
+            initial_capital = init_cap,
+        )
+    else:
+        print(f"\n[9/{STEPS}] Walk-forward skipped (--quick).")
+
+    # ── 10. MC on OOS trades ─────────────────────────────────────────────────
+    wf_mc: dict = {}
+    if wf_result and not wf_result.get("all_oos_trades", pd.DataFrame()).empty:
+        print(f"\n[10/{STEPS}] Running Monte Carlo on OOS trades …")
+        oos_tr = wf_result["all_oos_trades"]
+        wf_mc  = run_monte_carlo(oos_tr, initial_capital=init_cap, n_sims=args.mc_sims)
+        p50_r  = float(np.percentile(wf_mc["total_return"] * 100, 50))
+        p5_r   = float(np.percentile(wf_mc["total_return"] * 100, 5))
+        p95_r  = float(np.percentile(wf_mc["total_return"] * 100, 95))
+        print(f"  OOS MC: Ret p50={p50_r:+.1f}%  [p5={p5_r:+.1f}%, p95={p95_r:+.1f}%]  "
+              f"P(profit)={wf_mc['p_profit']:.1%}  P(ruin)={wf_mc['p_ruin']:.1%}")
+    else:
+        print(f"\n[10/{STEPS}] OOS MC skipped (no OOS trades).")
+
+    # ── 11. Leverage & Sizing Grid ───────────────────────────────────────────
+    print(f"\n[11/{STEPS}] Running leverage × sizing grid "
           "(2 methods × 4 risk levels × 3 leverage) …")
     lev_comp_df, lev_equity_store = run_leverage_grid(tf_data["1H"], signals)
 
     print("\n  Top-5 configurations by Sharpe:")
     _hline()
-    top5 = best_configs(lev_comp_df, n=5)
-    print(top5.to_string())
+    print(best_configs(lev_comp_df, n=5).to_string())
     _hline()
 
-    # ── 8. PNG Charts ────────────────────────────────────────────────────────
+    # ── 12. PNG Charts ───────────────────────────────────────────────────────
     if not args.no_charts:
-        print("\n[8/10] Generating individual PNG charts …")
+        print(f"\n[12/{STEPS}] Generating individual PNG charts …")
         saved = chrt.generate_all(
             tf_data   = tf_data,
             signals   = signals,
@@ -277,11 +327,11 @@ def main():
         )
         print(f"  {len(saved)} charts saved to: reports/charts/")
     else:
-        print("\n[8/10] PNG charts skipped (--no-charts).")
+        print(f"\n[12/{STEPS}] PNG charts skipped (--no-charts).")
 
-    # ── 8. Unified PDF Report ─────────────────────────────────────────────────
+    # ── 13. Unified PDF Report ────────────────────────────────────────────────
     if not args.no_report:
-        print("\n[10/10] Generating unified PDF report …")
+        print(f"\n[13/{STEPS}] Generating unified PDF report …")
         pdf_path = generate_pdf(
             tf_data          = tf_data,
             signals          = signals,
@@ -295,14 +345,19 @@ def main():
             lev_comp_df      = lev_comp_df,
             lev_equity_store = lev_equity_store,
             lev_scenario     = "Session 08-21",
+            wf_result        = wf_result if wf_result else None,
             output_path      = "reports/BTCUSDT_Strategy_Report.pdf",
         )
         print(f"  PDF report saved to: {pdf_path}")
     else:
-        print("\n[10/10] PDF report skipped (--no-report).")
+        print(f"\n[13/{STEPS}] PDF report skipped (--no-report).")
 
     elapsed = time.time() - t0
-    _banner(f"Done in {elapsed:.1f}s  ·  Report: reports/BTCUSDT_Strategy_Report.pdf")
+    bars_1h  = len(tf_data["1H"])
+    date_range = (f"{tf_data['1H'].index[0].date()} → "
+                  f"{tf_data['1H'].index[-1].date()}")
+    _banner(f"Done in {elapsed:.1f}s  ·  {bars_1h:,} 1H bars [{date_range}]"
+            f"  ·  Report: reports/BTCUSDT_Strategy_Report.pdf")
 
     return {
         "tf_data":           tf_data,
@@ -314,6 +369,8 @@ def main():
         "comp_df":           comp_df,
         "results_store":     results_store,
         "mc_store":          mc_store,
+        "wf_result":         wf_result,
+        "wf_mc":             wf_mc,
         "lev_comp_df":       lev_comp_df,
         "lev_equity_store":  lev_equity_store,
     }

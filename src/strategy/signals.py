@@ -200,11 +200,12 @@ STRONG_THRESH = 8.0
 
 def _align(signal: pd.Series, target_index: pd.DatetimeIndex) -> np.ndarray:
     """Forward-fill a higher-TF signal to the target (1H) index."""
-    s_df = (signal.reset_index()
-                  .rename(columns={signal.index.name or "index": "ts",
-                                   signal.name: "v"})
-                  .sort_values("ts"))
-    base = pd.DataFrame({"ts": target_index})
+    # Normalise both sides to second precision to avoid ms-vs-s merge errors
+    # (Binance Vision returns datetime64[s], yfinance returns datetime64[ms/ns])
+    tgt = target_index.astype("datetime64[s]")
+    sig_idx = pd.DatetimeIndex(signal.index).astype("datetime64[s]")
+    s_df = pd.DataFrame({"ts": sig_idx, "v": signal.values}).sort_values("ts")
+    base = pd.DataFrame({"ts": tgt})
     merged = pd.merge_asof(base, s_df, on="ts", direction="backward")
     return merged["v"].fillna(0.0).to_numpy()
 
