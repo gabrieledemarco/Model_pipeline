@@ -374,7 +374,100 @@ def fetch_real_funding(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Synthetic OI (unchanged – no long-history free source)
+# Binance Vision – Premium Index Klines (basis = futures - spot index)
+# Available since 2020-01, 1H granularity, no API key required.
+# Replaces synthetic OI: basis direction + price direction → real positioning signal.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PREMIUM_COLS = [
+    "open_time", "open", "high", "low", "close", "volume",
+    "close_time", "quote_vol", "n_trades",
+    "taker_buy_base", "taker_buy_quote", "ignore",
+]
+
+
+def _fetch_premium_month(year: int, month: int) -> Optional[pd.Series]:
+    """Fetch one month of premiumIndexKlines (close = basis ratio at bar close)."""
+    cache = _ensure_cache() / f"BTCUSDT-premium-{year}-{month:02d}.parquet"
+    if cache.exists():
+        return pd.read_parquet(cache)["premium"]
+
+    url = (f"{BVISION}/premiumIndexKlines/BTCUSDT/1h/"
+           f"BTCUSDT-1h-{year}-{month:02d}.zip")
+    data = _get_zip(url)
+    if data is None:
+        return None
+
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        raw = z.open(z.namelist()[0]).read()
+        first = raw.split(b"\n")[0].decode(errors="ignore").strip()
+        skip = 0 if first and first[0].isdigit() else 1
+        df = pd.read_csv(io.BytesIO(raw), header=None,
+                         names=PREMIUM_COLS, skiprows=skip)
+
+    df["ts"] = pd.to_datetime(df["open_time"].astype("int64"), unit="ms")
+    df = df.set_index("ts")[["close"]].rename(columns={"close": "premium"}).astype(float)
+    df.index = df.index.tz_localize(None).astype("datetime64[s]")
+    df.to_parquet(cache)
+    return df["premium"]
+
+
+def fetch_binance_vision_premium(
+    start_year: int = 2022,
+    start_month: int = 1,
+    end_year: Optional[int] = None,
+    end_month: Optional[int] = None,
+) -> pd.Series:
+    """
+    Real BTCUSDT basis (premium index, 1H) from Binance Vision.
+    Values are the fractional premium of futures price over spot index.
+    Positive = futures at premium (longs paying), negative = discount (shorts paying).
+    Returns empty Series on complete failure.
+    """
+    now = datetime.now()
+    if end_year is None:
+        end_year = now.year
+    if end_month is None:
+        end_month = now.month - 1 or 12
+
+    months = _months_range(start_year, start_month, end_year, end_month)
+    parts = []
+    for y, m in months:
+        s = _fetch_premium_month(y, m)
+        if s is not None:
+            parts.append(s)
+
+    if not parts:
+        return pd.Series(dtype=float, name="premium")
+
+    out = pd.concat(parts).sort_index()
+    out = out[~out.index.duplicated(keep="first")]
+    return out
+
+
+def fetch_real_oi(
+    df_1h: pd.DataFrame,
+) -> Tuple[pd.Series, bool]:
+    """
+    Fetch real basis (premiumIndexKlines) from Binance Vision as an OI proxy.
+    Returns (premium_1h_series, is_real).
+    Falls back to empty Series if download fails.
+    """
+    if df_1h.empty:
+        return pd.Series(dtype=float, name="premium"), False
+
+    start = df_1h.index[0]
+    premium = fetch_binance_vision_premium(
+        start_year=start.year, start_month=start.month)
+
+    if premium.empty or len(premium) < 100:
+        return pd.Series(dtype=float, name="premium"), False
+
+    return premium, True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Synthetic OI (kept as fallback – no free long-history source for raw OI)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_oi(price_series: pd.Series, seed: int = 42) -> pd.DataFrame:

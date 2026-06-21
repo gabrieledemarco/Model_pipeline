@@ -7,7 +7,7 @@ Architecture:
   HTF  (1W / 1D)  → macro regime + primary trend bias
   MTF  (4H)       → intermediate setup quality
   LTF  (1H)       → entry timing + volume confirmation
-  OI              → positioning pressure (synthetic, realistic)
+  OI/Basis        → real premiumIndexKlines basis from Binance Vision (fallback: synthetic)
   Funding         → real from Binance Vision CDN (fallback: synthetic)
   Cyclicality     → seasonal edge (monthly + DoW)
 
@@ -16,7 +16,7 @@ Data sources:
   4H        : resampled from 1H
   1D / 1W   : Yahoo Finance (4 years, macro context)
   Funding   : Binance Vision CDN (real, 8-hourly)
-  OI        : synthetic (no long-history free source)
+  OI/Basis  : Binance Vision premiumIndexKlines 1H (real, since 2020; fallback: synthetic)
 
 Run:
   python strategy_btcusdt.py [--no-charts] [--no-report] [--mc-sims N]
@@ -39,7 +39,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.strategy.data_fetcher   import (fetch_extended_data, fetch_real_funding,
-                                          generate_oi, generate_funding,
+                                          fetch_real_oi, generate_oi, generate_funding,
                                           fetch_all_timeframes)
 from src.strategy.indicators     import add_indicators
 from src.strategy.signals        import build_signal_matrix
@@ -141,10 +141,21 @@ def main():
         if not tf_data[tf].empty:
             tf_data[tf] = add_indicators(tf_data[tf])
 
-    # ── 3. OI + Funding ─────────────────────────────────────────────────────
-    print(f"\n[3/{STEPS}] Loading OI and funding data …")
+    # ── 3. OI (real basis) + Funding ────────────────────────────────────────
+    print(f"\n[3/{STEPS}] Loading OI (basis) and funding data …")
+
+    # Real basis from premiumIndexKlines (replaces synthetic OI)
+    premium_1h, oi_is_real = fetch_real_oi(df_1h_full)
+    oi_label = "Binance Vision premiumIndex (real basis)" if oi_is_real else "synthetic (fallback)"
+    print(f"  OI/Basis: {oi_label}", end="")
+    if oi_is_real:
+        print(f"  bars={len(premium_1h):,}  "
+              f"range=[{premium_1h.min()*100:.3f}%, {premium_1h.max()*100:.3f}%]")
+    else:
+        print()
+
+    # Keep synthetic OI DataFrame for fallback path in build_signal_matrix
     oi_df = generate_oi(tf_data["1D"]["close"])
-    print(f"  OI range: ${oi_df['oi'].min()/1e9:.1f}B – ${oi_df['oi'].max()/1e9:.1f}B")
 
     funding, is_real = fetch_real_funding(df_1h_full, tf_data["1D"])
     src_label = "Binance Vision (real)" if is_real else "synthetic (fallback)"
@@ -154,7 +165,8 @@ def main():
 
     # ── 4. Signals ───────────────────────────────────────────────────────────
     print(f"\n[4/{STEPS}] Building multi-timeframe signal matrix …")
-    signals = build_signal_matrix(tf_data, oi_df, funding)
+    signals = build_signal_matrix(tf_data, oi_df, funding,
+                                  premium_1h=premium_1h if oi_is_real else None)
 
     n_long    = int((signals["signal"] == 1).sum())
     n_short   = int((signals["signal"] == -1).sum())
