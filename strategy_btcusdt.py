@@ -34,9 +34,10 @@ from src.strategy.data_fetcher  import fetch_all_timeframes, generate_oi, genera
 from src.strategy.indicators    import add_indicators
 from src.strategy.signals       import build_signal_matrix
 from src.strategy.engine        import run_backtest, INIT_CAP
-from src.strategy.optimizer     import run_comparison
-from src.strategy.monte_carlo   import run_monte_carlo, mc_summary_table
-from src.strategy.report        import generate_pdf, TOP3_SCENARIOS
+from src.strategy.optimizer      import run_comparison
+from src.strategy.monte_carlo    import run_monte_carlo, mc_summary_table
+from src.strategy.leverage_study import run_leverage_grid, best_configs, STUDY_SCENARIOS
+from src.strategy.report         import generate_pdf, TOP3_SCENARIOS
 from src.strategy import analytics as ana
 from src.strategy import charts   as chrt
 
@@ -252,6 +253,17 @@ def main():
         print(summ.to_string())
         _hline()
 
+    # ── 9. Leverage & Sizing Grid ────────────────────────────────────────────
+    print("\n[9/10] Running leverage × sizing grid "
+          "(2 methods × 4 risk levels × 3 leverage) …")
+    lev_comp_df, lev_equity_store = run_leverage_grid(tf_data["1H"], signals)
+
+    print("\n  Top-5 configurations by Sharpe:")
+    _hline()
+    top5 = best_configs(lev_comp_df, n=5)
+    print(top5.to_string())
+    _hline()
+
     # ── 8. PNG Charts ────────────────────────────────────────────────────────
     if not args.no_charts:
         print("\n[8/10] Generating individual PNG charts …")
@@ -271,16 +283,19 @@ def main():
     if not args.no_report:
         print("\n[10/10] Generating unified PDF report …")
         pdf_path = generate_pdf(
-            tf_data       = tf_data,
-            signals       = signals,
-            oi_df         = oi_df,
-            funding       = funding,
-            bt_baseline   = bt,
-            analytics     = analytics_bundle,
-            comp_df       = comp_df,
-            results_store = results_store,
-            mc_store      = mc_store if mc_store else None,
-            output_path   = "reports/BTCUSDT_Strategy_Report.pdf",
+            tf_data          = tf_data,
+            signals          = signals,
+            oi_df            = oi_df,
+            funding          = funding,
+            bt_baseline      = bt,
+            analytics        = analytics_bundle,
+            comp_df          = comp_df,
+            results_store    = results_store,
+            mc_store         = mc_store if mc_store else None,
+            lev_comp_df      = lev_comp_df,
+            lev_equity_store = lev_equity_store,
+            lev_scenario     = "Session 08-21",
+            output_path      = "reports/BTCUSDT_Strategy_Report.pdf",
         )
         print(f"  PDF report saved to: {pdf_path}")
     else:
@@ -290,15 +305,17 @@ def main():
     _banner(f"Done in {elapsed:.1f}s  ·  Report: reports/BTCUSDT_Strategy_Report.pdf")
 
     return {
-        "tf_data":       tf_data,
-        "signals":       signals,
-        "oi_df":         oi_df,
-        "funding":       funding,
-        "backtest":      bt,
-        "analytics":     analytics_bundle,
-        "comp_df":       comp_df,
-        "results_store": results_store,
-        "mc_store":      mc_store,
+        "tf_data":           tf_data,
+        "signals":           signals,
+        "oi_df":             oi_df,
+        "funding":           funding,
+        "backtest":          bt,
+        "analytics":         analytics_bundle,
+        "comp_df":           comp_df,
+        "results_store":     results_store,
+        "mc_store":          mc_store,
+        "lev_comp_df":       lev_comp_df,
+        "lev_equity_store":  lev_equity_store,
     }
 
 
