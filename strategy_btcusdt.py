@@ -34,6 +34,8 @@ from src.strategy.data_fetcher  import fetch_all_timeframes, generate_oi, genera
 from src.strategy.indicators    import add_indicators
 from src.strategy.signals       import build_signal_matrix
 from src.strategy.engine        import run_backtest
+from src.strategy.optimizer     import run_comparison
+from src.strategy.report        import generate_pdf
 from src.strategy import analytics as ana
 from src.strategy import charts   as chrt
 
@@ -93,20 +95,22 @@ def _print_regime(trades: pd.DataFrame):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-charts", action="store_true",
-                    help="Skip chart generation (faster)")
+                    help="Skip individual PNG chart generation")
+    ap.add_argument("--no-report", action="store_true",
+                    help="Skip unified PDF report generation")
     args = ap.parse_args()
 
     t0 = time.time()
     _banner("BTCUSDT Multi-Timeframe Quant Strategy")
 
     # ── 1. Data ──────────────────────────────────────────────────────────────
-    print("\n[1/6] Fetching OHLCV data …")
+    print("\n[1/8] Fetching OHLCV data …")
     tf_data = fetch_all_timeframes("BTC-USD")
     if "1H" not in tf_data or len(tf_data["1H"]) < 50:
         sys.exit("ERROR: Insufficient 1H data. Check internet connection.")
 
     # ── 2. Indicators ────────────────────────────────────────────────────────
-    print("\n[2/6] Computing technical indicators …")
+    print("\n[2/8] Computing technical indicators …")
     for tf in tf_data:
         tf_data[tf] = add_indicators(tf_data[tf])
 
@@ -116,7 +120,7 @@ def main():
     print(f"  OI range: ${oi_df['oi'].min()/1e9:.1f}B – ${oi_df['oi'].max()/1e9:.1f}B")
 
     # ── 3. Signals ───────────────────────────────────────────────────────────
-    print("\n[3/6] Building multi-timeframe signal matrix …")
+    print("\n[3/8] Building multi-timeframe signal matrix …")
     signals = build_signal_matrix(tf_data, oi_df, funding)
 
     n_long    = int((signals["signal"] == 1).sum())
@@ -128,7 +132,7 @@ def main():
           f"{signals['composite'].max():.1f}]")
 
     # ── 4. Backtest ──────────────────────────────────────────────────────────
-    print("\n[4/6] Running backtest …")
+    print("\n[4/8] Running backtest …")
     bt = run_backtest(tf_data["1H"], signals)
 
     _print_kpis(bt["kpis"])
@@ -143,7 +147,7 @@ def main():
                   f"ΣPnL=${pnl_sum:+,.0f}")
 
     # ── 5. Analytics ─────────────────────────────────────────────────────────
-    print("\n[5/6] Running statistical analysis …")
+    print("\n[5/8] Running statistical analysis …")
 
     fwd_returns = ana.forward_returns(tf_data["1H"])
     decay_df    = ana.alpha_decay(signals, fwd_returns)
@@ -193,9 +197,32 @@ def main():
         print(f"    {month_name:<4}  {row['avg_ret']*100:+.2f}%  "
               f"{'▸' if row['avg_ret'] > 0 else '◂'}{bar}{neg}")
 
-    # ── 6. Charts ────────────────────────────────────────────────────────────
+    # ── 6. Scenario comparison ───────────────────────────────────────────────
+    print("\n[6/8] Running improvement scenario comparison …")
+    comp_df, results_store = run_comparison(tf_data["1H"], signals)
+
+    print("\n  Scenario Comparison:")
+    _hline()
+    # Print a concise comparison table
+    key_cols = ["# Trades", "Win Rate (%)", "Total Ret (%)", "Sharpe",
+                "Max DD (%)", "Profit Factor", "Final Equity ($)"]
+    available = [c for c in key_cols if c in comp_df.columns]
+    print(f"  {'Scenario':<22}", end="")
+    for col in available:
+        print(f"  {col:>16}", end="")
+    print()
+    _hline()
+    for scenario, row in comp_df.iterrows():
+        print(f"  {scenario:<22}", end="")
+        for col in available:
+            val = row.get(col, 0)
+            print(f"  {val:>16}", end="")
+        print()
+    _hline()
+
+    # ── 7. PNG Charts ────────────────────────────────────────────────────────
     if not args.no_charts:
-        print("\n[6/6] Generating charts …")
+        print("\n[7/8] Generating individual PNG charts …")
         saved = chrt.generate_all(
             tf_data   = tf_data,
             signals   = signals,
@@ -204,21 +231,40 @@ def main():
             bt_result = bt,
             analytics = analytics_bundle,
         )
-        print(f"\n  {len(saved)} charts saved to: reports/charts/")
+        print(f"  {len(saved)} charts saved to: reports/charts/")
     else:
-        print("\n[6/6] Charts skipped (--no-charts).")
+        print("\n[7/8] PNG charts skipped (--no-charts).")
+
+    # ── 8. Unified PDF Report ─────────────────────────────────────────────────
+    if not args.no_report:
+        print("\n[8/8] Generating unified PDF report …")
+        pdf_path = generate_pdf(
+            tf_data      = tf_data,
+            signals      = signals,
+            oi_df        = oi_df,
+            funding      = funding,
+            bt_baseline  = bt,
+            analytics    = analytics_bundle,
+            comp_df      = comp_df,
+            results_store = results_store,
+            output_path  = "reports/BTCUSDT_Strategy_Report.pdf",
+        )
+        print(f"  PDF report saved to: {pdf_path}")
+    else:
+        print("\n[8/8] PDF report skipped (--no-report).")
 
     elapsed = time.time() - t0
-    _banner(f"Done in {elapsed:.1f}s  ·  Charts: reports/charts/")
+    _banner(f"Done in {elapsed:.1f}s  ·  Report: reports/BTCUSDT_Strategy_Report.pdf")
 
-    # Return for programmatic use
     return {
-        "tf_data":    tf_data,
-        "signals":    signals,
-        "oi_df":      oi_df,
-        "funding":    funding,
-        "backtest":   bt,
-        "analytics":  analytics_bundle,
+        "tf_data":      tf_data,
+        "signals":      signals,
+        "oi_df":        oi_df,
+        "funding":      funding,
+        "backtest":     bt,
+        "analytics":    analytics_bundle,
+        "comp_df":      comp_df,
+        "results_store": results_store,
     }
 
 

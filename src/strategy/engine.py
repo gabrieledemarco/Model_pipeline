@@ -65,6 +65,7 @@ def run_backtest(
     df_1h: pd.DataFrame,
     signals: pd.DataFrame,
     initial_capital: float = INIT_CAP,
+    atr_sl_override: float | None = None,
 ) -> dict:
     """
     Event-driven backtest on 1H OHLCV bars.
@@ -81,6 +82,8 @@ def run_backtest(
     -------
     dict  with keys: equity, drawdown, trades, kpis
     """
+    _atr_sl = atr_sl_override if atr_sl_override is not None else ATR_SL
+
     n = len(df_1h)
     equity_arr = np.full(n, float(initial_capital))
     cash = float(initial_capital)
@@ -271,7 +274,7 @@ def run_backtest(
             curr_atr  = atr[i - 1]
 
             if curr_atr > 0 and entry_px > 0:
-                risk_per_unit = curr_atr * ATR_SL
+                risk_per_unit = curr_atr * _atr_sl
                 max_risk      = cash * RISK_PCT
                 qty = min(max_risk / risk_per_unit,
                           cash * 0.95 / entry_px)   # max 95 % of cash in notional
@@ -293,13 +296,13 @@ def run_backtest(
                 tp1_hit = tp2_hit = False
 
                 if new_sig == 1:
-                    sl  = ep - curr_atr * ATR_SL
+                    sl  = ep - curr_atr * _atr_sl
                     tp1 = ep + curr_atr * ATR_TP1
                     tp2 = ep + curr_atr * ATR_TP2
                     tp3 = ep + curr_atr * ATR_TP3
                     worst = ep; best = ep
                 else:
-                    sl  = ep + curr_atr * ATR_SL
+                    sl  = ep + curr_atr * _atr_sl
                     tp1 = ep - curr_atr * ATR_TP1
                     tp2 = ep - curr_atr * ATR_TP2
                     tp3 = ep - curr_atr * ATR_TP3
