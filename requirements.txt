@@ -12,3 +12,6 @@ quantstats>=0.0.62
 empyrical-reloaded>=0.5.9
 pytz>=2023.3
 tqdm>=4.66
+yfinance>=0.2
+scipy>=1.10
+statsmodels>=0.14
