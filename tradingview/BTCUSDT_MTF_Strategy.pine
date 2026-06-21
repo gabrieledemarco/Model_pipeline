@@ -1,0 +1,289 @@
+// ════════════════════════════════════════════════════════════════════════════
+// BTCUSDT Multi-Timeframe Quantitative Strategy  – Pine Script v5
+// ════════════════════════════════════════════════════════════════════════════
+// Replicates the "Session 08-21" scenario (best Sharpe 1.516 in backtest).
+//
+// Signal stack:
+//   Weekly  (×3)  · Daily  (×4)  · 4H (×3)  · 1H (×3)
+//   Volume  (×2)  · Seasonality (×1)
+//   Composite ≥ +5 → Long  |  ≤ −5 → Short
+//
+// Risk / exit model:
+//   SL  = 2.0 × ATR      (worst-case order)
+//   TP1 = 2.0 × ATR  →  close 50 %  → move SL to break-even
+//   TP2 = 4.0 × ATR  →  close 25 %
+//   TP3 = 6.0 × ATR  →  close 25 %
+//   Risk per trade = 1 % of equity
+//   Fee = 0.04 % / side (Binance taker)
+//
+// Chart:   BINANCE:BTCUSDT.P  ·  Timeframe: 1H
+// ════════════════════════════════════════════════════════════════════════════
+//@version=5
+strategy(
+    title              = "BTCUSDT MTF Quant – Session Filtered",
+    shorttitle         = "MTF-QUANT",
+    overlay            = true,
+    initial_capital    = 100000,
+    default_qty_type   = strategy.fixed,
+    default_qty_value  = 0,
+    commission_type    = strategy.commission.percent,
+    commission_value   = 0.04,
+    slippage           = 2,
+    pyramiding         = 0,
+    calc_on_every_tick = false
+)
+
+// ════════════════════════════════════════════════════════════════════════════
+// PARAMETERS
+// ════════════════════════════════════════════════════════════════════════════
+grp_sig  = "① Signal Thresholds"
+grp_risk = "② Risk Management"
+grp_filt = "③ Filters"
+grp_disp = "④ Display"
+
+long_thresh    = input.float( 5.0,  "Long  Threshold",        minval=1.0,   maxval=40.0,  step=0.5, group=grp_sig)
+short_thresh   = input.float(-5.0,  "Short Threshold",        minval=-40.0, maxval=-1.0,  step=0.5, group=grp_sig)
+atr_sl_mult    = input.float( 2.0,  "ATR Stop Multiplier",    minval=0.5,   maxval=5.0,   step=0.1, group=grp_risk)
+risk_pct       = input.float( 1.0,  "Risk % per Trade",       minval=0.1,   maxval=5.0,   step=0.1, group=grp_risk)
+session_filter = input.bool(true,   "Session Filter 08–21 UTC",              group=grp_filt)
+regime_filter  = input.bool(false,  "Regime Filter (Daily 200 EMA)",         group=grp_filt)
+monthly_filter = input.bool(false,  "Monthly Seasonality Filter",            group=grp_filt)
+show_levels    = input.bool(true,   "Show SL / TP Levels",                   group=grp_disp)
+show_emas      = input.bool(true,   "Show EMA Ribbon",                       group=grp_disp)
+show_score     = input.bool(true,   "Show Composite Score Label",            group=grp_disp)
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════════════════════════════════════
+ATR_TP1 = 2.0
+ATR_TP2 = 4.0
+ATR_TP3 = 6.0
+
+var int[] BULL_MONTHS = array.from(1, 3, 4, 7, 10, 11)   // Jan Mar Apr Jul Oct Nov
+var int[] BEAR_MONTHS = array.from(6, 8)                   // Jun Aug
+
+// ════════════════════════════════════════════════════════════════════════════
+// SIGNAL FUNCTIONS  (called inside request.security – no look-ahead)
+// ════════════════════════════════════════════════════════════════════════════
+
+// Weekly trend score (±3)
+f_weekly() =>
+    e50   = ta.ema(close, 50)
+    slope = e50 > e50[1] ? 1 : -1
+    r14   = ta.rsi(close, 14)
+    rsi_s = r14 > 50 ? 1 : -1
+    [_, _, hist] = ta.macd(close, 12, 26, 9)
+    mac_s = hist > 0 ? 1 : -1
+    slope + rsi_s + mac_s
+
+// Daily trend score (±4)  –  also returns EMA-200 regime as second value
+f_daily() =>
+    e21   = ta.ema(close, 21)
+    e50   = ta.ema(close, 50)
+    e200  = ta.ema(close, 200)
+    e_stk = e21 > e50 and e50 > e200 ? 2 : (e21 < e50 and e50 < e200 ? -2 : 0)
+    r14   = ta.rsi(close, 14)
+    rsi_s = r14 > 55 ? 1 : (r14 < 45 ? -1 : 0)
+    [_, _, hist] = ta.macd(close, 12, 26, 9)
+    mac_s = hist > 0 ? 1 : -1
+    score  = e_stk + rsi_s + mac_s
+    regime = close > e200 ? 1 : -1   // +1 bull / -1 bear
+    [score, regime]
+
+// 4-hour setup score (±3)
+f_4h() =>
+    e8  = ta.ema(close, 8)
+    e21 = ta.ema(close, 21)
+    pv  = close > e21 ? 1 : -1
+    ec  = e8 > e21   ? 1 : -1
+    r14 = ta.rsi(close, 14)
+    rs  = r14 > 55 ? 1 : (r14 < 45 ? -1 : 0)
+    pv + ec + rs
+
+// ════════════════════════════════════════════════════════════════════════════
+// MULTI-TIMEFRAME REQUESTS  (barmerge.lookahead_off = no look-ahead)
+// ════════════════════════════════════════════════════════════════════════════
+s_weekly               = request.security(syminfo.tickerid, "W",   f_weekly(),    barmerge.gaps_off, barmerge.lookahead_off)
+[s_daily_raw, d_regime]= request.security(syminfo.tickerid, "D",   f_daily(),     barmerge.gaps_off, barmerge.lookahead_off)
+s_daily                = s_daily_raw
+s_4h                   = request.security(syminfo.tickerid, "240", f_4h(),        barmerge.gaps_off, barmerge.lookahead_off)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 1H SIGNALS  (current chart – no request.security needed)
+// ════════════════════════════════════════════════════════════════════════════
+e8h  = ta.ema(close, 8)
+e13h = ta.ema(close, 13)
+e21h = ta.ema(close, 21)
+e50h = ta.ema(close, 50)
+e200h = ta.ema(close, 200)
+r7h  = ta.rsi(close, 7)
+r14h = ta.rsi(close, 14)
+[_, _, macd_hist_h] = ta.macd(close, 12, 26, 9)
+atr14 = ta.atr(14)
+
+s_1h = (close > e13h ? 1 : -1) +
+       (e8h   > e13h ? 1 : -1) +
+       (r7h   >   55 ? 1 : r7h < 45 ? -1 : 0)
+
+// Volume signal (±2)
+vol_sma  = ta.sma(volume, 20)
+vol_rat  = vol_sma > 0 ? volume / vol_sma : 1.0
+s_vol    = vol_rat > 1.5 ? (close > open ? 2 : -2) :
+           vol_rat < 0.5 ? (close > open ? -1 : 1) : 0
+
+// Seasonality / cyclicality (±1)
+s_cycle  = array.includes(BULL_MONTHS, month) ? 1 :
+           array.includes(BEAR_MONTHS, month) ? -1 : 0
+
+// ════════════════════════════════════════════════════════════════════════════
+// COMPOSITE SCORE
+//   Weights: weekly×3, daily×4, 4h×3, 1h×3, vol×2, cycle×1
+//   Max without OI/funding ≈ ±(9+16+9+9+4+1) = ±48
+// ════════════════════════════════════════════════════════════════════════════
+composite = s_weekly * 3 + s_daily * 4 + s_4h * 3 + s_1h * 3 + s_vol * 2 + s_cycle * 1
+
+// ════════════════════════════════════════════════════════════════════════════
+// FILTERS
+// ════════════════════════════════════════════════════════════════════════════
+
+// Session 08:00–21:00 UTC  (all days – BTC trades 24/7)
+in_session     = session_filter ? not na(time(timeframe.period, "0800-2100:1234567", "UTC")) : true
+
+// Regime: only trade with the daily 200-EMA trend
+regime_ok_long  = not regime_filter or d_regime == 1
+regime_ok_short = not regime_filter or d_regime == -1
+
+// Monthly seasonality: block counter-seasonal entries
+month_ok_long   = not monthly_filter or not array.includes(BEAR_MONTHS, month)
+month_ok_short  = not monthly_filter or not array.includes(BULL_MONTHS, month)
+
+no_position = strategy.position_size == 0
+
+// ════════════════════════════════════════════════════════════════════════════
+// ENTRY SIGNALS
+// ════════════════════════════════════════════════════════════════════════════
+long_signal  = composite >= long_thresh  and in_session and regime_ok_long  and month_ok_long  and no_position
+short_signal = composite <= short_thresh and in_session and regime_ok_short and month_ok_short and no_position
+
+// ════════════════════════════════════════════════════════════════════════════
+// POSITION STATE
+// ════════════════════════════════════════════════════════════════════════════
+var float sl_price  = na
+var float be_price  = na
+var float tp1_price = na
+var float tp2_price = na
+var float tp3_price = na
+var bool  tp1_done  = false
+var bool  tp2_done  = false
+
+// ── LONG ENTRY ──────────────────────────────────────────────────────────────
+if long_signal
+    sl_dist   = atr14 * atr_sl_mult
+    qty       = math.max((strategy.equity * risk_pct / 100.0) / sl_dist, 0.001)
+    strategy.entry("Long", strategy.long, qty=qty, comment="L↑ " + str.tostring(math.round(composite, 1)))
+    sl_price  := close - sl_dist
+    be_price  := close
+    tp1_price := close + atr14 * ATR_TP1
+    tp2_price := close + atr14 * ATR_TP2
+    tp3_price := close + atr14 * ATR_TP3
+    tp1_done  := false
+    tp2_done  := false
+
+// ── SHORT ENTRY ─────────────────────────────────────────────────────────────
+if short_signal
+    sl_dist   = atr14 * atr_sl_mult
+    qty       = math.max((strategy.equity * risk_pct / 100.0) / sl_dist, 0.001)
+    strategy.entry("Short", strategy.short, qty=qty, comment="S↓ " + str.tostring(math.round(composite, 1)))
+    sl_price  := close + sl_dist
+    be_price  := close
+    tp1_price := close - atr14 * ATR_TP1
+    tp2_price := close - atr14 * ATR_TP2
+    tp3_price := close - atr14 * ATR_TP3
+    tp1_done  := false
+    tp2_done  := false
+
+// ── LONG EXIT: worst-case order (SL first, then TP cascade) ─────────────────
+if strategy.position_size > 0
+    if low <= sl_price
+        strategy.close("Long", comment="SL")
+        sl_price := na;  tp1_price := na;  tp2_price := na;  tp3_price := na
+    else if not tp1_done and high >= tp1_price
+        strategy.close("Long", qty_percent=50, comment="TP1 50%")
+        sl_price := be_price          // trail stop to break-even
+        tp1_done := true
+    else if tp1_done and not tp2_done and high >= tp2_price
+        strategy.close("Long", qty_percent=50, comment="TP2 25%")
+        tp2_done := true
+    else if tp1_done and tp2_done and high >= tp3_price
+        strategy.close("Long", comment="TP3 25%")
+
+// ── SHORT EXIT: worst-case order ────────────────────────────────────────────
+if strategy.position_size < 0
+    if high >= sl_price
+        strategy.close("Short", comment="SL")
+        sl_price := na;  tp1_price := na;  tp2_price := na;  tp3_price := na
+    else if not tp1_done and low <= tp1_price
+        strategy.close("Short", qty_percent=50, comment="TP1 50%")
+        sl_price := be_price
+        tp1_done := true
+    else if tp1_done and not tp2_done and low <= tp2_price
+        strategy.close("Short", qty_percent=50, comment="TP2 25%")
+        tp2_done := true
+    else if tp1_done and tp2_done and low <= tp3_price
+        strategy.close("Short", comment="TP3 25%")
+
+// ════════════════════════════════════════════════════════════════════════════
+// VISUALS
+// ════════════════════════════════════════════════════════════════════════════
+
+// EMA ribbon
+plot(show_emas ? e8h   : na, "EMA 8",   color=#3b82f6, linewidth=1)
+plot(show_emas ? e13h  : na, "EMA 13",  color=#10b981, linewidth=1)
+plot(show_emas ? e21h  : na, "EMA 21",  color=#f59e0b, linewidth=1)
+plot(show_emas ? e50h  : na, "EMA 50",  color=#ef4444, linewidth=2)
+plot(show_emas ? e200h : na, "EMA 200", color=#8b5cf6, linewidth=2)
+
+// SL / TP lines (only while in position)
+in_pos = strategy.position_size != 0
+plot(in_pos and show_levels ? sl_price  : na, "SL",  color=color.new(color.red,   0), linewidth=1, style=plot.style_linebr)
+plot(in_pos and show_levels ? tp1_price : na, "TP1", color=color.new(color.lime,  0), linewidth=1, style=plot.style_linebr)
+plot(in_pos and show_levels ? tp2_price : na, "TP2", color=color.new(color.green, 0), linewidth=1, style=plot.style_linebr)
+plot(in_pos and show_levels ? tp3_price : na, "TP3", color=color.new(color.teal,  0), linewidth=1, style=plot.style_linebr)
+
+// Entry arrows
+plotshape(long_signal,  "Long",  shape.triangleup,   location.belowbar, color.new(color.lime, 0), size=size.small)
+plotshape(short_signal, "Short", shape.triangledown, location.abovebar, color.new(color.red,  0), size=size.small)
+
+// Session background tint
+bgcolor(in_session ? color.new(color.blue, 95) : na, title="Session Window")
+
+// Composite score label on last bar
+if show_score and barstate.islast
+    lbl_col = composite >= long_thresh  ? color.lime :
+              composite <= short_thresh ? color.red  : color.gray
+    label.new(bar_index, high * 1.001,
+              "Score: " + str.tostring(math.round(composite, 1)),
+              color=lbl_col, textcolor=color.white,
+              size=size.small, style=label.style_label_down)
+
+// ════════════════════════════════════════════════════════════════════════════
+// ALERTS  (use these to drive webhook execution)
+// ════════════════════════════════════════════════════════════════════════════
+// Paste the JSON body below into TradingView alert → "Message" field,
+// then point the webhook to your executor server.
+//
+// Long entry:
+//   {"action":"buy","symbol":"BTCUSDT","score":{{plot("Composite")}},"side":"long","atr":{{plot("ATR")}}}
+// Short entry:
+//   {"action":"sell","symbol":"BTCUSDT","score":{{plot("Composite")}},"side":"short","atr":{{plot("ATR")}}}
+
+alertcondition(long_signal,             "🟢 MTF Long Entry",  "LONG BTCUSDT | Score=" + str.tostring(math.round(composite,1)))
+alertcondition(short_signal,            "🔴 MTF Short Entry", "SHORT BTCUSDT | Score=" + str.tostring(math.round(composite,1)))
+alertcondition(long_signal or short_signal, "MTF Any Entry",  "BTCUSDT MTF signal fired")
+
+// ════════════════════════════════════════════════════════════════════════════
+// HIDDEN PLOTS  (for dynamic alert placeholders {{plot(…)}})
+// ════════════════════════════════════════════════════════════════════════════
+plot(composite, "Composite", display=display.none)
+plot(atr14,     "ATR",       display=display.none)
+plot(sl_price,  "SL_Val",    display=display.none)

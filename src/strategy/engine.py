@@ -66,6 +66,9 @@ def run_backtest(
     signals: pd.DataFrame,
     initial_capital: float = INIT_CAP,
     atr_sl_override: float | None = None,
+    sizing_method: str = "fixed_risk",
+    size_pct: float | None = None,
+    leverage: float = 1.0,
 ) -> dict:
     """
     Event-driven backtest on 1H OHLCV bars.
@@ -77,12 +80,25 @@ def run_backtest(
     signals : pd.DataFrame
         Aligned signal matrix from signals.build_signal_matrix().
     initial_capital : float
+    atr_sl_override : float | None
+        Override ATR_SL multiplier.
+    sizing_method : str
+        "fixed_risk"     – size so that the SL costs exactly *size_pct* of equity.
+        "fixed_fraction" – invest *size_pct* × leverage of equity per trade (notional).
+    size_pct : float | None
+        Fraction of equity used for sizing (default: RISK_PCT = 0.01).
+    leverage : float
+        Maximum position notional as a multiple of equity (default: 1.0).
+        Caps position to equity × leverage / price.  No margin-call / liquidation
+        modelling – the ATR stop-loss is assumed to execute without slippage.
 
     Returns
     -------
     dict  with keys: equity, drawdown, trades, kpis
     """
-    _atr_sl = atr_sl_override if atr_sl_override is not None else ATR_SL
+    _atr_sl   = atr_sl_override if atr_sl_override is not None else ATR_SL
+    _size_pct = size_pct if size_pct is not None else RISK_PCT
+    _leverage = max(float(leverage), 1.0)
 
     n = len(df_1h)
     equity_arr = np.full(n, float(initial_capital))
@@ -274,10 +290,18 @@ def run_backtest(
             curr_atr  = atr[i - 1]
 
             if curr_atr > 0 and entry_px > 0:
-                risk_per_unit = curr_atr * _atr_sl
-                max_risk      = cash * RISK_PCT
-                qty = min(max_risk / risk_per_unit,
-                          cash * 0.95 / entry_px)   # max 95 % of cash in notional
+                # leverage-adjusted max notional
+                max_qty = cash * _leverage * 0.95 / entry_px
+
+                if sizing_method == "fixed_fraction":
+                    # invest _size_pct × leverage of equity as notional
+                    qty = cash * _size_pct * _leverage / entry_px
+                else:  # fixed_risk (default)
+                    # size so the SL costs exactly _size_pct × equity
+                    risk_per_unit = curr_atr * _atr_sl
+                    qty = (cash * _size_pct) / risk_per_unit
+
+                qty = min(qty, max_qty)
                 qty = max(qty, 1e-12)
 
                 IN_POS    = True

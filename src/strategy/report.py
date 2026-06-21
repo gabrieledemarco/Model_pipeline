@@ -51,6 +51,10 @@ PINK   = "#ff7eb6"
 
 PALETTE = [BLUE, GREEN, ORANGE, PURPLE, GOLD, PINK, TEAL, RED]
 
+# Top-3 scenarios for focused equity + MC comparison
+TOP3_SCENARIOS = ["Baseline", "Session 08-21", "Regime filter"]
+TOP3_COLORS    = [BLUE, GREEN, ORANGE]
+
 A4W, A4H = 8.27, 11.69   # inches (portrait)
 
 SAVE = Path("reports")
@@ -854,19 +858,505 @@ def _page_conclusions(comp_df: pd.DataFrame, kpis: dict) -> plt.Figure:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# F · Top-3 equity comparison
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _page_equity_top3(results_store: dict) -> plt.Figure:
+    """
+    F · Side-by-side comparison of Baseline, Session 08-21 and Regime filter:
+    overlaid equity curves (normalized to 100), drawdown corridors, and a
+    KPI bar grid.
+    """
+    fig = _page()
+    fig.text(0.5, 0.962, "F · Top-3 Strategy Equity Comparison",
+             color=GOLD, fontsize=11, fontweight="bold", ha="center")
+    fig.text(0.5, 0.945, "Baseline  ·  Session 08-21  ·  Regime Filter",
+             color=GRAY, fontsize=8, ha="center")
+
+    gs = gridspec.GridSpec(
+        3, 3,
+        figure=fig,
+        left=0.09, right=0.97,
+        top=0.92, bottom=0.06,
+        hspace=0.52, wspace=0.40,
+    )
+
+    present = [(n, c) for n, c in zip(TOP3_SCENARIOS, TOP3_COLORS)
+               if n in results_store]
+
+    # ── Panel 1 (top, full-width): normalized equity overlay ─────────────────
+    ax_eq = fig.add_subplot(gs[0, :])
+    _ax(ax_eq, "Normalized Equity (base = 100)", ylabel="Equity Index")
+    for name, color in present:
+        eq  = results_store[name]["equity"]
+        idx = eq / eq.iloc[0] * 100
+        ax_eq.plot(eq.index, idx.values, color=color, lw=1.6, label=name)
+        last = float(idx.iloc[-1])
+        ax_eq.annotate(f"{last:.1f}", xy=(eq.index[-1], last),
+                       xytext=(4, 0), textcoords="offset points",
+                       color=color, fontsize=7, va="center")
+    ax_eq.axhline(100, color=GRAY, lw=0.6, ls="--", alpha=0.5)
+    ax_eq.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax_eq.legend(frameon=False, labelcolor=WHITE, fontsize=7, loc="upper left")
+
+    # ── Panel 2 (middle, full-width): drawdown overlay ───────────────────────
+    ax_dd = fig.add_subplot(gs[1, :])
+    _ax(ax_dd, "Drawdown (%)", ylabel="%")
+    for name, color in present:
+        dd = results_store[name]["drawdown"] * 100
+        ax_dd.fill_between(dd.index, dd.values, 0,
+                           color=color, alpha=0.20, linewidth=0)
+        ax_dd.plot(dd.index, dd.values, color=color, lw=0.9)
+    ax_dd.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax_dd.yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
+
+    # ── Bottom row: 3 KPI bar charts ─────────────────────────────────────────
+    kpi_specs = [
+        ("Total Return (%)",  lambda k: k.get("total_return", 0) * 100),
+        ("Sharpe (ann.)",     lambda k: k.get("sharpe", 0)),
+        ("Max Drawdown (%)",  lambda k: k.get("max_drawdown", 0) * 100),
+    ]
+    for col, (title, extractor) in enumerate(kpi_specs):
+        ax = fig.add_subplot(gs[2, col])
+        _ax(ax, title)
+        names_p = [n for n, _ in present]
+        colors_p = [c for _, c in present]
+        vals     = [extractor(results_store[n]["kpis"]) for n in names_p]
+
+        bars = ax.barh(names_p, vals, color=colors_p, alpha=0.82, height=0.55)
+        for bar, v in zip(bars, vals):
+            ha = "left" if v >= 0 else "right"
+            off = abs(v) * 0.05 + 0.05
+            ax.text(v + (off if v >= 0 else -off),
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{v:+.2f}", va="center", ha=ha, color=WHITE, fontsize=7)
+        ax.axvline(0, color=GRAY, lw=0.5)
+        ax.tick_params(labelsize=6)
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# G · Monte Carlo simulation results
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _page_monte_carlo(mc_store: dict,
+                      initial_capital: float = 100_000.0) -> plt.Figure:
+    """
+    G · Monte Carlo fan charts + final-equity and max-DD distributions for
+    the top-3 scenarios. 3 rows × 3 columns.
+    """
+    fig = _page()
+    fig.text(0.5, 0.962, "G · Monte Carlo Simulation  (1 000 Bootstrap Resamplings)",
+             color=GOLD, fontsize=11, fontweight="bold", ha="center")
+    fig.text(0.5, 0.945,
+             "Trade returns resampled with replacement, applied compoundingly",
+             color=GRAY, fontsize=8, ha="center")
+
+    present = [(n, c) for n, c in zip(TOP3_SCENARIOS, TOP3_COLORS)
+               if n in mc_store and mc_store[n]]
+    n_rows  = max(len(present), 1)
+
+    gs = gridspec.GridSpec(
+        n_rows, 3,
+        figure=fig,
+        left=0.09, right=0.97,
+        top=0.92, bottom=0.06,
+        hspace=0.58, wspace=0.38,
+    )
+
+    for row, (name, color) in enumerate(present):
+        mc   = mc_store[name]
+        paths = mc["paths"]            # (n_sims, n_trades+1)
+        fe    = mc["final_equity"]
+        mdd   = mc["max_drawdown"] * 100
+        n_t   = mc["n_trades"]
+        x     = np.arange(n_t + 1)
+
+        p5,  p25, p50, p75, p95 = (np.percentile(paths, p, axis=0)
+                                    for p in (5, 25, 50, 75, 95))
+
+        # ── Col 0: Fan chart ──────────────────────────────────────────────────
+        ax_f = fig.add_subplot(gs[row, 0])
+        _ax(ax_f, f"{name} – Equity Fan",
+            xlabel="Trade #", ylabel="Equity ($)")
+        ax_f.fill_between(x, p5,  p95,  alpha=0.12, color=color, linewidth=0)
+        ax_f.fill_between(x, p25, p75,  alpha=0.28, color=color, linewidth=0)
+        ax_f.plot(x, p50, color=color, lw=1.3, label="Median")
+        ax_f.plot(x, p5,  color=color, lw=0.6, ls=":", alpha=0.7, label="5th/95th")
+        ax_f.plot(x, p95, color=color, lw=0.6, ls=":", alpha=0.7)
+        ax_f.axhline(initial_capital, color=GRAY, lw=0.6, ls="--", alpha=0.5)
+        ax_f.yaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda v, _: f"${v/1e3:.0f}k"))
+        ax_f.legend(frameon=False, labelcolor=GRAY, fontsize=6)
+
+        # Annotate median final
+        med_final = float(p50[-1])
+        ax_f.annotate(f"${med_final/1e3:.1f}k",
+                      xy=(n_t, med_final), xytext=(-28, 4),
+                      textcoords="offset points", color=color, fontsize=6.5)
+
+        # ── Col 1: Final equity distribution ─────────────────────────────────
+        ax_fe = fig.add_subplot(gs[row, 1])
+        _ax(ax_fe, f"{name} – Final Equity",
+            xlabel="Final Equity ($)", ylabel="# Simulations")
+        ax_fe.hist(fe, bins=55, color=color, alpha=0.65, edgecolor="none")
+        ax_fe.axvline(initial_capital,
+                      color=GRAY, lw=0.8, ls="--", label="Initial")
+        for pv, ls_s, lab in [(5, ":", "p5"), (50, "-", "p50"), (95, ":", "p95")]:
+            vl = float(np.percentile(fe, pv))
+            ax_fe.axvline(vl, color=WHITE, lw=0.7, ls=ls_s, label=f"{lab}=${vl/1e3:.1f}k")
+        ax_fe.xaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda v, _: f"${v/1e3:.0f}k"))
+        ax_fe.legend(frameon=False, labelcolor=GRAY, fontsize=5.5, loc="upper left")
+        # P(profit) / P(ruin) box
+        ax_fe.text(0.97, 0.97,
+                   f"P(profit)  {mc['p_profit']:.1%}\n"
+                   f"P(ruin)    {mc['p_ruin']:.1%}",
+                   transform=ax_fe.transAxes, va="top", ha="right",
+                   color=WHITE, fontsize=6.5,
+                   bbox=dict(facecolor=PANEL, edgecolor=BORDER,
+                             alpha=0.9, pad=3))
+
+        # ── Col 2: Max drawdown distribution ─────────────────────────────────
+        ax_dd = fig.add_subplot(gs[row, 2])
+        _ax(ax_dd, f"{name} – Max Drawdown",
+            xlabel="Max DD (%)", ylabel="# Simulations")
+        ax_dd.hist(mdd, bins=55, color=RED, alpha=0.60, edgecolor="none")
+        for pv, ls_s in [(5, ":"), (50, "-"), (95, ":")]:
+            vl = float(np.percentile(mdd, pv))
+            ax_dd.axvline(vl, color=WHITE, lw=0.7, ls=ls_s,
+                          label=f"p{pv}={vl:.1f}%")
+        ax_dd.legend(frameon=False, labelcolor=GRAY, fontsize=6)
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# H · Monte Carlo summary stats table
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _page_mc_summary(mc_store: dict,
+                     initial_capital: float = 100_000.0) -> plt.Figure:
+    """
+    H · Percentile breakdown table for MC results across the top-3 scenarios.
+    """
+    from .monte_carlo import mc_summary_table
+
+    fig = _page()
+    fig.text(0.5, 0.962, "H · Monte Carlo – Percentile Summary Table",
+             color=GOLD, fontsize=11, fontweight="bold", ha="center")
+
+    present = {n: mc_store[n] for n in TOP3_SCENARIOS
+               if n in mc_store and mc_store[n]}
+    if not present:
+        fig.text(0.5, 0.5, "No MC data available",
+                 color=GRAY, fontsize=12, ha="center", va="center")
+        return fig
+
+    summ = mc_summary_table(present)
+
+    ax = fig.add_axes([0.04, 0.72, 0.92, 0.20])
+    ax.set_facecolor(PANEL); ax.axis("off")
+    cols  = summ.columns.tolist()
+    rows  = summ.index.tolist()
+    data  = summ.values
+    n_r, n_c = len(rows), len(cols)
+    col_w = 0.88 / (n_c + 1)
+    row_h = 0.70 / (n_r + 1)
+
+    hdr_y = row_h * n_r + row_h * 0.5
+    ax.add_patch(mpatches.Rectangle(
+        (0, hdr_y - row_h * 0.5), 1.0, row_h,
+        transform=ax.transData, facecolor=GOLD, alpha=0.25))
+    ax.text(0.05, hdr_y, "Scenario", color=GOLD, fontsize=8,
+            fontweight="bold", ha="center", va="center")
+    for j, col in enumerate(cols):
+        ax.text(0.10 + col_w * (j + 0.5), hdr_y,
+                col.replace(" (", "\n("), color=GOLD, fontsize=6.5,
+                fontweight="bold", ha="center", va="center")
+
+    for i, row_name in enumerate(rows):
+        y = row_h * (n_r - 1 - i) + row_h * 0.5
+        bg = "#1e2530" if i % 2 == 0 else PANEL
+        ax.add_patch(mpatches.Rectangle(
+            (0, y - row_h * 0.5), 1.0, row_h,
+            transform=ax.transData, facecolor=bg))
+        color = TOP3_COLORS[TOP3_SCENARIOS.index(row_name)] \
+                if row_name in TOP3_SCENARIOS else WHITE
+        ax.text(0.05, y, row_name, color=color, fontsize=7.5,
+                fontweight="bold", ha="center", va="center")
+        for j, val in enumerate(data[i]):
+            ax.text(0.10 + col_w * (j + 0.5), y,
+                    f"{val:.2f}", color=WHITE, fontsize=7.5,
+                    ha="center", va="center")
+
+    # Per-scenario percentile breakdown panels
+    n_present = len(present)
+    gs2 = gridspec.GridSpec(
+        1, n_present,
+        figure=fig,
+        left=0.06, right=0.97,
+        top=0.68, bottom=0.06,
+        hspace=0.4, wspace=0.40,
+    )
+
+    for col, (name, mc) in enumerate(present.items()):
+        color = TOP3_COLORS[TOP3_SCENARIOS.index(name)] \
+                if name in TOP3_SCENARIOS else WHITE
+        ax_p = fig.add_subplot(gs2[0, col])
+        _ax(ax_p, f"{name} – Return Percentiles (%)",
+            xlabel="Percentile", ylabel="Total Return (%)")
+        pcts_x = mc["summary"]["percentile"].values
+        rets_y = mc["summary"]["total_return%"].values
+        ax_p.plot(pcts_x, rets_y, color=color, lw=1.5, marker="o",
+                  markersize=4)
+        ax_p.axhline(0, color=GRAY, lw=0.6, ls="--")
+        for pv, rv in zip(pcts_x, rets_y):
+            if pv in (5, 50, 95):
+                ax_p.annotate(f"{rv:.1f}%",
+                              xy=(pv, rv), xytext=(3, 3),
+                              textcoords="offset points",
+                              color=WHITE, fontsize=6)
+        ax_p.set_xlim(-2, 102)
+        ax_p.yaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# I · Leverage & Sizing – equity curves grid
+# ─────────────────────────────────────────────────────────────────────────────
+
+_METHOD_LABELS = {"FR": "Fixed Risk", "FF": "Fixed Fraction"}
+_LEV_COLORS    = {1: BLUE, 5: GREEN, 10: ORANGE}
+_PCT_STYLES    = {0.2: ":", 0.5: "--", 1.0: "-", 2.0: "-."}
+_PCT_ALPHA     = {0.2: 0.55, 0.5: 0.70, 1.0: 1.00, 2.0: 0.85}
+
+
+def _page_leverage_equity(equity_store: dict,
+                          scenario: str = "Session 08-21") -> plt.Figure:
+    """
+    I · 4-row × 3-col grid of equity curves for the chosen scenario.
+    Rows = risk / invest level (0.2 %, 0.5 %, 1 %, 2 %)
+    Cols = leverage (1×, 5×, 10×)
+    Two curves per subplot: FR (blue) vs FF (orange).
+    """
+    fig = _page()
+    fig.text(0.5, 0.962,
+             f"I · Leverage & Sizing – Equity Curves  [{scenario}]",
+             color=GOLD, fontsize=11, fontweight="bold", ha="center")
+    fig.text(0.5, 0.945,
+             "Blue = Fixed Risk  ·  Orange = Fixed Fraction  ·  "
+             "Rows = % level  ·  Cols = leverage",
+             color=GRAY, fontsize=8, ha="center")
+
+    pct_levels = [0.2, 0.5, 1.0, 2.0]
+    lev_levels = [1, 5, 10]
+    methods    = [("FR", BLUE), ("FF", ORANGE)]
+
+    gs = gridspec.GridSpec(
+        4, 3, figure=fig,
+        left=0.07, right=0.97, top=0.92, bottom=0.05,
+        hspace=0.55, wspace=0.32,
+    )
+    sc_store = equity_store.get(scenario, {})
+
+    for row, pct in enumerate(pct_levels):
+        for col, lev in enumerate(lev_levels):
+            ax = fig.add_subplot(gs[row, col])
+            _ax(ax, f"{pct:.1f}%  ·  {lev}×  lev",
+                ylabel="Equity ($)" if col == 0 else "")
+
+            for short, color in methods:
+                key = f"{short}|{pct:.1f}%|{lev}x"
+                if key not in sc_store:
+                    continue
+                eq = sc_store[key]
+                lbl = f"{short}  ret={((eq.iloc[-1]/eq.iloc[0])-1)*100:+.1f}%"
+                ax.plot(eq.index, eq.values, color=color,
+                        lw=1.2 if short == "FR" else 1.0,
+                        ls="-" if short == "FR" else "--",
+                        alpha=0.9, label=lbl)
+
+            ax.axhline(eq.iloc[0] if sc_store else 100_000,
+                       color=GRAY, lw=0.5, ls=":", alpha=0.5)
+            ax.yaxis.set_major_formatter(
+                mticker.FuncFormatter(lambda v, _: f"${v/1e3:.0f}k"))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+            ax.legend(frameon=False, labelcolor=WHITE, fontsize=5.5,
+                      loc="upper left")
+            ax.tick_params(labelsize=6)
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# J · KPI heatmaps  (Total Return and Max DD for both methods)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _page_leverage_heatmaps(lev_comp_df: pd.DataFrame,
+                             scenario: str = "Session 08-21") -> plt.Figure:
+    """
+    J · 2×2 heatmap grid:
+    top row = Total Return (%), bottom row = Max DD (%)
+    left col = Fixed Risk,     right col = Fixed Fraction
+    X-axis = Pct level, Y-axis = Leverage
+    """
+    from .leverage_study import pivot_heatmap
+
+    fig = _page()
+    fig.text(0.5, 0.962,
+             f"J · KPI Heatmaps – Leverage × Risk Level  [{scenario}]",
+             color=GOLD, fontsize=11, fontweight="bold", ha="center")
+    fig.text(0.5, 0.945,
+             "Rows = Leverage  ·  Cols = % level  ·  "
+             "Left = Fixed Risk  ·  Right = Fixed Fraction",
+             color=GRAY, fontsize=8, ha="center")
+
+    gs = gridspec.GridSpec(
+        2, 2, figure=fig,
+        left=0.08, right=0.97, top=0.91, bottom=0.07,
+        hspace=0.45, wspace=0.28,
+    )
+
+    specs = [
+        (0, 0, "Fixed Risk",     "Total Ret (%)", sns.color_palette("RdYlGn", 21)),
+        (0, 1, "Fixed Fraction", "Total Ret (%)", sns.color_palette("RdYlGn", 21)),
+        (1, 0, "Fixed Risk",     "Max DD (%)",    sns.color_palette("RdYlGn_r", 21)),
+        (1, 1, "Fixed Fraction", "Max DD (%)",    sns.color_palette("RdYlGn_r", 21)),
+    ]
+
+    for r, c, meth, metric, cmap in specs:
+        ax = fig.add_subplot(gs[r, c])
+        _ax(ax, f"{meth} – {metric}")
+        piv = pivot_heatmap(lev_comp_df, scenario, meth, metric)
+        if piv.empty:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    color=GRAY, transform=ax.transAxes)
+            continue
+
+        vmax = piv.abs().values.max()
+        vmin = -vmax if metric == "Total Ret (%)" else piv.values.min()
+
+        sns.heatmap(
+            piv, ax=ax,
+            annot=True, fmt=".1f",
+            cmap=cmap,
+            vmin=vmin, vmax=vmax if metric == "Total Ret (%)" else 0,
+            linewidths=0.5, linecolor=BORDER,
+            annot_kws={"size": 8, "color": "white"},
+            cbar_kws={"shrink": 0.7},
+        )
+        ax.set_xlabel("Risk / Invest %", color=GRAY, fontsize=8)
+        ax.set_ylabel("Leverage",         color=GRAY, fontsize=8)
+        ax.tick_params(colors=WHITE, labelsize=8)
+        ax.set_yticklabels(
+            [f"{int(v)}×" for v in piv.index], rotation=0, color=WHITE)
+        ax.set_xticklabels(
+            [f"{v:.1f}%" for v in piv.columns], rotation=0, color=WHITE)
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K · Best configurations ranking table
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _page_best_configs(lev_comp_df: pd.DataFrame) -> plt.Figure:
+    """
+    K · Top-15 configurations by Sharpe across all scenarios,
+    methods, leverage levels and risk levels.
+    """
+    from .leverage_study import best_configs
+
+    fig = _page()
+    fig.text(0.5, 0.962,
+             "K · Best Configurations Ranking  (by Sharpe Ratio)",
+             color=GOLD, fontsize=11, fontweight="bold", ha="center")
+    fig.text(0.5, 0.945,
+             "Top 15 across all scenarios × sizing methods × leverage × risk levels",
+             color=GRAY, fontsize=8, ha="center")
+
+    df_top = best_configs(lev_comp_df, n=15)
+    if df_top.empty:
+        fig.text(0.5, 0.5, "No data", ha="center", va="center", color=GRAY)
+        return fig
+
+    ax = fig.add_axes([0.02, 0.08, 0.96, 0.84])
+    ax.set_facecolor(PANEL); ax.axis("off")
+
+    cols  = df_top.columns.tolist()
+    n_r   = len(df_top)
+    n_c   = len(cols)
+    col_w = 0.96 / (n_c)
+    row_h = 0.84 / (n_r + 1)
+
+    # Header
+    hdr_y = row_h * n_r + row_h * 0.6
+    ax.add_patch(mpatches.Rectangle(
+        (0, hdr_y - row_h * 0.5), 1.0, row_h,
+        transform=ax.transData, facecolor=GOLD, alpha=0.25))
+    for j, col in enumerate(cols):
+        ax.text(col_w * (j + 0.5), hdr_y,
+                col.replace(" ", "\n"), color=GOLD, fontsize=6.5,
+                fontweight="bold", ha="center", va="center")
+
+    # Rows
+    for i, (_, row) in enumerate(df_top.iterrows()):
+        y    = row_h * (n_r - 1 - i) + row_h * 0.6
+        bg   = "#1e2530" if i % 2 == 0 else PANEL
+        rank_col = GOLD if i == 0 else (GREEN if i < 3 else WHITE)
+        ax.add_patch(mpatches.Rectangle(
+            (0, y - row_h * 0.5), 1.0, row_h,
+            transform=ax.transData, facecolor=bg))
+        for j, col in enumerate(cols):
+            val = row[col]
+            if isinstance(val, float):
+                txt = f"{val:+.2f}" if "Ret" in col or "DD" in col else f"{val:.3f}"
+            else:
+                txt = str(val)
+            c_ = rank_col if j < 4 else WHITE
+            ax.text(col_w * (j + 0.5), y, txt,
+                    color=c_, fontsize=6.8,
+                    ha="center", va="center")
+
+    # Sharpe bar chart on the right side (inset)
+    ax2 = fig.add_axes([0.80, 0.10, 0.17, 0.80])
+    _ax(ax2, "Sharpe", xlabel="")
+    sharpes = df_top["Sharpe"].values
+    colors_ = [GOLD if i == 0 else (GREEN if i < 3 else BLUE)
+                for i in range(len(sharpes))]
+    ys = list(range(len(sharpes) - 1, -1, -1))
+    ax2.barh(ys, sharpes, color=colors_, alpha=0.8, height=0.7)
+    ax2.set_yticks(ys)
+    ax2.set_yticklabels([f"#{i+1}" for i in range(len(ys))],
+                        color=GRAY, fontsize=6)
+    ax2.tick_params(labelsize=6)
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Master PDF assembler
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_pdf(
-    tf_data:       Dict,
-    signals:       pd.DataFrame,
-    oi_df:         pd.DataFrame,
-    funding:       pd.Series,
-    bt_baseline:   dict,
-    analytics:     dict,
-    comp_df:       pd.DataFrame,
-    results_store: dict,
-    output_path:   str = "reports/BTCUSDT_Strategy_Report.pdf",
+    tf_data:          Dict,
+    signals:          pd.DataFrame,
+    oi_df:            pd.DataFrame,
+    funding:          pd.Series,
+    bt_baseline:      dict,
+    analytics:        dict,
+    comp_df:          pd.DataFrame,
+    results_store:    dict,
+    mc_store:         Optional[dict] = None,
+    lev_comp_df:      Optional[pd.DataFrame] = None,
+    lev_equity_store: Optional[dict] = None,
+    lev_scenario:     str = "Session 08-21",
+    output_path:      str = "reports/BTCUSDT_Strategy_Report.pdf",
 ) -> Path:
     """
     Build the full strategy PDF report and return the saved path.
@@ -878,6 +1368,7 @@ def generate_pdf(
     analytics     – dict returned by the analytics block in strategy_btcusdt.py
     comp_df       – scenario comparison DataFrame from optimizer.run_comparison()
     results_store – dict of {scenario_name: backtest_result}
+    mc_store      – optional dict of {scenario_name: run_monte_carlo result}
     """
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -886,6 +1377,8 @@ def generate_pdf(
     equity  = bt_baseline["equity"]
     dd      = bt_baseline["drawdown"]
     trades  = bt_baseline["trades"]
+    init_cap = float(kpis.get("final_equity", 100_000) /
+                     (1 + kpis.get("total_return", 0)))
 
     pages = [
         ("Cover",               lambda: _page_cover(kpis)),
@@ -910,7 +1403,26 @@ def generate_pdf(
         ("D · Equity Compare",  lambda: _page_equity_comparison(results_store, kpis)),
         ("D · KPI Deltas",      lambda: _page_kpi_deltas(comp_df)),
         ("E · Conclusions",     lambda: _page_conclusions(comp_df, kpis)),
+        ("F · Top-3 Equity",    lambda: _page_equity_top3(results_store)),
     ]
+
+    if mc_store:
+        pages += [
+            ("G · Monte Carlo",     lambda _mc=mc_store, _ic=init_cap:
+                                        _page_monte_carlo(_mc, _ic)),
+            ("H · MC Summary",      lambda _mc=mc_store, _ic=init_cap:
+                                        _page_mc_summary(_mc, _ic)),
+        ]
+
+    if lev_comp_df is not None and lev_equity_store is not None:
+        pages += [
+            ("I · Leverage Equity",  lambda _es=lev_equity_store, _sc=lev_scenario:
+                                         _page_leverage_equity(_es, _sc)),
+            ("J · KPI Heatmaps",     lambda _df=lev_comp_df, _sc=lev_scenario:
+                                         _page_leverage_heatmaps(_df, _sc)),
+            ("K · Best Configs",     lambda _df=lev_comp_df:
+                                         _page_best_configs(_df)),
+        ]
 
     metadata = {
         "Title":   "BTCUSDT Multi-TF Strategy Report",
