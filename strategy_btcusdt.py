@@ -33,9 +33,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.strategy.data_fetcher  import fetch_all_timeframes, generate_oi, generate_funding
 from src.strategy.indicators    import add_indicators
 from src.strategy.signals       import build_signal_matrix
-from src.strategy.engine        import run_backtest
+from src.strategy.engine        import run_backtest, INIT_CAP
 from src.strategy.optimizer     import run_comparison
-from src.strategy.report        import generate_pdf
+from src.strategy.monte_carlo   import run_monte_carlo, mc_summary_table
+from src.strategy.report        import generate_pdf, TOP3_SCENARIOS
 from src.strategy import analytics as ana
 from src.strategy import charts   as chrt
 
@@ -98,19 +99,21 @@ def main():
                     help="Skip individual PNG chart generation")
     ap.add_argument("--no-report", action="store_true",
                     help="Skip unified PDF report generation")
+    ap.add_argument("--mc-sims", type=int, default=1000,
+                    help="Number of Monte Carlo simulations (default: 1000)")
     args = ap.parse_args()
 
     t0 = time.time()
     _banner("BTCUSDT Multi-Timeframe Quant Strategy")
 
     # ── 1. Data ──────────────────────────────────────────────────────────────
-    print("\n[1/8] Fetching OHLCV data …")
+    print("\n[1/10] Fetching OHLCV data …")
     tf_data = fetch_all_timeframes("BTC-USD")
     if "1H" not in tf_data or len(tf_data["1H"]) < 50:
         sys.exit("ERROR: Insufficient 1H data. Check internet connection.")
 
     # ── 2. Indicators ────────────────────────────────────────────────────────
-    print("\n[2/8] Computing technical indicators …")
+    print("\n[2/10] Computing technical indicators …")
     for tf in tf_data:
         tf_data[tf] = add_indicators(tf_data[tf])
 
@@ -120,7 +123,7 @@ def main():
     print(f"  OI range: ${oi_df['oi'].min()/1e9:.1f}B – ${oi_df['oi'].max()/1e9:.1f}B")
 
     # ── 3. Signals ───────────────────────────────────────────────────────────
-    print("\n[3/8] Building multi-timeframe signal matrix …")
+    print("\n[3/10] Building multi-timeframe signal matrix …")
     signals = build_signal_matrix(tf_data, oi_df, funding)
 
     n_long    = int((signals["signal"] == 1).sum())
@@ -132,7 +135,7 @@ def main():
           f"{signals['composite'].max():.1f}]")
 
     # ── 4. Backtest ──────────────────────────────────────────────────────────
-    print("\n[4/8] Running backtest …")
+    print("\n[4/10] Running backtest …")
     bt = run_backtest(tf_data["1H"], signals)
 
     _print_kpis(bt["kpis"])
@@ -147,7 +150,7 @@ def main():
                   f"ΣPnL=${pnl_sum:+,.0f}")
 
     # ── 5. Analytics ─────────────────────────────────────────────────────────
-    print("\n[5/8] Running statistical analysis …")
+    print("\n[5/10] Running statistical analysis …")
 
     fwd_returns = ana.forward_returns(tf_data["1H"])
     decay_df    = ana.alpha_decay(signals, fwd_returns)
@@ -198,7 +201,7 @@ def main():
               f"{'▸' if row['avg_ret'] > 0 else '◂'}{bar}{neg}")
 
     # ── 6. Scenario comparison ───────────────────────────────────────────────
-    print("\n[6/8] Running improvement scenario comparison …")
+    print("\n[6/10] Running improvement scenario comparison …")
     comp_df, results_store = run_comparison(tf_data["1H"], signals)
 
     print("\n  Scenario Comparison:")
@@ -220,9 +223,38 @@ def main():
         print()
     _hline()
 
-    # ── 7. PNG Charts ────────────────────────────────────────────────────────
+    # ── 7. Monte Carlo simulation ─────────────────────────────────────────────
+    print(f"\n[7/10] Running Monte Carlo ({args.mc_sims:,} simulations) …")
+    mc_store: dict = {}
+    init_cap = INIT_CAP
+    for sc_name in TOP3_SCENARIOS:
+        if sc_name not in results_store:
+            continue
+        sc_trades = results_store[sc_name]["trades"]
+        if sc_trades is None or sc_trades.empty:
+            continue
+        mc_store[sc_name] = run_monte_carlo(
+            sc_trades, initial_capital=init_cap, n_sims=args.mc_sims)
+        mc = mc_store[sc_name]
+        p50_ret = float(np.percentile(mc["total_return"] * 100, 50))
+        p5_ret  = float(np.percentile(mc["total_return"] * 100, 5))
+        p95_ret = float(np.percentile(mc["total_return"] * 100, 95))
+        p50_dd  = float(np.percentile(mc["max_drawdown"] * 100, 50))
+        print(f"  {sc_name:<20}  "
+              f"Ret p50={p50_ret:+.1f}%  [p5={p5_ret:+.1f}%, p95={p95_ret:+.1f}%]  "
+              f"MDD p50={p50_dd:.1f}%  "
+              f"P(profit)={mc['p_profit']:.1%}")
+
+    if mc_store:
+        summ = mc_summary_table(mc_store)
+        print("\n  MC Summary Table:")
+        _hline()
+        print(summ.to_string())
+        _hline()
+
+    # ── 8. PNG Charts ────────────────────────────────────────────────────────
     if not args.no_charts:
-        print("\n[7/8] Generating individual PNG charts …")
+        print("\n[8/10] Generating individual PNG charts …")
         saved = chrt.generate_all(
             tf_data   = tf_data,
             signals   = signals,
@@ -233,38 +265,40 @@ def main():
         )
         print(f"  {len(saved)} charts saved to: reports/charts/")
     else:
-        print("\n[7/8] PNG charts skipped (--no-charts).")
+        print("\n[8/10] PNG charts skipped (--no-charts).")
 
     # ── 8. Unified PDF Report ─────────────────────────────────────────────────
     if not args.no_report:
-        print("\n[8/8] Generating unified PDF report …")
+        print("\n[10/10] Generating unified PDF report …")
         pdf_path = generate_pdf(
-            tf_data      = tf_data,
-            signals      = signals,
-            oi_df        = oi_df,
-            funding      = funding,
-            bt_baseline  = bt,
-            analytics    = analytics_bundle,
-            comp_df      = comp_df,
+            tf_data       = tf_data,
+            signals       = signals,
+            oi_df         = oi_df,
+            funding       = funding,
+            bt_baseline   = bt,
+            analytics     = analytics_bundle,
+            comp_df       = comp_df,
             results_store = results_store,
-            output_path  = "reports/BTCUSDT_Strategy_Report.pdf",
+            mc_store      = mc_store if mc_store else None,
+            output_path   = "reports/BTCUSDT_Strategy_Report.pdf",
         )
         print(f"  PDF report saved to: {pdf_path}")
     else:
-        print("\n[8/8] PDF report skipped (--no-report).")
+        print("\n[10/10] PDF report skipped (--no-report).")
 
     elapsed = time.time() - t0
     _banner(f"Done in {elapsed:.1f}s  ·  Report: reports/BTCUSDT_Strategy_Report.pdf")
 
     return {
-        "tf_data":      tf_data,
-        "signals":      signals,
-        "oi_df":        oi_df,
-        "funding":      funding,
-        "backtest":     bt,
-        "analytics":    analytics_bundle,
-        "comp_df":      comp_df,
+        "tf_data":       tf_data,
+        "signals":       signals,
+        "oi_df":         oi_df,
+        "funding":       funding,
+        "backtest":      bt,
+        "analytics":     analytics_bundle,
+        "comp_df":       comp_df,
         "results_store": results_store,
+        "mc_store":      mc_store,
     }
 
 
