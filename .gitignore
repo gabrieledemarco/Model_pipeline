@@ -5,6 +5,7 @@ __pycache__/
 .env
 data/raw/
 data/parquet/
+data/cache/
 models_store/*.joblib
 reports/charts/**/*.png
 reports/charts/**/*.json

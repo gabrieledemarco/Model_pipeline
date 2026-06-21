@@ -1340,6 +1340,230 @@ def _page_best_configs(lev_comp_df: pd.DataFrame) -> plt.Figure:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Page L – Walk-Forward equity + per-window returns
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _page_walk_forward(wf_result: dict) -> plt.Figure:
+    win_df   = wf_result["windows"]
+    eq       = wf_result["combined_equity"]
+    scenario = wf_result.get("scenario_name", "")
+    kpis     = wf_result.get("full_kpis", {})
+
+    fig = _page()
+    fig.suptitle("L · Walk-Forward Validation (OOS)",
+                 color=WHITE, fontsize=14, y=0.97)
+
+    gs = fig.add_gridspec(3, 2, hspace=0.45, wspace=0.35,
+                          left=0.07, right=0.96, top=0.91, bottom=0.06)
+
+    # ── OOS equity curve ──────────────────────────────────────────────────
+    ax_eq = fig.add_subplot(gs[0, :])
+    ax_eq.set_facecolor(PANEL)
+    if not eq.empty:
+        ax_eq.plot(eq.index, eq.values, color=BLUE, lw=1.5, label="OOS equity")
+        ax_eq.fill_between(eq.index, eq.values, eq.iloc[0],
+                            where=(eq.values >= eq.iloc[0]),
+                            color=GREEN, alpha=0.15)
+        ax_eq.fill_between(eq.index, eq.values, eq.iloc[0],
+                            where=(eq.values < eq.iloc[0]),
+                            color=RED, alpha=0.2)
+        ax_eq.axhline(eq.iloc[0], color=GRAY, lw=0.8, ls="--")
+
+        # shade OOS windows
+        for _, row in win_df.iterrows():
+            ax_eq.axvspan(pd.Timestamp(row["Train End"]),
+                          pd.Timestamp(row["OOS End"]),
+                          color=BLUE, alpha=0.04)
+
+    ax_eq.set_title(f"Chained OOS Equity — {scenario}",
+                    color=GRAY, fontsize=9)
+    ax_eq.tick_params(colors=GRAY, labelsize=7)
+    ax_eq.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    for sp in ax_eq.spines.values():
+        sp.set_color(BORDER)
+
+    # ── Per-window bar chart ──────────────────────────────────────────────
+    ax_bar = fig.add_subplot(gs[1, :])
+    ax_bar.set_facecolor(PANEL)
+    if not win_df.empty:
+        rets  = win_df["OOS Return (%)"].values
+        colors_ = [GREEN if r >= 0 else RED for r in rets]
+        xs = np.arange(len(rets))
+        ax_bar.bar(xs, rets, color=colors_, alpha=0.75, width=0.7)
+        ax_bar.axhline(0, color=WHITE, lw=0.7, ls="--")
+        ax_bar.axhline(float(np.median(rets)), color=ORANGE,
+                       lw=1, ls=":", label=f"Median {np.median(rets):+.1f}%")
+        ax_bar.set_xticks(xs)
+        labels = [f"W{int(w)}\n{str(row['Train End'])[:7]}"
+                  for w, row in win_df.iterrows()]
+        ax_bar.set_xticklabels(labels, color=GRAY, fontsize=6, rotation=30)
+        ax_bar.set_title("OOS Return per Window (%)", color=GRAY, fontsize=9)
+        ax_bar.legend(fontsize=7, labelcolor=GRAY, framealpha=0.2)
+    ax_bar.tick_params(colors=GRAY, labelsize=7)
+    for sp in ax_bar.spines.values():
+        sp.set_color(BORDER)
+
+    # ── KPI tiles (bottom row) ────────────────────────────────────────────
+    pct_prof  = wf_result.get("pct_profitable", 0)
+    med_ret   = wf_result.get("median_oos_ret", 0)
+    consist   = wf_result.get("consistency", 0)
+    n_win     = wf_result.get("n_windows", 0)
+    oos_sharpe = kpis.get("sharpe", 0)
+    oos_dd     = kpis.get("max_drawdown", 0)
+
+    tiles = [
+        ("Windows\ntested",       f"{n_win}"),
+        ("Profitable\nwindows",   f"{pct_prof:.0f}%"),
+        ("Median OOS\nreturn",    f"{med_ret:+.1f}%"),
+        ("OOS Sharpe\n(combined)",f"{oos_sharpe:.3f}"),
+        ("OOS Max DD\n(combined)",f"{oos_dd*100:.1f}%"),
+        ("Consistency\n(Sharpe of rets)", f"{consist:+.3f}"),
+    ]
+    # Use text annotations in a dedicated axes
+    ax_tiles = fig.add_axes([0.07, 0.02, 0.89, 0.13], facecolor=BG)
+    ax_tiles.set_xlim(0, len(tiles))
+    ax_tiles.set_ylim(0, 1)
+    ax_tiles.axis("off")
+    for i, (label, val) in enumerate(tiles):
+        x = i + 0.5
+        color = GREEN if ("%" in val and not val.startswith("-") and
+                          float(val.replace("%","").replace("+","")) > 0) else BLUE
+        ax_tiles.add_patch(
+            plt.Rectangle((i + 0.05, 0.05), 0.9, 0.9,
+                          facecolor=PANEL, edgecolor=BORDER, lw=0.5))
+        ax_tiles.text(x, 0.72, val, ha="center", va="center",
+                      color=color, fontsize=12, fontweight="bold")
+        ax_tiles.text(x, 0.28, label, ha="center", va="center",
+                      color=GRAY, fontsize=7)
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Page M – Walk-Forward statistics: distribution + Sharpe by window
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _page_wf_stats(wf_result: dict) -> plt.Figure:
+    win_df = wf_result["windows"]
+    trades = wf_result.get("all_oos_trades", pd.DataFrame())
+
+    fig = _page()
+    fig.suptitle("M · Walk-Forward Statistics",
+                 color=WHITE, fontsize=14, y=0.97)
+
+    gs = fig.add_gridspec(2, 3, hspace=0.42, wspace=0.38,
+                          left=0.07, right=0.96, top=0.90, bottom=0.08)
+
+    # ── Return distribution ───────────────────────────────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.set_facecolor(PANEL)
+    if not win_df.empty:
+        rets = win_df["OOS Return (%)"].values
+        ax1.hist(rets, bins=min(12, len(rets)), color=BLUE, alpha=0.75,
+                 edgecolor=BORDER, lw=0.5)
+        ax1.axvline(float(np.median(rets)), color=ORANGE, lw=1.2, ls="--",
+                    label=f"Median {np.median(rets):+.1f}%")
+        ax1.axvline(0, color=RED, lw=0.8, ls=":")
+        ax1.legend(fontsize=7, labelcolor=GRAY, framealpha=0.2)
+    ax1.set_title("OOS Return Distribution", color=GRAY, fontsize=8)
+    ax1.tick_params(colors=GRAY, labelsize=7)
+    for sp in ax1.spines.values():
+        sp.set_color(BORDER)
+
+    # ── Sharpe by window ──────────────────────────────────────────────────
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.set_facecolor(PANEL)
+    if not win_df.empty:
+        sharpes = win_df["Sharpe"].values
+        colors_ = [GREEN if s >= 0 else RED for s in sharpes]
+        ax2.bar(range(len(sharpes)), sharpes, color=colors_, alpha=0.75, width=0.7)
+        ax2.axhline(0, color=WHITE, lw=0.7, ls="--")
+        ax2.axhline(1.0, color=GREEN, lw=0.7, ls=":", alpha=0.5)
+    ax2.set_title("OOS Sharpe per Window", color=GRAY, fontsize=8)
+    ax2.tick_params(colors=GRAY, labelsize=7)
+    for sp in ax2.spines.values():
+        sp.set_color(BORDER)
+
+    # ── Win Rate by window ────────────────────────────────────────────────
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.set_facecolor(PANEL)
+    if not win_df.empty:
+        wrs = win_df["Win Rate (%)"].values
+        colors_ = [GREEN if w >= 50 else RED for w in wrs]
+        ax3.bar(range(len(wrs)), wrs, color=colors_, alpha=0.75, width=0.7)
+        ax3.axhline(50, color=WHITE, lw=0.8, ls="--")
+    ax3.set_title("OOS Win Rate (%) per Window", color=GRAY, fontsize=8)
+    ax3.tick_params(colors=GRAY, labelsize=7)
+    for sp in ax3.spines.values():
+        sp.set_color(BORDER)
+
+    # ── Max DD by window ─────────────────────────────────────────────────
+    ax4 = fig.add_subplot(gs[1, 0])
+    ax4.set_facecolor(PANEL)
+    if not win_df.empty:
+        dds = win_df["Max DD (%)"].values
+        ax4.bar(range(len(dds)), dds, color=RED, alpha=0.6, width=0.7)
+        ax4.axhline(float(np.median(dds)), color=ORANGE, lw=1, ls="--",
+                    label=f"Median {np.median(dds):.1f}%")
+        ax4.legend(fontsize=7, labelcolor=GRAY, framealpha=0.2)
+    ax4.set_title("OOS Max Drawdown (%) per Window", color=GRAY, fontsize=8)
+    ax4.tick_params(colors=GRAY, labelsize=7)
+    for sp in ax4.spines.values():
+        sp.set_color(BORDER)
+
+    # ── OOS trade net PnL distribution ───────────────────────────────────
+    ax5 = fig.add_subplot(gs[1, 1])
+    ax5.set_facecolor(PANEL)
+    if not trades.empty and "net_pnl" in trades.columns:
+        pnls = trades["net_pnl"].values
+        wins = pnls[pnls > 0]
+        loss = pnls[pnls <= 0]
+        ax5.hist(wins, bins=20, color=GREEN, alpha=0.6, label=f"Wins ({len(wins)})")
+        ax5.hist(loss, bins=20, color=RED,   alpha=0.6, label=f"Loss ({len(loss)})")
+        ax5.axvline(0, color=WHITE, lw=0.7)
+        ax5.legend(fontsize=7, labelcolor=GRAY, framealpha=0.2)
+    ax5.set_title("OOS Trade PnL Distribution", color=GRAY, fontsize=8)
+    ax5.tick_params(colors=GRAY, labelsize=7)
+    for sp in ax5.spines.values():
+        sp.set_color(BORDER)
+
+    # ── Window KPI table ──────────────────────────────────────────────────
+    ax6 = fig.add_subplot(gs[1, 2])
+    ax6.set_facecolor(PANEL)
+    ax6.axis("off")
+    if not win_df.empty:
+        show_cols = ["OOS Return (%)", "# Trades", "Win Rate (%)",
+                     "Sharpe", "Max DD (%)"]
+        tbl_df = win_df[show_cols].copy()
+        tbl_df.index.name = "Win"
+
+        col_labels = ["Ret%", "N", "WR%", "Sharpe", "DD%"]
+        cell_text  = [[str(tbl_df.iloc[i][c]) for c in show_cols]
+                      for i in range(len(tbl_df))]
+
+        tbl = ax6.table(
+            cellText   = cell_text,
+            rowLabels  = [f"W{int(w)}" for w in tbl_df.index],
+            colLabels  = col_labels,
+            cellLoc    = "center",
+            rowLoc     = "right",
+            loc        = "center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(6.5)
+
+        for (r, c), cell in tbl.get_celld().items():
+            cell.set_facecolor(BG if r == 0 else PANEL)
+            cell.set_edgecolor(BORDER)
+            cell.set_text_props(color=GRAY if r > 0 else WHITE)
+
+        ax6.set_title("Per-Window KPIs", color=GRAY, fontsize=8, pad=4)
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Master PDF assembler
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1356,6 +1580,7 @@ def generate_pdf(
     lev_comp_df:      Optional[pd.DataFrame] = None,
     lev_equity_store: Optional[dict] = None,
     lev_scenario:     str = "Session 08-21",
+    wf_result:        Optional[dict] = None,
     output_path:      str = "reports/BTCUSDT_Strategy_Report.pdf",
 ) -> Path:
     """
@@ -1422,6 +1647,12 @@ def generate_pdf(
                                          _page_leverage_heatmaps(_df, _sc)),
             ("K · Best Configs",     lambda _df=lev_comp_df:
                                          _page_best_configs(_df)),
+        ]
+
+    if wf_result is not None and wf_result.get("n_windows", 0) > 0:
+        pages += [
+            ("L · Walk-Forward",     lambda _wf=wf_result: _page_walk_forward(_wf)),
+            ("M · WF Statistics",    lambda _wf=wf_result: _page_wf_stats(_wf)),
         ]
 
     metadata = {

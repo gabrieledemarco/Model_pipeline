@@ -96,7 +96,7 @@ def one_hour_entry(df: pd.DataFrame) -> pd.Series:
 
 def oi_signal(df_oi: pd.DataFrame, df_price: pd.DataFrame) -> pd.Series:
     """
-    Open Interest confirmation / divergence signal.
+    Open Interest confirmation / divergence signal (synthetic OI fallback).
     Score: -2 to +2
 
       Price ↑ + OI ↑  →  +2  (new longs entering, confirmed bull)
@@ -118,6 +118,47 @@ def oi_signal(df_oi: pd.DataFrame, df_price: pd.DataFrame) -> pd.Series:
     s[ (p_c > 0) & (oi_c <= 0)] =  1.0
 
     return s.reindex(df_price.index, fill_value=0).rename("s_oi")
+
+
+def basis_oi_signal(premium_1h: pd.Series, df_price_1h: pd.DataFrame) -> pd.Series:
+    """
+    Real OI proxy using Binance Vision premiumIndexKlines (basis = futures - spot).
+    Score: -2 to +2  (same semantics as oi_signal)
+
+    Logic mirrors OI divergence but using basis changes as positioning proxy:
+      Price ↑ + Basis ↑  →  +2  longs aggressively bidding up futures (confirmed bull)
+      Price ↓ + Basis ↓  →  -2  shorts pushing futures below spot (confirmed bear)
+      Price ↓ + Basis ↑  →  -1  shorts entering but paying premium (bear, less clean)
+      Price ↑ + Basis ↓  →  +1  short squeeze; longs not chasing (weakly bullish)
+
+    Additionally: extreme absolute basis (>0.15%) → contrarian overlay
+      Basis > +0.15%  →  cap score at 0 (longs overextended, not a buy)
+      Basis < -0.10%  →  cap score at 0 (shorts overextended, not a sell)
+    """
+    p_chg = df_price_1h["close"].pct_change()
+
+    # Align basis to 1H price index via forward-fill
+    prem_idx = premium_1h.index.astype("datetime64[s]")
+    price_idx = df_price_1h.index.astype("datetime64[s]")
+    prem_df = pd.DataFrame({"ts": prem_idx, "v": premium_1h.values}).sort_values("ts")
+    base_df = pd.DataFrame({"ts": price_idx})
+    merged = pd.merge_asof(base_df, prem_df, on="ts", direction="backward")
+    basis = pd.Series(merged["v"].fillna(0.0).values,
+                      index=df_price_1h.index, name="basis")
+
+    b_chg = basis.diff()
+
+    s = pd.Series(0.0, index=df_price_1h.index)
+    s[(p_chg > 0)  & (b_chg > 0)]  =  2.0
+    s[(p_chg <= 0) & (b_chg <= 0)] = -2.0
+    s[(p_chg <= 0) & (b_chg > 0)]  = -1.0
+    s[(p_chg > 0)  & (b_chg <= 0)] =  1.0
+
+    # Contrarian cap: extreme basis means market is overcrowded
+    s[basis >  0.0015] = np.minimum(s[basis >  0.0015], 0.0)
+    s[basis < -0.0010] = np.maximum(s[basis < -0.0010], 0.0)
+
+    return s.rename("s_oi")
 
 
 def funding_signal(funding: pd.Series) -> pd.Series:
@@ -200,26 +241,38 @@ STRONG_THRESH = 8.0
 
 def _align(signal: pd.Series, target_index: pd.DatetimeIndex) -> np.ndarray:
     """Forward-fill a higher-TF signal to the target (1H) index."""
-    s_df = (signal.reset_index()
-                  .rename(columns={signal.index.name or "index": "ts",
-                                   signal.name: "v"})
-                  .sort_values("ts"))
-    base = pd.DataFrame({"ts": target_index})
+    # Normalise both sides to second precision to avoid ms-vs-s merge errors
+    # (Binance Vision returns datetime64[s], yfinance returns datetime64[ms/ns])
+    tgt = target_index.astype("datetime64[s]")
+    sig_idx = pd.DatetimeIndex(signal.index).astype("datetime64[s]")
+    s_df = pd.DataFrame({"ts": sig_idx, "v": signal.values}).sort_values("ts")
+    base = pd.DataFrame({"ts": tgt})
     merged = pd.merge_asof(base, s_df, on="ts", direction="backward")
     return merged["v"].fillna(0.0).to_numpy()
 
 
 def build_signal_matrix(
-    tf_data: Dict[str, pd.DataFrame],
-    oi_df:   pd.DataFrame,
-    funding: pd.Series,
+    tf_data:    Dict[str, pd.DataFrame],
+    oi_df:      pd.DataFrame,
+    funding:    pd.Series,
+    premium_1h: pd.Series = None,
 ) -> pd.DataFrame:
     """
     Compute all signal components and produce a composite score on the 1H index.
 
+    Parameters
+    ----------
+    tf_data     : multi-TF OHLCV DataFrames with indicators
+    oi_df       : synthetic OI DataFrame (fallback when premium_1h is None/empty)
+    funding     : daily funding rate Series
+    premium_1h  : real basis series from Binance Vision premiumIndexKlines (1H).
+                  When provided and non-empty, replaces synthetic OI with the real
+                  basis_oi_signal (price × basis direction divergence).
+
     Returns a DataFrame indexed to 1H bars with columns:
       s_weekly, s_daily, s_4h, s_1h, s_oi, s_funding, s_vol, s_cycle,
-      composite, signal (−1 / 0 / +1), strong (bool), regime (str)
+      composite, signal (−1 / 0 / +1), strong (bool), regime (str),
+      oi_source ('real_basis' | 'synthetic')
     """
     df_1w = tf_data["1W"]
     df_1d = tf_data["1D"]
@@ -228,13 +281,25 @@ def build_signal_matrix(
 
     base = df_1h.index
 
+    # OI / basis signal: use real basis when available
+    use_real_basis = (premium_1h is not None and
+                      not premium_1h.empty and
+                      len(premium_1h) > 100)
+
+    if use_real_basis:
+        s_oi_raw = basis_oi_signal(premium_1h, df_1h)
+        oi_source = "real_basis"
+    else:
+        s_oi_raw = oi_signal(oi_df, df_1d)
+        oi_source = "synthetic"
+
     # Native-TF signals
     raw = {
         "s_weekly":  weekly_trend(df_1w),
         "s_daily":   daily_trend(df_1d),
         "s_4h":      fourfour_setup(df_4h),
         "s_1h":      one_hour_entry(df_1h),
-        "s_oi":      oi_signal(oi_df, df_1d),
+        "s_oi":      s_oi_raw,
         "s_funding": funding_signal(funding),
         "s_vol":     volume_signal(df_1h),
         "s_cycle":   cyclicality_signal(df_1h),
@@ -243,12 +308,15 @@ def build_signal_matrix(
     out = pd.DataFrame(index=base)
 
     # HTF signals: align to 1H via forward-fill
+    # s_oi with real basis is already at 1H — still run through _align for safety
     for key in ("s_weekly", "s_daily", "s_4h", "s_oi", "s_funding"):
         out[key] = _align(raw[key], base)
 
     # Same-TF signals: direct assignment
     for key in ("s_1h", "s_vol", "s_cycle"):
         out[key] = raw[key].reindex(base, fill_value=0).values
+
+    out["oi_source"] = oi_source
 
     # Weighted composite
     out["composite"] = sum(out[k] * WEIGHTS[k] for k in WEIGHTS)
