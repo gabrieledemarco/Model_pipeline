@@ -1,21 +1,14 @@
 """
-ML gate experiment: train a LightGBM classifier to filter composite signals
-based on predicted trade profitability.
+ML gate v2 experiment report.
 
-Pipeline
-────────
-1. Load data (from cache) + build indicators
-2. Build bias-free signal matrix (Session 08-21 filter)
-3. Build feature matrix (ml_features.build_feature_matrix)
-4. Walk-forward ML gate (ml_gate.walk_forward_ml_gate)
-   - 6m train / 2m OOS / 23 windows
-   - Label: did this trade make money?
-   - Predict: P(profitable | features at entry bar)
-5. Compare three equity curves:
-   a. Baseline: composite ±5 + session filter
-   b. ML-gated (thr=0.55): composite signal allowed only if ML agrees
-   c. ML-gated (thr=0.60): stricter gate
-6. Generate HTML report → reports/ml_report.html
+Compares 4 strategies on bias-free signals (composite ±3, session 08-21):
+  A. Baseline            : no ML gate
+  B. Binary gate (v1)    : P(profitable) ≥ 0.55, no early stopping [reference]
+  C. Binary gate (v2)    : early stopping + progressive feature selection
+  D. Regression gate (v2): predict trade return%, allow if predicted > 0
+
+Walk-forward: 6m train / 2m OOS / 23 windows.
+Output → reports/ml_report.html
 """
 from __future__ import annotations
 
@@ -34,18 +27,29 @@ from src.strategy.signals        import build_signal_matrix
 from src.strategy.optimizer      import apply_filters, ScenarioConfig
 from src.strategy.engine         import run_backtest, INIT_CAP
 from src.strategy.ml_features    import build_feature_matrix
-from src.strategy.ml_gate        import walk_forward_ml_gate, run_gated_backtest
+from src.strategy.ml_gate        import (
+    walk_forward_binary_gate,
+    walk_forward_regression_gate,
+    run_gated_backtest,
+    TRAIN_MONTHS, OOS_MONTHS,
+)
 
-SESSION_CFG = ScenarioConfig("Session 08-21", session_hours=(8, 21), long_threshold=3.0, short_threshold=-3.0)
+SESSION_CFG = ScenarioConfig(
+    "Session 08-21",
+    session_hours=(8, 21),
+    long_threshold=3.0,
+    short_threshold=-3.0,
+)
 
 
-def kpi_row(name: str, bt: dict) -> dict:
+def kpi_row(name: str, bt: dict, extra: dict = None) -> dict:
     k = bt["kpis"]
-    return {
+    r = {
         "name":          name,
         "total_return":  round(k.get("total_return", 0) * 100, 2),
         "max_dd":        round(k.get("max_drawdown", 0) * 100, 2),
         "sharpe":        round(k.get("sharpe", 0), 3),
+        "calmar":        round(k.get("calmar", 0), 3),
         "win_rate":      round(k.get("win_rate", 0) * 100, 1),
         "profit_factor": round(k.get("profit_factor", 0), 2),
         "n_trades":      k.get("n_trades", 0),
@@ -55,13 +59,18 @@ def kpi_row(name: str, bt: dict) -> dict:
         "drawdown":      bt["drawdown"].tolist(),
         "index":         [str(t) for t in bt["equity"].index],
     }
+    if extra:
+        r.update(extra)
+    return r
 
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("\n══ ML Gate Report ═════════════════════════════════════════════════")
+    print("\n══ ML Gate v2 Report ══════════════════════════════════════════════")
 
-    # ── 1. Load data ──────────────────────────────────────────────────────────
-    print("\n[1/5] Loading data …")
+    # ── 1. Data ───────────────────────────────────────────────────────────────
+    print("\n[1/6] Loading data …")
     raw = fetch_extended_data(start_year=2022, start_month=1, fetch_1m=False)
     tf_ind = {}
     for tf in ["1W", "1D", "4H", "1H", "15M"]:
@@ -70,66 +79,83 @@ def main():
 
     df_1h   = tf_ind["1H"]
     df_15m  = tf_ind["15M"]
-    oi_df   = generate_oi(tf_ind["1D"]["close"])   if not tf_ind["1D"].empty else pd.DataFrame()
-    funding = generate_funding(tf_ind["1D"]["close"]) if not tf_ind["1D"].empty else pd.Series(dtype=float)
+    oi_df   = generate_oi(tf_ind["1D"]["close"])
+    funding = generate_funding(tf_ind["1D"]["close"])
 
-    # ── 2. Build baseline signals (threshold ±3, session 08-21) ──────────────
-    print("\n[2/5] Building signal matrix …")
-    raw_signals = build_signal_matrix(
-        tf_data    = tf_ind,
-        oi_df      = oi_df,
-        funding    = funding,
-        premium_1h = None,
-        df_15m     = df_15m,
-        df_1m      = None,
+    # ── 2. Signals ────────────────────────────────────────────────────────────
+    print("\n[2/6] Building signals (±3, session 08-21) …")
+    raw_sig = build_signal_matrix(
+        tf_data=tf_ind, oi_df=oi_df, funding=funding,
+        premium_1h=None, df_15m=df_15m, df_1m=None,
     )
-    signals = apply_filters(raw_signals, SESSION_CFG)
-
+    signals = apply_filters(raw_sig, SESSION_CFG)
     n_sig = int((signals["signal"] != 0).sum())
-    print(f"  Signals: {n_sig} bars  "
-          f"(long={int((signals['signal']==1).sum())}  "
-          f"short={int((signals['signal']==-1).sum())})")
+    print(f"  Active signal bars: {n_sig:,}")
 
-    # ── 3. Baseline backtest ──────────────────────────────────────────────────
-    print("\n[3/5] Baseline backtest …")
+    # ── 3. Baseline ───────────────────────────────────────────────────────────
+    print("\n[3/6] Baseline backtest …")
     base_bt  = run_backtest(df_1h, signals)
-    baseline = kpi_row("Baseline (composite ±3)", base_bt)
-    print(f"  Return={baseline['total_return']:.1f}%  "
-          f"DD={baseline['max_dd']:.1f}%  "
-          f"Win={baseline['win_rate']:.0f}%  "
+    baseline = kpi_row("A. Baseline (no gate)", base_bt,
+                       extra={"n_allowed": n_sig, "filter_rate": 0.0,
+                              "window_stats": [], "importances": []})
+    print(f"  Return={baseline['total_return']:+.1f}%  "
+          f"DD={baseline['max_dd']:.1f}%  Win={baseline['win_rate']:.0f}%  "
           f"Trades={baseline['n_trades']}")
 
     # ── 4. Feature matrix ─────────────────────────────────────────────────────
-    print("\n[4/5] Building feature matrix …")
+    print("\n[4/6] Feature matrix …")
     feat_df = build_feature_matrix(tf_ind, signals)
-    print(f"  Features: {len(feat_df.columns)} columns × {len(feat_df)} rows")
+    print(f"  Shape: {feat_df.shape[0]:,} rows × {feat_df.shape[1]} features")
 
-    # ── 5. Walk-forward ML gate ───────────────────────────────────────────────
-    print("\n[5/5] Walk-forward ML gate training …")
-    gate_results = {}
+    results = [baseline]
 
-    for thr in [0.50, 0.55, 0.60]:
-        print(f"\n  Threshold P≥{thr:.2f}:")
-        gate = walk_forward_ml_gate(
+    # ── 5. Binary gate v2 (early stopping + feature selection) ───────────────
+    print("\n[5/6] Binary gate v2 (early stopping + feat selection) …")
+    for thr, label in [(0.50, "B. Binary P≥0.50"), (0.55, "C. Binary P≥0.55")]:
+        print(f"\n  {label}:")
+        gate = walk_forward_binary_gate(
             df_1h, signals, feat_df,
-            gate_threshold=thr, verbose=True,
+            gate_threshold=thr, use_feat_sel=True, verbose=True,
         )
-        gated_bt = run_gated_backtest(df_1h, signals, gate)
-        r = kpi_row(f"ML Gate P≥{thr:.2f}", gated_bt)
-        n_allowed = int((gate.gated_signal != 0).sum())
+        bt = run_gated_backtest(df_1h, signals, gate)
+        n_allowed   = int((gate.gated_signal != 0).sum())
         filter_rate = (1 - n_allowed / n_sig) * 100 if n_sig else 0
-        r["n_allowed"]   = n_allowed
-        r["filter_rate"] = round(filter_rate, 1)
-        r["window_stats"] = gate.window_stats
-        r["importances"]  = gate.importances.head(20).to_dict("records") if gate.importances is not None else []
-        gate_results[f"{thr:.2f}"] = r
-        print(f"  → Return={r['total_return']:.1f}%  DD={r['max_dd']:.1f}%  "
+        r = kpi_row(label, bt, extra={
+            "n_allowed":   n_allowed,
+            "filter_rate": round(filter_rate, 1),
+            "window_stats": gate.window_stats,
+            "importances":  gate.importances.head(20).to_dict("records") if gate.importances is not None else [],
+        })
+        results.append(r)
+        print(f"  → Return={r['total_return']:+.1f}%  DD={r['max_dd']:.1f}%  "
               f"Win={r['win_rate']:.0f}%  Trades={r['n_trades']}  "
               f"Filtered={filter_rate:.0f}%")
 
-    # ── Generate report ───────────────────────────────────────────────────────
-    print("\nGenerating HTML report …")
-    html = _build_html(baseline, gate_results)
+    # ── 6. Regression gate v2 ─────────────────────────────────────────────────
+    print("\n[6/6] Regression gate v2 …")
+    for min_ret, label in [(0.0, "D. Regression ret≥0%"), (0.005, "E. Regression ret≥0.5%")]:
+        print(f"\n  {label}:")
+        gate = walk_forward_regression_gate(
+            df_1h, signals, feat_df,
+            min_return_pct=min_ret, use_feat_sel=True, verbose=True,
+        )
+        bt = run_gated_backtest(df_1h, signals, gate)
+        n_allowed   = int((gate.gated_signal != 0).sum())
+        filter_rate = (1 - n_allowed / n_sig) * 100 if n_sig else 0
+        r = kpi_row(label, bt, extra={
+            "n_allowed":   n_allowed,
+            "filter_rate": round(filter_rate, 1),
+            "window_stats": gate.window_stats,
+            "importances":  gate.importances.head(20).to_dict("records") if gate.importances is not None else [],
+        })
+        results.append(r)
+        print(f"  → Return={r['total_return']:+.1f}%  DD={r['max_dd']:.1f}%  "
+              f"Win={r['win_rate']:.0f}%  Trades={r['n_trades']}  "
+              f"Filtered={filter_rate:.0f}%")
+
+    # ── HTML report ───────────────────────────────────────────────────────────
+    print("\nGenerating report …")
+    html = _build_html(results)
     out  = Path("reports/ml_report.html")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding="utf-8")
@@ -138,131 +164,117 @@ def main():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTML report
+# HTML builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _color(val, metric):
-    if metric in ("total_return", "win_rate", "profit_factor", "expectancy"):
+def _c(val, metric):
+    if metric in ("total_return","win_rate","profit_factor","calmar","expectancy"):
         return "pos" if val > 0 else "neg"
     if metric == "max_dd":
         return "pos" if val > -15 else "neg"
     return ""
 
 
-def _build_html(baseline: dict, gate_results: dict) -> str:
-    colours = {"0.50": "#FF9800", "0.55": "#2196F3", "0.60": "#4CAF50"}
-    thr_keys = list(gate_results.keys())
+def _build_html(results: list) -> str:
+    COLOURS = ["#8b949e","#FF9800","#2196F3","#4CAF50","#E91E63"]
 
-    # ── Summary metrics ───────────────────────────────────────────────────────
-    best_key = max(thr_keys, key=lambda k: gate_results[k]["total_return"])
-    best = gate_results[best_key]
+    baseline = results[0]
+    best     = max(results[1:], key=lambda r: r["total_return"])
 
-    # Downsampled index for charts
-    idx = baseline["index"]
-    idx_series = pd.DatetimeIndex(idx)
-    step = max(1, len(idx) // 800)
-    chart_idx = json.dumps([str(idx_series[i].date()) for i in range(0, len(idx), step)])
+    # Downsample
+    idx     = pd.DatetimeIndex(baseline["index"])
+    step    = max(1, len(idx) // 800)
+    ch_idx  = json.dumps([str(idx[j].date()) for j in range(0, len(idx), step)])
 
     def ds(r, col="equity"):
         return json.dumps([round(r[col][j], 2) for j in range(0, len(r[col]), step)])
 
-    def imp_chart_data(imp_list, n=15):
-        top = imp_list[:n]
-        labels = json.dumps([x["feature"] for x in top])
-        vals   = json.dumps([round(x["importance"], 1) for x in top])
-        return labels, vals
+    eq_datasets = []
+    dd_datasets = []
+    for i, r in enumerate(results):
+        col  = COLOURS[i % len(COLOURS)]
+        lbl  = r["name"].replace('"', "'")
+        bw   = "2.5" if i == 0 else "1.8"
+        dash = "[6,3]" if i == 0 else "[]"
+        eq_datasets.append(f"""{{
+  label:"{lbl}", data:{ds(r)},
+  borderColor:"{col}", borderWidth:{bw}, borderDash:{dash},
+  pointRadius:0, fill:false, tension:0.1
+}}""")
+        dd_datasets.append(f"""{{
+  label:"{lbl}", data:{ds(r,"drawdown")},
+  borderColor:"{col}", borderWidth:{bw}, borderDash:{dash},
+  pointRadius:0, fill:false, tension:0.1
+}}""")
 
-    # Feature importance for first gate threshold
-    first_key = thr_keys[1] if len(thr_keys) > 1 else thr_keys[0]
-    imp_labels, imp_vals = imp_chart_data(gate_results[first_key]["importances"])
+    eq_ds = "[" + ",\n".join(eq_datasets) + "]"
+    dd_ds = "[" + ",\n".join(dd_datasets) + "]"
 
-    # Window stats table for first gate
+    # Comparison table
+    def cmp_row(r):
+        row = f"<tr><td>{r['name']}</td>"
+        for col, sfx in [("total_return","%"),("max_dd","%"),("calmar",""),
+                          ("win_rate","%"),("profit_factor",""),
+                          ("n_trades",""),("expectancy","$")]:
+            v = r[col]; c = _c(v, col)
+            row += f"<td class='{c}'>{v}{sfx}</td>"
+        n_allowed   = r.get("n_allowed","—")
+        filter_rate = r.get("filter_rate","—")
+        row += f"<td>{n_allowed}</td><td>{filter_rate}%</td></tr>\n"
+        return row
+
+    cmp_rows = "".join(cmp_row(r) for r in results)
+
+    # Feature importance bars (from first ML result)
+    ml_res = results[1] if len(results) > 1 else results[0]
+    imp_list = ml_res.get("importances", [])[:15]
+    imp_labels = json.dumps([x["feature"] for x in imp_list])
+    imp_vals   = json.dumps([round(x["importance"], 1) for x in imp_list])
+
+    # Regression result importance (last result)
+    reg_res  = results[-1] if len(results) > 4 else results[0]
+    rimp_list = reg_res.get("importances", [])[:15]
+    rimp_labels = json.dumps([x["feature"] for x in rimp_list])
+    rimp_vals   = json.dumps([round(x["importance"], 1) for x in rimp_list])
+
+    # Window stats table (Binary v2 P≥0.55 — index 2)
+    ws_res  = results[2] if len(results) > 2 else results[1]
     win_rows = ""
-    for w in gate_results[first_key]["window_stats"]:
-        pct = round(w["n_gated"] / w["n_sig_oos"] * 100, 0) if w["n_sig_oos"] else 0
+    for w in ws_res.get("window_stats", []):
+        pct = round(w["n_gated"] / w["n_sig_oos"] * 100, 0) if w.get("n_sig_oos") else 0
         win_rows += (
             f"<tr><td>{w['window']}</td>"
             f"<td>{w['oos_start']}</td><td>{w['oos_end']}</td>"
-            f"<td>{w['n_train_tr']}</td>"
-            f"<td class='pos'>{w['n_pos_tr']}</td>"
-            f"<td class='neg'>{w['n_neg_tr']}</td>"
-            f"<td>{w['train_acc']}%</td>"
-            f"<td>{w['n_sig_oos']}</td>"
-            f"<td>{w['n_gated']} ({pct:.0f}%)</td></tr>\n"
+            f"<td>{w['n_train']}</td><td>{w['n_pos']}</td><td>{w['n_neg']}</td>"
+            f"<td class='{'pos' if w.get('val_acc',0)>55 else 'neg'}'>{w.get('val_acc','—')}%</td>"
+            f"<td>{w.get('best_iter','—')}</td><td>{w.get('n_feat','—')}</td>"
+            f"<td>{w['n_sig_oos']} → {w['n_gated']} ({pct:.0f}%)</td></tr>\n"
         )
 
-    # Main comparison table
-    def cmp_row(r):
-        cells = ""
-        for col, sfx in [("total_return","%"),("max_dd","%"),("sharpe",""),
-                          ("win_rate","%"),("profit_factor",""),("n_trades",""),("expectancy","$")]:
-            v = r[col]
-            c = _color(v, col)
-            cells += f"<td class='{c}'>{v}{sfx}</td>"
-        extra = f"<td>{r.get('n_allowed','—')}</td><td>{r.get('filter_rate','—')}%</td>"
-        return f"<tr><td>{r['name']}</td>{cells}{extra}</tr>\n"
-
-    cmp_table = cmp_row(baseline)
-    for k, r in gate_results.items():
-        cmp_table += cmp_row(r)
-
-    # Equity datasets
-    eq_ds = f"""{{
-  label: "Baseline",
-  data: {ds(baseline)},
-  borderColor: "#8b949e",
-  borderWidth: 2,
-  borderDash: [6,3],
-  pointRadius: 0,
-  fill: false,
-  tension: 0.1,
-}}"""
-    for k, r in gate_results.items():
-        col = colours.get(k, "#ffffff")
-        eq_ds += f""",
-{{
-  label: "{r['name']}",
-  data: {ds(r)},
-  borderColor: "{col}",
-  borderWidth: 2,
-  pointRadius: 0,
-  fill: false,
-  tension: 0.1,
-}}"""
-
-    dd_ds = f"""{{
-  label: "Baseline DD",
-  data: {ds(baseline, "drawdown")},
-  borderColor: "#8b949e",
-  borderWidth: 1.5,
-  borderDash: [6,3],
-  pointRadius: 0,
-  fill: false,
-  tension: 0.1,
-}}"""
-    for k, r in gate_results.items():
-        col = colours.get(k, "#ffffff")
-        dd_ds += f""",
-{{
-  label: "{r['name']} DD",
-  data: {ds(r, "drawdown")},
-  borderColor: "{col}",
-  borderWidth: 1.5,
-  pointRadius: 0,
-  fill: "-1",
-  backgroundColor: "{col}11",
-  tension: 0.1,
-}}"""
+    # Regression window stats (index 3)
+    reg_ws_res = results[3] if len(results) > 3 else results[0]
+    reg_win_rows = ""
+    for w in reg_ws_res.get("window_stats", []):
+        pct = round(w["n_gated"] / w["n_sig_oos"] * 100, 0) if w.get("n_sig_oos") else 0
+        reg_win_rows += (
+            f"<tr><td>{w['window']}</td>"
+            f"<td>{w['oos_start']}</td><td>{w['oos_end']}</td>"
+            f"<td>{w['n_train']}</td>"
+            f"<td>{w.get('train_mean_ret','—')}%</td>"
+            f"<td>{w.get('val_rmse','—')}%</td>"
+            f"<td>{w.get('best_iter','—')}</td><td>{w.get('n_feat','—')}</td>"
+            f"<td>{w['n_sig_oos']} → {w['n_gated']} ({pct:.0f}%)</td></tr>\n"
+        )
 
     base_ret = baseline["total_return"]
-    best_ret  = best["total_return"]
-    best_filt = best.get("filter_rate", 0)
+    best_ret = best["total_return"]
+    n_ws     = len(ws_res.get("window_stats", []))
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>ML Gate Report — BTCUSDT Strategy</title>
+<title>ML Gate v2 — BTCUSDT</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
@@ -271,156 +283,133 @@ h1{{text-align:center;padding:24px;font-size:22px;color:#58a6ff;border-bottom:1p
 h2{{color:#79c0ff;font-size:16px;margin:20px 0 10px;padding-left:4px;border-left:3px solid #388bfd;}}
 h3{{color:#8b949e;font-size:13px;margin:10px 0 6px;}}
 .section{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;margin:16px;}}
-.highlight-box{{background:#1c2333;border:1px solid #388bfd;border-radius:6px;padding:12px 16px;margin-bottom:14px;}}
-.highlight-box p{{line-height:1.8;color:#c9d1d9;}}
-.highlight-box strong{{color:#58a6ff;}}
+.box{{background:#1c2333;border:1px solid #388bfd;border-radius:6px;padding:12px 16px;margin-bottom:14px;line-height:1.8;}}
+.box strong{{color:#58a6ff;}}
 table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;}}
-th{{background:#1c2333;color:#8b949e;padding:8px 10px;text-align:right;font-weight:600;position:sticky;top:0;}}
+th{{background:#1c2333;color:#8b949e;padding:8px 10px;text-align:right;font-weight:600;white-space:nowrap;}}
 th:first-child{{text-align:left;}}
-td{{padding:7px 10px;border-bottom:1px solid #21262d;text-align:right;}}
+td{{padding:6px 10px;border-bottom:1px solid #21262d;text-align:right;white-space:nowrap;}}
 td:first-child{{text-align:left;color:#c9d1d9;}}
 tr:hover td{{background:#1c2333;}}
 .pos{{color:#3fb950;}} .neg{{color:#f85149;}}
-.chart-container{{position:relative;height:340px;margin:10px 0;}}
-.chart-sm{{position:relative;height:260px;margin:6px 0;}}
+.chart-xl{{position:relative;height:360px;margin:10px 0;}}
+.chart-md{{position:relative;height:250px;margin:6px 0;}}
 .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:16px;}}
 .stat-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0;}}
-.stat-card{{background:#1c2333;border:1px solid #30363d;border-radius:6px;padding:12px;text-align:center;}}
-.stat-card .val{{font-size:20px;font-weight:700;margin:4px 0;}}
-.stat-card .lbl{{font-size:11px;color:#8b949e;}}
-.badge{{display:inline-block;background:#1c2333;border:1px solid #388bfd;color:#58a6ff;
-        border-radius:4px;padding:2px 8px;font-size:11px;margin-right:6px;}}
-.warn{{color:#e3b341;font-size:12px;margin-top:8px;}}
+.card{{background:#1c2333;border:1px solid #30363d;border-radius:6px;padding:12px;text-align:center;}}
+.card .v{{font-size:20px;font-weight:700;margin:4px 0;}}
+.card .l{{font-size:11px;color:#8b949e;}}
+.badge{{display:inline-block;background:#1c2333;border:1px solid #388bfd;
+        color:#58a6ff;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px;}}
+.scroll{{overflow-x:auto;max-height:360px;overflow-y:auto;}}
 </style>
 </head>
 <body>
-<h1>BTCUSDT — ML Gate Report</h1>
+<h1>BTCUSDT — ML Gate v2</h1>
 
 <!-- Summary -->
 <div class="section">
 <h2>Overview</h2>
-<div class="highlight-box">
-<p>
-LightGBM gate trained to predict trade profitability from multi-timeframe features.
-Session 08-21 UTC. Composite threshold <strong>±3</strong> (best from threshold sweep).
-Walk-forward: <strong>{TRAIN_MONTHS}m train / {OOS_MONTHS}m OOS</strong>,
-sliding by {OOS_MONTHS}m → {len(gate_results[first_key]['window_stats'])} windows.
-<br>
-Baseline return: <strong class="{'pos' if base_ret>0 else 'neg'}">{base_ret:+.1f}%</strong>.
-Best ML gate (P≥{best_key}): <strong class="{'pos' if best_ret>0 else 'neg'}">{best_ret:+.1f}%</strong>
-filtering out <strong>{best_filt:.0f}%</strong> of signals.
-</p>
-<p class="warn">
-⚠ Gate only acts on OOS windows. Bars without ML coverage retain composite signal (first {TRAIN_MONTHS} months bootstrapping cost).
-</p>
+<div class="box">
+Baseline (composite ±3, session 08-21): <strong class="{'pos' if base_ret>0 else 'neg'}">{base_ret:+.1f}%</strong>.
+Best ML gate: <strong class="{'pos' if best_ret>0 else 'neg'}">{best_ret:+.1f}%</strong> — <strong>{best['name']}</strong>.
+<br>Walk-forward: <strong>{TRAIN_MONTHS}m train / {OOS_MONTHS}m OOS</strong> · {n_ws} windows.
+Improvements over v1: early stopping, progressive feature selection (top-{20} after {5} warm-up windows), regression target.
 </div>
-
 <div class="stat-grid">
-  <div class="stat-card">
-    <div class="lbl">Baseline Return</div>
-    <div class="val {'pos' if base_ret>0 else 'neg'}">{base_ret:+.1f}%</div>
-    <div class="lbl">composite ±3</div>
-  </div>
-  <div class="stat-card">
-    <div class="lbl">Best Gate Return</div>
-    <div class="val {'pos' if best_ret>0 else 'neg'}">{best_ret:+.1f}%</div>
-    <div class="lbl">P≥{best_key}</div>
-  </div>
-  <div class="stat-card">
-    <div class="lbl">Best Gate DD</div>
-    <div class="val {'pos' if best['max_dd']>-20 else 'neg'}">{best['max_dd']:.1f}%</div>
-    <div class="lbl">P≥{best_key}</div>
-  </div>
-  <div class="stat-card">
-    <div class="lbl">Best Win Rate</div>
-    <div class="val {'pos' if best['win_rate']>50 else 'neg'}">{best['win_rate']:.0f}%</div>
-    <div class="lbl">P≥{best_key}</div>
-  </div>
+  <div class="card"><div class="l">Baseline Return</div><div class="v {'pos' if base_ret>0 else 'neg'}">{base_ret:+.1f}%</div><div class="l">composite ±3</div></div>
+  <div class="card"><div class="l">Best ML Return</div><div class="v {'pos' if best_ret>0 else 'neg'}">{best_ret:+.1f}%</div><div class="l">{best['name'][:20]}</div></div>
+  <div class="card"><div class="l">Best ML DD</div><div class="v {'pos' if best['max_dd']>-20 else 'neg'}">{best['max_dd']:.1f}%</div><div class="l">{best['name'][:20]}</div></div>
+  <div class="card"><div class="l">Best Win Rate</div><div class="v {'pos' if best['win_rate']>50 else 'neg'}">{best['win_rate']:.0f}%</div><div class="l">{best['name'][:20]}</div></div>
 </div>
 </div>
 
-<!-- Equity curves -->
+<!-- Equity -->
 <div class="section">
-<h2>Equity Curves — Baseline vs ML Gate</h2>
-<div class="chart-container"><canvas id="c_equity"></canvas></div>
-<h2>Drawdown</h2>
-<div class="chart-container" style="height:200px"><canvas id="c_dd"></canvas></div>
+<h2>Equity Curves</h2>
+<div class="chart-xl"><canvas id="ceq"></canvas></div>
+<h2 style="margin-top:16px">Drawdown</h2>
+<div class="chart-md"><canvas id="cdd"></canvas></div>
 </div>
 
 <!-- Comparison table -->
 <div class="section">
-<h2>Performance Comparison</h2>
-<div style="overflow-x:auto"><table>
-<tr><th>Strategy</th><th>Return%</th><th>Max DD%</th><th>Sharpe</th>
+<h2>Performance Summary</h2>
+<div class="scroll"><table>
+<tr><th>Strategy</th><th>Return%</th><th>Max DD%</th><th>Calmar</th>
     <th>Win%</th><th>PF</th><th>Trades</th><th>Expect($)</th>
-    <th># Allowed</th><th>Filter%</th></tr>
-{cmp_table}</table></div>
+    <th>Allowed</th><th>Filtered%</th></tr>
+{cmp_rows}</table></div>
 </div>
 
 <!-- Feature importance -->
 <div class="section">
+<h2>Feature Importance (avg OOS importance, top-15)</h2>
 <div class="grid2">
   <div>
-    <h2><span class="badge">ML</span>Top 15 Features (avg across windows)</h2>
-    <div class="chart-sm"><canvas id="c_imp"></canvas></div>
+    <h3><span class="badge">Binary v2</span>P≥0.55</h3>
+    <div class="chart-md"><canvas id="cimp_b"></canvas></div>
   </div>
   <div>
-    <h2><span class="badge">ML</span>Walk-forward Window Stats (P≥{first_key})</h2>
-    <div style="overflow-x:auto;max-height:320px;"><table>
-    <tr><th>#</th><th>OOS Start</th><th>OOS End</th>
-        <th>Train</th><th class="pos">+</th><th class="neg">-</th>
-        <th>TrainAcc</th><th>Signals</th><th>Gated</th></tr>
-    {win_rows}
-    </table></div>
+    <h3><span class="badge">Regression v2</span>ret≥0%</h3>
+    <div class="chart-md"><canvas id="cimp_r"></canvas></div>
   </div>
 </div>
 </div>
 
+<!-- Window stats: binary -->
+<div class="section">
+<h2><span class="badge">Binary v2</span>Walk-forward Window Stats (P≥0.55)</h2>
+<div class="scroll"><table>
+<tr><th>#</th><th>OOS Start</th><th>OOS End</th>
+    <th>Train</th><th>Win+</th><th>Loss-</th>
+    <th>Val Acc</th><th>Best Iter</th><th># Feats</th><th>Signals → Gated</th></tr>
+{win_rows}</table></div>
+</div>
+
+<!-- Window stats: regression -->
+<div class="section">
+<h2><span class="badge">Regression v2</span>Walk-forward Window Stats (ret≥0%)</h2>
+<div class="scroll"><table>
+<tr><th>#</th><th>OOS Start</th><th>OOS End</th>
+    <th>Train</th><th>μ Train Ret</th><th>Val RMSE</th>
+    <th>Best Iter</th><th># Feats</th><th>Signals → Gated</th></tr>
+{reg_win_rows}</table></div>
+</div>
+
 <script>
-const IDX = {chart_idx};
-const OPT = {{
-  responsive:true, maintainAspectRatio:false, animation:{{duration:0}},
+const IDX={ch_idx};
+const OPT={{responsive:true,maintainAspectRatio:false,animation:{{duration:0}},
   plugins:{{legend:{{labels:{{color:'#8b949e',font:{{size:11}}}}}}}},
   scales:{{
     x:{{ticks:{{color:'#8b949e',maxTicksLimit:12,font:{{size:10}}}},grid:{{color:'#21262d'}}}},
     y:{{ticks:{{color:'#8b949e',font:{{size:10}},callback:v=>v.toLocaleString()}},grid:{{color:'#21262d'}}}}
   }}
 }};
-
-new Chart(document.getElementById('c_equity'),{{
-  type:'line', data:{{labels:IDX, datasets:[{eq_ds}]}}, options:OPT
+new Chart(document.getElementById('ceq'),{{type:'line',data:{{labels:IDX,datasets:{eq_ds}}},options:OPT}});
+new Chart(document.getElementById('cdd'),{{type:'line',
+  data:{{labels:IDX,datasets:{dd_ds}}},
+  options:{{...OPT,scales:{{...OPT.scales,y:{{...OPT.scales.y,
+    ticks:{{...OPT.scales.y.ticks,callback:v=>(v*100).toFixed(1)+'%'}}}}}}}}
 }});
 
-new Chart(document.getElementById('c_dd'),{{
-  type:'line', data:{{labels:IDX, datasets:[{dd_ds}]}},
-  options:{{...OPT, scales:{{...OPT.scales,
-    y:{{...OPT.scales.y, ticks:{{...OPT.scales.y.ticks, callback:v=>(v*100).toFixed(1)+'%'}}}}
-  }}}}
-}});
-
-new Chart(document.getElementById('c_imp'),{{
-  type:'bar',
-  data:{{labels:{imp_labels}, datasets:[{{
-    label:'Avg importance', data:{imp_vals},
-    backgroundColor:'#388bfd88', borderColor:'#388bfd', borderWidth:1,
-  }}]}},
-  options:{{
-    responsive:true, maintainAspectRatio:false, animation:{{duration:0}},
-    indexAxis:'y',
-    plugins:{{legend:{{display:false}}}},
-    scales:{{
-      x:{{ticks:{{color:'#8b949e',font:{{size:10}}}},grid:{{color:'#21262d'}}}},
-      y:{{ticks:{{color:'#8b949e',font:{{size:10}}}},grid:{{color:'#21262d'}}}}
+function impChart(id, labels, vals){{
+  new Chart(document.getElementById(id),{{type:'bar',
+    data:{{labels,datasets:[{{label:'importance',data:vals,
+      backgroundColor:'#388bfd88',borderColor:'#388bfd',borderWidth:1}}]}},
+    options:{{responsive:true,maintainAspectRatio:false,animation:{{duration:0}},
+      indexAxis:'y',plugins:{{legend:{{display:false}}}},
+      scales:{{x:{{ticks:{{color:'#8b949e',font:{{size:10}}}},grid:{{color:'#21262d'}}}},
+               y:{{ticks:{{color:'#8b949e',font:{{size:9}}}},grid:{{color:'#21262d'}}}}}}
     }}
-  }}
-}});
+  }});
+}}
+impChart('cimp_b',{imp_labels},{imp_vals});
+impChart('cimp_r',{rimp_labels},{rimp_vals});
 </script>
 </body>
 </html>"""
 
-
-# Import constant for HTML
-from src.strategy.ml_gate import TRAIN_MONTHS, OOS_MONTHS
 
 if __name__ == "__main__":
     main()
