@@ -292,6 +292,26 @@ def build_signal_matrix(
     """
     Compute all signal components and produce a composite score on the 1H index.
 
+    Lookahead-free alignment rules
+    ───────────────────────────────
+    Every HTF bar is indexed at its open_time but contains close data at
+    open_time + bar_duration.  Without correction, a 1H bar at T would
+    receive a 4H signal whose close is T+4h (future data).
+
+    Fix: shift each HTF signal index forward by its bar duration before
+    merge_asof.  This makes merge_asof find the last bar that CLOSED at
+    or before the 1H bar's open_time — no look-ahead.
+
+      Weekly  → shift +7 days   (bar closes end-of-week)
+      Daily   → shift +1 day    (bar closes at midnight next day)
+      4H      → shift +4 hours
+      Funding → shift +1 day    (daily-resampled series)
+      OI syn. → shift +1 day    (daily-frequency synthetic OI)
+
+    Sub-1H signals (15m, 1m) are aligned from the 1H close_time (= open
+    + 1h) after shifting by their bar duration, so we use the last bar
+    that closed within the 1H bar — not the bar that just opened.
+
     Parameters
     ----------
     tf_data     : multi-TF OHLCV DataFrames with indicators (keys: 1W, 1D, 4H, 1H)
@@ -312,6 +332,8 @@ def build_signal_matrix(
     df_1h = tf_data["1H"]
 
     base = df_1h.index
+    # 1H close_time: aligns sub-1H signals to the last bar closed within each 1H
+    close_times = base + pd.Timedelta(hours=1)
 
     # OI / basis signal: use real basis when available
     use_real_basis = (premium_1h is not None and
@@ -335,29 +357,38 @@ def build_signal_matrix(
               "vol_ratio" in df_1m.columns and len(df_1m) > 100)
     s_1m_raw = one_min_entry(df_1m) if has_1m else pd.Series(0.0, index=base)
 
-    # Native-TF signals
-    raw = {
-        "s_weekly":  weekly_trend(df_1w),
-        "s_daily":   daily_trend(df_1d),
-        "s_4h":      fourfour_setup(df_4h),
-        "s_1h":      one_hour_entry(df_1h),
-        "s_oi":      s_oi_raw,
-        "s_funding": funding_signal(funding),
-        "s_vol":     volume_signal(df_1h),
-        "s_cycle":   cyclicality_signal(df_1h),
-        "s_15m":     s_15m_raw,
-        "s_1m":      s_1m_raw,
-    }
+    def _shift(series: pd.Series, delta: pd.Timedelta) -> pd.Series:
+        """Relabel signal index by +delta so merge_asof finds the last CLOSED bar."""
+        s = series.copy()
+        s.index = s.index + delta
+        return s
 
     out = pd.DataFrame(index=base)
 
-    # HTF / sub-1H signals: forward-fill to 1H via merge_asof
-    for key in ("s_weekly", "s_daily", "s_4h", "s_oi", "s_funding", "s_15m", "s_1m"):
-        out[key] = _align(raw[key], base)
+    # ── HTF signals: shift index forward by bar duration ─────────────────────
+    out["s_weekly"] = _align(_shift(weekly_trend(df_1w),   pd.Timedelta(weeks=1)),  base)
+    out["s_daily"]  = _align(_shift(daily_trend(df_1d),    pd.Timedelta(days=1)),   base)
+    out["s_4h"]     = _align(_shift(fourfour_setup(df_4h), pd.Timedelta(hours=4)),  base)
 
-    # Same-TF signals: direct assignment
-    for key in ("s_1h", "s_vol", "s_cycle"):
-        out[key] = raw[key].reindex(base, fill_value=0).values
+    # OI: real basis is 1H-frequency (no shift needed); synthetic is daily (shift +1d)
+    if use_real_basis:
+        out["s_oi"] = _align(s_oi_raw, base)
+    else:
+        out["s_oi"] = _align(_shift(s_oi_raw, pd.Timedelta(days=1)), base)
+
+    # Funding: daily-resampled → shift +1d
+    out["s_funding"] = _align(
+        _shift(funding_signal(funding), pd.Timedelta(days=1)), base)
+
+    # ── Sub-1H signals: shift by bar duration + align from 1H close_time ─────
+    # Picks the last 15m/1m bar that CLOSED within (not just started in) the 1H.
+    out["s_15m"] = _align(_shift(s_15m_raw, pd.Timedelta(minutes=15)), close_times)
+    out["s_1m"]  = _align(_shift(s_1m_raw,  pd.Timedelta(minutes=1)),  close_times)
+
+    # ── Same-TF 1H signals: direct assignment, no shift ──────────────────────
+    out["s_1h"]    = one_hour_entry(df_1h).reindex(base, fill_value=0).values
+    out["s_vol"]   = volume_signal(df_1h).reindex(base, fill_value=0).values
+    out["s_cycle"] = cyclicality_signal(df_1h).reindex(base, fill_value=0).values
 
     out["oi_source"] = oi_source
     out["has_15m"]   = int(has_15m)
@@ -374,10 +405,12 @@ def build_signal_matrix(
 
     out["strong"] = (out["composite"].abs() >= STRONG_THRESH).astype(int)
 
-    # Regime from daily 200-EMA
+    # Regime from daily 200-EMA: shift +1d (daily bar not closed until next midnight)
     bull_regime = (df_1d["close"] > df_1d["ema_200"]).astype(int)
     out["regime"] = _align(
-        bull_regime.map({1: "bull", 0: "bear"}).rename("regime"), base
+        _shift(bull_regime.map({1: "bull", 0: "bear"}).rename("regime"),
+               pd.Timedelta(days=1)),
+        base,
     )
 
     return out
