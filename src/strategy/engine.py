@@ -69,6 +69,10 @@ def run_backtest(
     sizing_method: str = "fixed_risk",
     size_pct: float | None = None,
     leverage: float = 1.0,
+    max_notional_pct: float = 1.0,
+    vol_target: float | None = None,
+    dd_halt_pct: float | None = None,
+    min_score: float | None = None,
 ) -> dict:
     """
     Event-driven backtest on 1H OHLCV bars.
@@ -89,8 +93,23 @@ def run_backtest(
         Fraction of equity used for sizing (default: RISK_PCT = 0.01).
     leverage : float
         Maximum position notional as a multiple of equity (default: 1.0).
-        Caps position to equity × leverage / price.  No margin-call / liquidation
-        modelling – the ATR stop-loss is assumed to execute without slippage.
+    max_notional_pct : float
+        Hard cap on single-position notional as fraction of equity (default 1.0 = off).
+        E.g. 0.20 limits each position to at most 20 % of current equity notional.
+        Prevents oversized positions when ATR is low relative to price.
+    vol_target : float | None
+        Annualised volatility target (e.g. 0.20 = 20 %).  When set, scales the
+        effective risk fraction inversely to realised vol (rvol_20), keeping
+        portfolio vol near the target.  Scalar is clipped to [0.25, 3.0].
+    dd_halt_pct : float | None
+        Drawdown circuit breaker threshold (e.g. 0.15 = 15 %).  When equity
+        drawdown from its rolling peak exceeds this level, position size is
+        halved; at 1.5× the threshold trading pauses entirely until equity
+        recovers above the single-threshold level.
+    min_score : float | None
+        Minimum absolute composite score required to open a new position
+        (e.g. 8.0 = "strong signals only").  Applies on top of the
+        signal direction filter.
 
     Returns
     -------
@@ -104,16 +123,20 @@ def run_backtest(
     equity_arr = np.full(n, float(initial_capital))
     cash = float(initial_capital)
 
-    o   = df_1h["open"].to_numpy(float)
-    h   = df_1h["high"].to_numpy(float)
-    l   = df_1h["low"].to_numpy(float)
-    c   = df_1h["close"].to_numpy(float)
-    atr = df_1h["atr_14"].to_numpy(float)
+    o    = df_1h["open"].to_numpy(float)
+    h    = df_1h["high"].to_numpy(float)
+    l    = df_1h["low"].to_numpy(float)
+    c    = df_1h["close"].to_numpy(float)
+    atr  = df_1h["atr_14"].to_numpy(float)
+    rvol = df_1h["rvol_20"].to_numpy(float) if "rvol_20" in df_1h.columns \
+           else np.full(n, 1.0)
 
-    sig_arr   = signals["signal"].to_numpy(int)
-    comp_arr  = signals["composite"].to_numpy(float)
+    sig_arr    = signals["signal"].to_numpy(int)
+    comp_arr   = signals["composite"].to_numpy(float)
     regime_arr = signals["regime"].to_numpy(object) if "regime" in signals.columns \
                  else np.full(n, "unknown", dtype=object)
+
+    equity_peak = float(initial_capital)   # for circuit breaker
 
     trades: List[Trade] = []
 
@@ -289,19 +312,42 @@ def run_backtest(
             entry_px  = o[i]            # fill at next-bar open
             curr_atr  = atr[i - 1]
 
+            # ── min_score filter ─────────────────────────────────────────
+            if min_score is not None and abs(comp_arr[i - 1]) < min_score:
+                continue
+
+            # ── drawdown circuit breaker ──────────────────────────────────
+            size_scale = 1.0
+            if dd_halt_pct is not None:
+                current_dd = (equity_arr[i - 1] - equity_peak) / equity_peak
+                if current_dd < -(dd_halt_pct * 1.5):
+                    continue                    # full pause
+                elif current_dd < -dd_halt_pct:
+                    size_scale = 0.5            # half size
+
             if curr_atr > 0 and entry_px > 0:
+                # ── volatility targeting ─────────────────────────────────
+                eff_size_pct = _size_pct
+                if vol_target is not None:
+                    rv = max(rvol[i - 1], 1e-6)
+                    vol_scalar = np.clip(vol_target / rv, 0.25, 3.0)
+                    eff_size_pct = _size_pct * vol_scalar
+
                 # leverage-adjusted max notional
                 max_qty = cash * _leverage * 0.95 / entry_px
 
                 if sizing_method == "fixed_fraction":
-                    # invest _size_pct × leverage of equity as notional
-                    qty = cash * _size_pct * _leverage / entry_px
+                    qty = cash * eff_size_pct * _leverage / entry_px
                 else:  # fixed_risk (default)
-                    # size so the SL costs exactly _size_pct × equity
                     risk_per_unit = curr_atr * _atr_sl
-                    qty = (cash * _size_pct) / risk_per_unit
+                    qty = (cash * eff_size_pct) / risk_per_unit
 
-                qty = min(qty, max_qty)
+                # ── notional cap ─────────────────────────────────────────
+                if max_notional_pct < 1.0:
+                    cap_qty = cash * max_notional_pct / entry_px
+                    qty = min(qty, cap_qty)
+
+                qty = min(qty, max_qty) * size_scale
                 qty = max(qty, 1e-12)
 
                 IN_POS    = True
@@ -333,6 +379,7 @@ def run_backtest(
                     worst = ep; best = ep
 
         equity_arr[i] = _mark()
+        equity_peak = max(equity_peak, equity_arr[i])
 
     # close any open position at last bar
     if IN_POS:
