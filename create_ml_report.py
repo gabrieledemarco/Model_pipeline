@@ -1,11 +1,13 @@
 """
-ML gate v2 experiment report.
+ML gate report — v2 (trade-level) + v3 (bar-level).
 
-Compares 4 strategies on bias-free signals (composite ±3, session 08-21):
+Strategies compared (composite ±3, session 08-21):
   A. Baseline            : no ML gate
-  B. Binary gate (v1)    : P(profitable) ≥ 0.55, no early stopping [reference]
-  C. Binary gate (v2)    : early stopping + progressive feature selection
-  D. Regression gate (v2): predict trade return%, allow if predicted > 0
+  B. Binary P≥0.50 (v2) : trade-level, early stopping + feat selection
+  C. Binary P≥0.55 (v2) : trade-level, early stopping + feat selection
+  D. Regression ret≥0%   : trade-level, predict trade return %
+  E. Bar-level P≥0.55    : ALL 1H bars as training (~6k vs ~200 trades)
+  F. Bar-level P≥0.60    : more selective bar-level gate
 
 Walk-forward: 6m train / 2m OOS / 23 windows.
 Output → reports/ml_report.html
@@ -30,6 +32,7 @@ from src.strategy.ml_features    import build_feature_matrix
 from src.strategy.ml_gate        import (
     walk_forward_binary_gate,
     walk_forward_regression_gate,
+    walk_forward_bar_level_gate,
     run_gated_backtest,
     TRAIN_MONTHS, OOS_MONTHS,
 )
@@ -67,7 +70,7 @@ def kpi_row(name: str, bt: dict, extra: dict = None) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("\n══ ML Gate v2 Report ══════════════════════════════════════════════")
+    print("\n══ ML Gate Report (v2 trade-level + v3 bar-level) ════════════════")
 
     # ── 1. Data ───────────────────────────────────────────────────────────────
     print("\n[1/6] Loading data …")
@@ -103,14 +106,14 @@ def main():
           f"Trades={baseline['n_trades']}")
 
     # ── 4. Feature matrix ─────────────────────────────────────────────────────
-    print("\n[4/6] Feature matrix …")
+    print("\n[4/7] Feature matrix …")
     feat_df = build_feature_matrix(tf_ind, signals)
     print(f"  Shape: {feat_df.shape[0]:,} rows × {feat_df.shape[1]} features")
 
     results = [baseline]
 
     # ── 5. Binary gate v2 (early stopping + feature selection) ───────────────
-    print("\n[5/6] Binary gate v2 (early stopping + feat selection) …")
+    print("\n[5/7] Binary gate v2 (early stopping + feat selection) …")
     for thr, label in [(0.50, "B. Binary P≥0.50"), (0.55, "C. Binary P≥0.55")]:
         print(f"\n  {label}:")
         gate = walk_forward_binary_gate(
@@ -132,12 +135,35 @@ def main():
               f"Filtered={filter_rate:.0f}%")
 
     # ── 6. Regression gate v2 ─────────────────────────────────────────────────
-    print("\n[6/6] Regression gate v2 …")
-    for min_ret, label in [(0.0, "D. Regression ret≥0%"), (0.005, "E. Regression ret≥0.5%")]:
+    print("\n[6/7] Regression gate v2 …")
+    print("\n  D. Regression ret≥0%:")
+    gate = walk_forward_regression_gate(
+        df_1h, signals, feat_df,
+        min_return_pct=0.0, use_feat_sel=True, verbose=True,
+    )
+    bt = run_gated_backtest(df_1h, signals, gate)
+    n_allowed   = int((gate.gated_signal != 0).sum())
+    filter_rate = (1 - n_allowed / n_sig) * 100 if n_sig else 0
+    r = kpi_row("D. Regression ret≥0%", bt, extra={
+        "n_allowed":   n_allowed,
+        "filter_rate": round(filter_rate, 1),
+        "window_stats": gate.window_stats,
+        "importances":  gate.importances.head(20).to_dict("records") if gate.importances is not None else [],
+        "gate_type": "regression",
+    })
+    results.append(r)
+    print(f"  → Return={r['total_return']:+.1f}%  DD={r['max_dd']:.1f}%  "
+          f"Win={r['win_rate']:.0f}%  Trades={r['n_trades']}  "
+          f"Filtered={filter_rate:.0f}%")
+
+    # ── 7. Bar-level direction gate v3 ────────────────────────────────────────
+    print("\n[7/7] Bar-level direction gate v3 (~6k training bars per window) …")
+    for thr, label in [(0.55, "E. Bar-level P≥0.55"), (0.60, "F. Bar-level P≥0.60")]:
         print(f"\n  {label}:")
-        gate = walk_forward_regression_gate(
+        gate = walk_forward_bar_level_gate(
             df_1h, signals, feat_df,
-            min_return_pct=min_ret, use_feat_sel=True, verbose=True,
+            gate_threshold=thr, forward_bars=4,
+            use_feat_sel=True, verbose=True,
         )
         bt = run_gated_backtest(df_1h, signals, gate)
         n_allowed   = int((gate.gated_signal != 0).sum())
@@ -147,6 +173,7 @@ def main():
             "filter_rate": round(filter_rate, 1),
             "window_stats": gate.window_stats,
             "importances":  gate.importances.head(20).to_dict("records") if gate.importances is not None else [],
+            "gate_type": "bar_level",
         })
         results.append(r)
         print(f"  → Return={r['total_return']:+.1f}%  DD={r['max_dd']:.1f}%  "
@@ -176,7 +203,7 @@ def _c(val, metric):
 
 
 def _build_html(results: list) -> str:
-    COLOURS = ["#8b949e","#FF9800","#2196F3","#4CAF50","#E91E63"]
+    COLOURS = ["#8b949e","#FF9800","#2196F3","#4CAF50","#E91E63","#9C27B0","#00BCD4"]
 
     baseline = results[0]
     best     = max(results[1:], key=lambda r: r["total_return"])
@@ -225,20 +252,20 @@ def _build_html(results: list) -> str:
 
     cmp_rows = "".join(cmp_row(r) for r in results)
 
-    # Feature importance bars (from first ML result)
-    ml_res = results[1] if len(results) > 1 else results[0]
+    # Feature importance — Binary v2 P≥0.55 (index 2)
+    ml_res   = results[2] if len(results) > 2 else results[1]
     imp_list = ml_res.get("importances", [])[:15]
     imp_labels = json.dumps([x["feature"] for x in imp_list])
     imp_vals   = json.dumps([round(x["importance"], 1) for x in imp_list])
 
-    # Regression result importance (last result)
-    reg_res  = results[-1] if len(results) > 4 else results[0]
-    rimp_list = reg_res.get("importances", [])[:15]
-    rimp_labels = json.dumps([x["feature"] for x in rimp_list])
-    rimp_vals   = json.dumps([round(x["importance"], 1) for x in rimp_list])
+    # Feature importance — first bar-level result (index 4, "E.")
+    bar_res   = next((r for r in results if r.get("gate_type") == "bar_level"), results[-1])
+    bimp_list = bar_res.get("importances", [])[:15]
+    bimp_labels = json.dumps([x["feature"] for x in bimp_list])
+    bimp_vals   = json.dumps([round(x["importance"], 1) for x in bimp_list])
 
-    # Window stats table (Binary v2 P≥0.55 — index 2)
-    ws_res  = results[2] if len(results) > 2 else results[1]
+    # Window stats — Binary v2 P≥0.55 (index 2)
+    ws_res   = results[2] if len(results) > 2 else results[1]
     win_rows = ""
     for w in ws_res.get("window_stats", []):
         pct = round(w["n_gated"] / w["n_sig_oos"] * 100, 0) if w.get("n_sig_oos") else 0
@@ -251,8 +278,8 @@ def _build_html(results: list) -> str:
             f"<td>{w['n_sig_oos']} → {w['n_gated']} ({pct:.0f}%)</td></tr>\n"
         )
 
-    # Regression window stats (index 3)
-    reg_ws_res = results[3] if len(results) > 3 else results[0]
+    # Window stats — Regression (index 3, "D.")
+    reg_ws_res   = results[3] if len(results) > 3 else results[0]
     reg_win_rows = ""
     for w in reg_ws_res.get("window_stats", []):
         pct = round(w["n_gated"] / w["n_sig_oos"] * 100, 0) if w.get("n_sig_oos") else 0
@@ -266,15 +293,31 @@ def _build_html(results: list) -> str:
             f"<td>{w['n_sig_oos']} → {w['n_gated']} ({pct:.0f}%)</td></tr>\n"
         )
 
-    base_ret = baseline["total_return"]
-    best_ret = best["total_return"]
-    n_ws     = len(ws_res.get("window_stats", []))
+    # Window stats — Bar-level P≥0.55 (index 4, "E.")
+    bar_ws_rows = ""
+    for w in bar_res.get("window_stats", []):
+        pct = round(w["n_gated"] / w["n_sig_oos"] * 100, 0) if w.get("n_sig_oos") else 0
+        bar_ws_rows += (
+            f"<tr><td>{w['window']}</td>"
+            f"<td>{w['oos_start']}</td><td>{w['oos_end']}</td>"
+            f"<td>{w.get('n_train_bars','—')}</td>"
+            f"<td>{w.get('n_up','—')}</td><td>{w.get('n_dn','—')}</td>"
+            f"<td class='{'pos' if w.get('val_acc',0)>53 else 'neg'}'>{w.get('val_acc','—')}%</td>"
+            f"<td>{w.get('best_iter','—')}</td><td>{w.get('n_feat','—')}</td>"
+            f"<td>{w['n_sig_oos']} → {w['n_gated']} ({pct:.0f}%)</td></tr>\n"
+        )
+
+    base_ret   = baseline["total_return"]
+    best_ret   = best["total_return"]
+    n_ws       = len(ws_res.get("window_stats", []))
+    n_bar_ws   = len(bar_res.get("window_stats", []))
+    bar_name   = bar_res.get("name", "Bar-level")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>ML Gate v2 — BTCUSDT</title>
+<title>ML Gate — BTCUSDT</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
@@ -305,7 +348,7 @@ tr:hover td{{background:#1c2333;}}
 </style>
 </head>
 <body>
-<h1>BTCUSDT — ML Gate v2</h1>
+<h1>BTCUSDT — ML Gate (v2 trade-level · v3 bar-level)</h1>
 
 <!-- Summary -->
 <div class="section">
@@ -313,8 +356,10 @@ tr:hover td{{background:#1c2333;}}
 <div class="box">
 Baseline (composite ±3, session 08-21): <strong class="{'pos' if base_ret>0 else 'neg'}">{base_ret:+.1f}%</strong>.
 Best ML gate: <strong class="{'pos' if best_ret>0 else 'neg'}">{best_ret:+.1f}%</strong> — <strong>{best['name']}</strong>.
-<br>Walk-forward: <strong>{TRAIN_MONTHS}m train / {OOS_MONTHS}m OOS</strong> · {n_ws} windows.
-Improvements over v1: early stopping, progressive feature selection (top-{20} after {5} warm-up windows), regression target.
+<br>Walk-forward: <strong>{TRAIN_MONTHS}m train / {OOS_MONTHS}m OOS</strong>.
+<strong>v2 trade-level</strong>: early stopping + feature selection on ~200 trade labels/window.
+<strong>v3 bar-level</strong>: trains on ALL 1H bars (~6k/window), target = 4H forward direction,
+direction-aware gate (LONG: P(up)≥thr · SHORT: P(up)≤1−thr).
 </div>
 <div class="stat-grid">
   <div class="card"><div class="l">Baseline Return</div><div class="v {'pos' if base_ret>0 else 'neg'}">{base_ret:+.1f}%</div><div class="l">composite ±3</div></div>
@@ -347,34 +392,48 @@ Improvements over v1: early stopping, progressive feature selection (top-{20} af
 <h2>Feature Importance (avg OOS importance, top-15)</h2>
 <div class="grid2">
   <div>
-    <h3><span class="badge">Binary v2</span>P≥0.55</h3>
+    <h3><span class="badge">v2 Binary</span>P≥0.55 (trade-level)</h3>
     <div class="chart-md"><canvas id="cimp_b"></canvas></div>
   </div>
   <div>
-    <h3><span class="badge">Regression v2</span>ret≥0%</h3>
-    <div class="chart-md"><canvas id="cimp_r"></canvas></div>
+    <h3><span class="badge">v3 Bar-level</span>P≥0.55 (ALL bars)</h3>
+    <div class="chart-md"><canvas id="cimp_bar"></canvas></div>
   </div>
 </div>
 </div>
 
-<!-- Window stats: binary -->
+<!-- Window stats: binary v2 -->
 <div class="section">
-<h2><span class="badge">Binary v2</span>Walk-forward Window Stats (P≥0.55)</h2>
+<h2><span class="badge">v2 Binary</span>Walk-forward Window Stats — Binary P≥0.55 (trade-level)</h2>
 <div class="scroll"><table>
 <tr><th>#</th><th>OOS Start</th><th>OOS End</th>
-    <th>Train</th><th>Win+</th><th>Loss-</th>
+    <th>Train Trades</th><th>Win+</th><th>Loss-</th>
     <th>Val Acc</th><th>Best Iter</th><th># Feats</th><th>Signals → Gated</th></tr>
 {win_rows}</table></div>
 </div>
 
-<!-- Window stats: regression -->
+<!-- Window stats: regression v2 -->
 <div class="section">
-<h2><span class="badge">Regression v2</span>Walk-forward Window Stats (ret≥0%)</h2>
+<h2><span class="badge">v2 Regression</span>Walk-forward Window Stats — Regression ret≥0% (trade-level)</h2>
 <div class="scroll"><table>
 <tr><th>#</th><th>OOS Start</th><th>OOS End</th>
-    <th>Train</th><th>μ Train Ret</th><th>Val RMSE</th>
+    <th>Train Trades</th><th>μ Train Ret</th><th>Val RMSE</th>
     <th>Best Iter</th><th># Feats</th><th>Signals → Gated</th></tr>
 {reg_win_rows}</table></div>
+</div>
+
+<!-- Window stats: bar-level v3 -->
+<div class="section">
+<h2><span class="badge">v3 Bar-level</span>Walk-forward Window Stats — {bar_name} (ALL 1H bars)</h2>
+<p style="color:#8b949e;font-size:12px;margin-bottom:8px">
+  Training target: y=1 if close[T+4h]&gt;close[T]. ~6,000 bars/window vs ~200 trades.
+  Gate is direction-aware: LONG passes if P(up)≥thr; SHORT passes if P(up)≤1−thr.
+</p>
+<div class="scroll"><table>
+<tr><th>#</th><th>OOS Start</th><th>OOS End</th>
+    <th>Train Bars</th><th>↑ Up</th><th>↓ Dn</th>
+    <th>Val Acc</th><th>Best Iter</th><th># Feats</th><th>Signals → Gated</th></tr>
+{bar_ws_rows}</table></div>
 </div>
 
 <script>
@@ -405,7 +464,7 @@ function impChart(id, labels, vals){{
   }});
 }}
 impChart('cimp_b',{imp_labels},{imp_vals});
-impChart('cimp_r',{rimp_labels},{rimp_vals});
+impChart('cimp_bar',{bimp_labels},{bimp_vals});
 </script>
 </body>
 </html>"""
