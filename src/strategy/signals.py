@@ -10,13 +10,16 @@ Signal component weights (tuned empirically):
   daily_trend   : 4   – primary trend filter; highest weight
   4h_setup      : 3   – intermediate context and setup quality
   1h_entry      : 3   – precise entry timing on the working TF
-  oi_signal     : 2   – positioning pressure from open interest
+  oi_signal     : 2   – positioning pressure from open interest (real basis)
   funding       : 1   – contrarian sentiment from funding rate
   volume        : 2   – volume confirmation / divergence
   cyclicality   : 1   – time-based seasonal edge
+  15m_entry     : 2   – intraday precision entry (RSI-7 + MACD, forward-filled)
+  1m_entry      : 1   – microstructure confirmation (high-vol bar direction)
 
-Max raw composite ≈ ±19 (all components maxed simultaneously).
-Entry thresholds are set at ±5 (loose) and ±8 (strong).
+Entry thresholds: ±5 (loose), ±8 (strong).
+15m and 1m signals are forward-filled to 1H; they contribute 0 when data
+is unavailable, so the system degrades gracefully.
 """
 from __future__ import annotations
 
@@ -161,6 +164,31 @@ def basis_oi_signal(premium_1h: pd.Series, df_price_1h: pd.DataFrame) -> pd.Seri
     return s.rename("s_oi")
 
 
+def fifteen_min_entry(df: pd.DataFrame) -> pd.Series:
+    """
+    15-minute precision entry signal.
+    Score: -2 to +2
+      ±1  RSI-7 zone (fast RSI for short-TF momentum)
+      ±1  MACD histogram sign
+    """
+    s = pd.Series(0.0, index=df.index)
+    s += np.where(df["rsi_7"] > 60, 1.0, np.where(df["rsi_7"] < 40, -1.0, 0.0))
+    s += np.sign(df["macd_hist"].fillna(0))
+    return s.rename("s_15m")
+
+
+def one_min_entry(df: pd.DataFrame) -> pd.Series:
+    """
+    1-minute microstructure signal.
+    Score: -1 to +1
+    High-volume bars (vol_ratio > 2.0) confirm direction via log_ret sign.
+    """
+    s = pd.Series(0.0, index=df.index)
+    mask = df["vol_ratio"] > 2.0
+    s[mask] = np.sign(df.loc[mask, "log_ret"]).clip(-1, 1)
+    return s.rename("s_1m")
+
+
 def funding_signal(funding: pd.Series) -> pd.Series:
     """
     Contrarian funding signal.
@@ -232,6 +260,8 @@ WEIGHTS = {
     "s_funding": 1,
     "s_vol":     2,
     "s_cycle":   1,
+    "s_15m":     2,  # 15-minute entry precision
+    "s_1m":      1,  # 1-minute microstructure
 }
 
 LONG_THRESH   = 5.0
@@ -256,23 +286,25 @@ def build_signal_matrix(
     oi_df:      pd.DataFrame,
     funding:    pd.Series,
     premium_1h: pd.Series = None,
+    df_15m:     pd.DataFrame = None,
+    df_1m:      pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     Compute all signal components and produce a composite score on the 1H index.
 
     Parameters
     ----------
-    tf_data     : multi-TF OHLCV DataFrames with indicators
+    tf_data     : multi-TF OHLCV DataFrames with indicators (keys: 1W, 1D, 4H, 1H)
     oi_df       : synthetic OI DataFrame (fallback when premium_1h is None/empty)
     funding     : daily funding rate Series
-    premium_1h  : real basis series from Binance Vision premiumIndexKlines (1H).
-                  When provided and non-empty, replaces synthetic OI with the real
-                  basis_oi_signal (price × basis direction divergence).
+    premium_1h  : real basis series from Binance Vision premiumIndexKlines (1H)
+    df_15m      : 15-minute OHLCV with indicators (forward-filled to 1H)
+    df_1m       : 1-minute OHLCV with indicators (forward-filled to 1H)
 
     Returns a DataFrame indexed to 1H bars with columns:
       s_weekly, s_daily, s_4h, s_1h, s_oi, s_funding, s_vol, s_cycle,
-      composite, signal (−1 / 0 / +1), strong (bool), regime (str),
-      oi_source ('real_basis' | 'synthetic')
+      s_15m, s_1m, composite, signal (−1 / 0 / +1), strong (bool),
+      regime (str), oi_source ('real_basis' | 'synthetic')
     """
     df_1w = tf_data["1W"]
     df_1d = tf_data["1D"]
@@ -293,6 +325,16 @@ def build_signal_matrix(
         s_oi_raw = oi_signal(oi_df, df_1d)
         oi_source = "synthetic"
 
+    # 15m signal (0 when data unavailable)
+    has_15m = (df_15m is not None and not df_15m.empty and
+               "rsi_7" in df_15m.columns and len(df_15m) > 100)
+    s_15m_raw = fifteen_min_entry(df_15m) if has_15m else pd.Series(0.0, index=base)
+
+    # 1m signal (0 when data unavailable)
+    has_1m = (df_1m is not None and not df_1m.empty and
+              "vol_ratio" in df_1m.columns and len(df_1m) > 100)
+    s_1m_raw = one_min_entry(df_1m) if has_1m else pd.Series(0.0, index=base)
+
     # Native-TF signals
     raw = {
         "s_weekly":  weekly_trend(df_1w),
@@ -303,13 +345,14 @@ def build_signal_matrix(
         "s_funding": funding_signal(funding),
         "s_vol":     volume_signal(df_1h),
         "s_cycle":   cyclicality_signal(df_1h),
+        "s_15m":     s_15m_raw,
+        "s_1m":      s_1m_raw,
     }
 
     out = pd.DataFrame(index=base)
 
-    # HTF signals: align to 1H via forward-fill
-    # s_oi with real basis is already at 1H — still run through _align for safety
-    for key in ("s_weekly", "s_daily", "s_4h", "s_oi", "s_funding"):
+    # HTF / sub-1H signals: forward-fill to 1H via merge_asof
+    for key in ("s_weekly", "s_daily", "s_4h", "s_oi", "s_funding", "s_15m", "s_1m"):
         out[key] = _align(raw[key], base)
 
     # Same-TF signals: direct assignment
@@ -317,6 +360,8 @@ def build_signal_matrix(
         out[key] = raw[key].reindex(base, fill_value=0).values
 
     out["oi_source"] = oi_source
+    out["has_15m"]   = int(has_15m)
+    out["has_1m"]    = int(has_1m)
 
     # Weighted composite
     out["composite"] = sum(out[k] * WEIGHTS[k] for k in WEIGHTS)

@@ -84,22 +84,23 @@ def _months_range(start_year: int, start_month: int,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Binance Vision – 1H OHLCV klines
+# Binance Vision – generic OHLCV klines (any interval)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_klines_month(year: int, month: int) -> Optional[pd.DataFrame]:
-    cache = _ensure_cache() / f"BTCUSDT-1h-{year}-{month:02d}.parquet"
+def _fetch_klines_month_generic(interval: str, year: int, month: int) -> Optional[pd.DataFrame]:
+    """Download one monthly klines zip for any interval (1m, 15m, 1h, …)."""
+    cache = _ensure_cache() / f"BTCUSDT-{interval}-{year}-{month:02d}.parquet"
     if cache.exists():
         return pd.read_parquet(cache)
 
-    url = f"{BVISION}/klines/BTCUSDT/1h/BTCUSDT-1h-{year}-{month:02d}.zip"
+    url = (f"{BVISION}/klines/BTCUSDT/{interval}/"
+           f"BTCUSDT-{interval}-{year}-{month:02d}.zip")
     data = _get_zip(url)
     if data is None:
         return None
 
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         raw = z.open(z.namelist()[0]).read()
-        # some months ship a header row, some don't – detect and skip if present
         first = raw.split(b"\n")[0].decode(errors="ignore").strip()
         skip  = 0 if first and first[0].isdigit() else 1
         df = pd.read_csv(io.BytesIO(raw), header=None,
@@ -113,28 +114,32 @@ def _fetch_klines_month(year: int, month: int) -> Optional[pd.DataFrame]:
     return df
 
 
-def fetch_binance_vision_1h(
+def fetch_binance_vision_klines(
+    interval: str,
     start_year: int = 2022,
     start_month: int = 1,
     end_year: Optional[int] = None,
     end_month: Optional[int] = None,
     workers: int = 6,
+    verbose: bool = False,
 ) -> pd.DataFrame:
     """
-    Download BTCUSDT perpetual 1H OHLCV from Binance Vision CDN.
+    Download BTCUSDT perpetual OHLCV from Binance Vision CDN for any interval.
     Files are cached as parquet; subsequent calls are instant.
+
+    interval : BV interval string, e.g. '1m', '15m', '1h', '4h'
     """
     now = datetime.now()
     if end_year is None:
         end_year = now.year
     if end_month is None:
-        end_month = now.month - 1 or 12  # last complete month
+        end_month = now.month - 1 or 12
 
     months = _months_range(start_year, start_month, end_year, end_month)
     frames: List[pd.DataFrame] = [None] * len(months)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_fetch_klines_month, y, m): i
+        futs = {ex.submit(_fetch_klines_month_generic, interval, y, m): i
                 for i, (y, m) in enumerate(months)}
         for fut in as_completed(futs):
             idx = futs[fut]
@@ -142,9 +147,11 @@ def fetch_binance_vision_1h(
             result = fut.result()
             if result is not None:
                 frames[idx] = result
-                print(f"  ✓ {y}-{m:02d}: {len(result):5d} bars")
+                if verbose:
+                    print(f"  ✓ {interval} {y}-{m:02d}: {len(result):6d} bars")
             else:
-                print(f"  ✗ {y}-{m:02d}: not available")
+                if verbose:
+                    print(f"  ✗ {interval} {y}-{m:02d}: not available")
 
     valid = [f for f in frames if f is not None]
     if not valid:
@@ -153,6 +160,21 @@ def fetch_binance_vision_1h(
     out = pd.concat(valid).sort_index()
     out = out[~out.index.duplicated(keep="first")]
     return out
+
+
+def fetch_binance_vision_1h(
+    start_year: int = 2022,
+    start_month: int = 1,
+    end_year: Optional[int] = None,
+    end_month: Optional[int] = None,
+    workers: int = 6,
+) -> pd.DataFrame:
+    """Download BTCUSDT perpetual 1H OHLCV from Binance Vision CDN."""
+    df = fetch_binance_vision_klines(
+        "1h", start_year=start_year, start_month=start_month,
+        end_year=end_year, end_month=end_month, workers=workers, verbose=True,
+    )
+    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,16 +322,18 @@ def fetch_extended_data(
     start_month: int = 1,
     workers: int = 6,
     symbol: str = SYMBOL,
+    fetch_15m: bool = True,
+    fetch_1m: bool = True,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Fetch 2+ years of multi-TF data.
+    Fetch multi-TF data from Binance Vision (futures) + yfinance (macro).
 
-    1H + 4H : Binance Vision perpetual futures (real prices)
-              Falls back to yfinance spot if CDN unreachable.
-    1D + 1W  : yfinance (4-year history, macro context)
-    15M      : yfinance 60-day (not needed for strategy but kept for completeness)
+    1H + 4H  : Binance Vision perpetual futures.  Falls back to yfinance.
+    1D + 1W  : yfinance (4-year history, macro context).
+    15M      : Binance Vision (~2,900 bars/month). Falls back to yfinance 60d.
+    1M       : Binance Vision (~43,800 bars/month). Heavy; skip with fetch_1m=False.
 
-    Returns dict with keys: 1W, 1D, 4H, 1H, 15M
+    Returns dict with keys: 1W, 1D, 4H, 1H, 15M, 1M
     """
     result: Dict[str, pd.DataFrame] = {}
 
@@ -333,17 +357,37 @@ def fetch_extended_data(
     # ── 1W from yfinance ────────────────────────────────────────────────────
     result["1W"] = fetch_ohlcv_yf("1W", symbol)
 
-    # ── 15M (yfinance, 60d) ──────────────────────────────────────────────────
-    try:
-        result["15M"] = fetch_ohlcv_yf("15M", symbol)
-    except Exception:
+    # ── 15M from Binance Vision (~2,900 bars/month) ──────────────────────────
+    if fetch_15m:
+        print("  Downloading 15m from Binance Vision …")
+        df_15m = fetch_binance_vision_klines(
+            "15m", start_year=start_year, start_month=start_month,
+            workers=workers, verbose=False)
+        if df_15m.empty:
+            try:
+                df_15m = fetch_ohlcv_yf("15M", symbol)
+                print("  ↳ BV unavailable – using yfinance 15M (60d)")
+            except Exception:
+                df_15m = pd.DataFrame()
+        result["15M"] = df_15m
+    else:
         result["15M"] = pd.DataFrame()
 
+    # ── 1M from Binance Vision (~43,800 bars/month) ──────────────────────────
+    if fetch_1m:
+        print("  Downloading 1m from Binance Vision … (heavy, cached after first run)")
+        df_1m = fetch_binance_vision_klines(
+            "1m", start_year=start_year, start_month=start_month,
+            workers=workers, verbose=False)
+        result["1M"] = df_1m
+    else:
+        result["1M"] = pd.DataFrame()
+
     # ── Print summary ─────────────────────────────────────────────────────────
-    for tf in ["1W", "1D", "4H", "1H"]:
+    for tf in ["1W", "1D", "4H", "1H", "15M", "1M"]:
         df = result.get(tf, pd.DataFrame())
         if not df.empty:
-            print(f"  [{tf:>3s}]  {len(df):6d} bars  "
+            print(f"  [{tf:>3s}]  {len(df):8,d} bars  "
                   f"[{df.index[0].date()} → {df.index[-1].date()}]")
 
     return result
