@@ -20,9 +20,9 @@ CACHE_DIR = Path(__file__).parent.parent.parent / "data" / "cache"
 FAPI      = "https://fapi.binance.com/fapi/v1"
 
 # REST interval strings for each internal TF key
-_REST_INTERVAL = {"1H": "1h", "15M": "15m", "1M": "1m"}
+_REST_INTERVAL = {"1H": "1h", "4H": "4h", "1D": "1d", "15M": "15m", "1M": "1m"}
 # Cache filename fragment for each TF key
-_CACHE_FRAG    = {"1H": "1h", "15M": "15m", "1M": "1m"}
+_CACHE_FRAG    = {"1H": "1h", "4H": "4h", "1D": "1d", "15M": "15m", "1M": "1m"}
 
 RESAMPLE_AGG = {
     "open": "first", "high": "max",
@@ -104,7 +104,7 @@ def bootstrap_tf(tf_key: str, skip_cache: bool = False) -> pd.DataFrame:
         else:
             df = cached
     else:
-        limit = {"1H": 1500, "15M": 1500, "1M": 500}[tf_key]
+        limit = {"1H": 1500, "4H": 1000, "1D": 1000, "15M": 1500, "1M": 500}.get(tf_key, 500)
         df = fetch_rest_bars(tf_key, limit=limit)
 
     return df
@@ -160,6 +160,8 @@ def bootstrap_all(verbose: bool = True) -> dict:
     -------
     dict with keys:
       "1H"         → pd.DataFrame (full history from cache + recent REST)
+      "4H"         → pd.DataFrame (real Binance futures 4H klines)
+      "1D"         → pd.DataFrame (real Binance futures 1D klines)
       "15M"        → pd.DataFrame
       "1M"         → pd.DataFrame (last ~500 bars only)
       "funding"    → pd.Series
@@ -167,7 +169,7 @@ def bootstrap_all(verbose: bool = True) -> dict:
     """
     out: dict = {}
 
-    for tf in ["1H", "15M"]:
+    for tf in ["1H", "4H", "1D", "15M"]:
         if verbose:
             print(f"  [{tf}] loading cache + REST … ", end="", flush=True)
         df = bootstrap_tf(tf, skip_cache=False)

@@ -2,9 +2,9 @@
 Multi-timeframe OHLCV data fetcher for BTCUSDT.
 
 Primary source: Binance Vision CDN (real BTCUSDT perpetual futures, no API key).
-  - 1H OHLCV  : data/futures/um/monthly/klines/BTCUSDT/1h/
-  - Funding    : data/futures/um/monthly/fundingRate/BTCUSDT/
-  - 4H         : resampled from 1H (same source, consistent)
+  - 1H, 4H, 1D : data/futures/um/monthly/klines/BTCUSDT/{interval}/
+  - Funding     : data/futures/um/monthly/fundingRate/BTCUSDT/
+  - 1W          : resampled from real Binance Vision 1D (futures data, not spot)
 
 Fallback: Yahoo Finance BTC-USD (spot) when Binance Vision is unreachable.
 
@@ -326,12 +326,13 @@ def fetch_extended_data(
     fetch_1m: bool = True,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Fetch multi-TF data from Binance Vision (futures) + yfinance (macro).
+    Fetch multi-TF data entirely from Binance Vision perpetual futures.
+    No resampling, no yfinance spot data — every series is real futures OHLCV.
 
-    1H + 4H  : Binance Vision perpetual futures.  Falls back to yfinance.
-    1D + 1W  : yfinance (4-year history, macro context).
-    15M      : Binance Vision (~2,900 bars/month). Falls back to yfinance 60d.
-    1M       : Binance Vision (~43,800 bars/month). Heavy; skip with fetch_1m=False.
+    1H, 4H, 1D : Binance Vision perpetual futures (real klines for each TF).
+    1W          : resampled from real Binance Vision 1D (not spot prices).
+    15M         : Binance Vision (~2,900 bars/month).
+    1M          : Binance Vision (~43,800 bars/month). Skip with fetch_1m=False.
 
     Returns dict with keys: 1W, 1D, 4H, 1H, 15M, 1M
     """
@@ -339,27 +340,45 @@ def fetch_extended_data(
 
     # ── 1H from Binance Vision ───────────────────────────────────────────────
     print("  Downloading 1H from Binance Vision …")
-    df_1h = fetch_binance_vision_1h(
-        start_year=start_year, start_month=start_month, workers=workers)
-
+    df_1h = fetch_binance_vision_klines(
+        "1h", start_year=start_year, start_month=start_month,
+        workers=workers, verbose=True)
     if df_1h.empty or len(df_1h) < 500:
-        print("  ↳ Binance Vision unavailable – falling back to yfinance")
+        print("  ↳ 1H unavailable – falling back to yfinance")
         df_1h = fetch_ohlcv_yf("1H", symbol)
-
     result["1H"] = df_1h
 
-    # ── 4H resampled from 1H ────────────────────────────────────────────────
-    result["4H"] = resample_to_4h(df_1h)
+    # ── 4H from Binance Vision (real futures, not resampled) ─────────────────
+    print("  Downloading 4H from Binance Vision …")
+    df_4h = fetch_binance_vision_klines(
+        "4h", start_year=start_year, start_month=start_month,
+        workers=workers, verbose=False)
+    if df_4h.empty or len(df_4h) < 100:
+        print("  ↳ 4H unavailable – resampling from 1H as fallback")
+        df_4h = resample_to_4h(df_1h)
+    result["4H"] = df_4h
 
-    # ── 1D from yfinance (4 years for macro context) ─────────────────────────
-    result["1D"] = fetch_ohlcv_yf("1D", symbol)
+    # ── 1D from Binance Vision (real futures, not yfinance spot) ─────────────
+    print("  Downloading 1D from Binance Vision …")
+    df_1d = fetch_binance_vision_klines(
+        "1d", start_year=start_year, start_month=start_month,
+        workers=workers, verbose=False)
+    if df_1d.empty or len(df_1d) < 100:
+        print("  ↳ 1D unavailable – falling back to yfinance")
+        df_1d = fetch_ohlcv_yf("1D", symbol)
+    result["1D"] = df_1d
 
-    # ── 1W from yfinance ────────────────────────────────────────────────────
-    result["1W"] = fetch_ohlcv_yf("1W", symbol)
+    # ── 1W resampled from real Binance Vision 1D (futures prices) ────────────
+    result["1W"] = (df_1d
+                    .resample("W", label="left", closed="left")
+                    .agg({"open": "first", "high": "max",
+                          "low": "min",   "close": "last",
+                          "volume": "sum"})
+                    .dropna(subset=["open"]))
 
     # ── 15M from Binance Vision (~2,900 bars/month) ──────────────────────────
     if fetch_15m:
-        print("  Downloading 15m from Binance Vision …")
+        print("  Downloading 15M from Binance Vision …")
         df_15m = fetch_binance_vision_klines(
             "15m", start_year=start_year, start_month=start_month,
             workers=workers, verbose=False)
@@ -375,7 +394,7 @@ def fetch_extended_data(
 
     # ── 1M from Binance Vision (~43,800 bars/month) ──────────────────────────
     if fetch_1m:
-        print("  Downloading 1m from Binance Vision … (heavy, cached after first run)")
+        print("  Downloading 1M from Binance Vision … (heavy, cached after first run)")
         df_1m = fetch_binance_vision_klines(
             "1m", start_year=start_year, start_month=start_month,
             workers=workers, verbose=False)

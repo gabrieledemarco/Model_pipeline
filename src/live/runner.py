@@ -45,6 +45,8 @@ RESAMPLE_AGG = {"open": "first", "high": "max",
 
 # Rolling window sizes
 MAX_1H  = 5_000    # ~7 months of hourly bars
+MAX_4H  = 3_000    # ~500 days of 4H bars
+MAX_1D  = 2_000    # ~5.5 years of daily bars
 MAX_15M = 600      # ~6 days
 MAX_1M  = 250      # ~4 hours (enough for vol_ratio / log_ret)
 
@@ -67,6 +69,8 @@ class LiveRunner:
 
         # Rolling OHLCV windows (raw, no indicators yet)
         self._buf_1h:  pd.DataFrame = pd.DataFrame()
+        self._buf_4h:  pd.DataFrame = pd.DataFrame()
+        self._buf_1d:  pd.DataFrame = pd.DataFrame()
         self._buf_15m: pd.DataFrame = pd.DataFrame()
         self._buf_1m:  pd.DataFrame = pd.DataFrame()
 
@@ -82,6 +86,8 @@ class LiveRunner:
         print("\n── Bootstrap ────────────────────────────────────────────────")
         raw = bootstrap_all(verbose=verbose)
         self._buf_1h  = raw["1H"]
+        self._buf_4h  = raw.get("4H", pd.DataFrame())
+        self._buf_1d  = raw.get("1D", pd.DataFrame())
         self._buf_15m = raw["15M"]
         self._buf_1m  = raw["1M"]
         self._funding    = raw["funding"]
@@ -128,15 +134,15 @@ class LiveRunner:
         # ── Enrich 1H buffer ────────────────────────────────────────────────
         df_1h = add_indicators(self._buf_1h)
 
-        # ── Resample to HTF ─────────────────────────────────────────────────
-        df_4h = (df_1h.resample("4h").agg(RESAMPLE_AGG)
-                  .dropna(subset=["close"]))
-        df_1d = (df_1h.resample("D").agg(RESAMPLE_AGG)
-                  .dropna(subset=["close"]))
-        df_1w = (df_1h.resample("W").agg(RESAMPLE_AGG)
-                  .dropna(subset=["close"]))
-        df_4h = add_indicators(df_4h) if len(df_4h) > 10 else df_4h
-        df_1d = add_indicators(df_1d) if len(df_1d) > 10 else df_1d
+        # ── Real HTF buffers (no resampling) ────────────────────────────────
+        raw_4h = self._buf_4h if not self._buf_4h.empty else pd.DataFrame()
+        raw_1d = self._buf_1d if not self._buf_1d.empty else pd.DataFrame()
+        df_4h = add_indicators(raw_4h) if len(raw_4h) > 10 else raw_4h
+        df_1d = add_indicators(raw_1d) if len(raw_1d) > 10 else raw_1d
+        # 1W from real 1D futures (resample only the aggregation, not TF data)
+        df_1w = (raw_1d.resample("W", label="left", closed="left")
+                       .agg(RESAMPLE_AGG).dropna(subset=["close"])
+                 if not raw_1d.empty else pd.DataFrame())
         df_1w = add_indicators(df_1w) if len(df_1w) > 10 else df_1w
 
         tf_data = {"1W": df_1w, "1D": df_1d, "4H": df_4h, "1H": df_1h}
@@ -233,7 +239,7 @@ class LiveRunner:
     # ── Background refresh ────────────────────────────────────────────────────
 
     async def _refresh_loop(self) -> None:
-        """Refresh funding rate and premium index every hour."""
+        """Refresh funding, premium, and HTF bars every hour."""
         while True:
             await asyncio.sleep(3600)
             try:
@@ -243,13 +249,27 @@ class LiveRunner:
                 new_prem = await asyncio.to_thread(fetch_premium_1h)
                 if not new_prem.empty:
                     self._premium_1h = new_prem
-                # Also top up 1H buffer with any bars missed
+                # Top up 1H buffer
                 if not self._buf_1h.empty:
                     new_1h = await asyncio.to_thread(
                         fetch_rest_bars, "1H", self._buf_1h.index[-1])
                     if not new_1h.empty:
                         self._buf_1h = (pd.concat([self._buf_1h, new_1h])
                                         .tail(MAX_1H))
-                log.info("Refreshed funding & premium index")
+                # Top up real 4H buffer
+                if not self._buf_4h.empty:
+                    new_4h = await asyncio.to_thread(
+                        fetch_rest_bars, "4H", self._buf_4h.index[-1])
+                    if not new_4h.empty:
+                        self._buf_4h = (pd.concat([self._buf_4h, new_4h])
+                                        .drop_duplicates().tail(MAX_4H))
+                # Top up real 1D buffer
+                if not self._buf_1d.empty:
+                    new_1d = await asyncio.to_thread(
+                        fetch_rest_bars, "1D", self._buf_1d.index[-1])
+                    if not new_1d.empty:
+                        self._buf_1d = (pd.concat([self._buf_1d, new_1d])
+                                        .drop_duplicates().tail(MAX_1D))
+                log.info("Refreshed funding, premium, and HTF bars")
             except Exception as exc:
                 log.warning("Refresh failed: %s", exc)
