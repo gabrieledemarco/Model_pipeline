@@ -338,11 +338,11 @@ def _distance_features(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bars-since helper  (sequential)
+# Bars-since helpers  (sequential)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bars_since(arr: np.ndarray, cap: int) -> np.ndarray:
-    """Number of bars since last nonzero value; cap at `cap` if never happened."""
+    """Number of bars since the most recent nonzero value; `cap` if never happened."""
     N   = len(arr)
     res = np.full(N, cap, dtype=np.float32)
     cnt = cap
@@ -355,17 +355,44 @@ def _bars_since(arr: np.ndarray, cap: int) -> np.ndarray:
     return res
 
 
+def _last_k_bars_since(arr: np.ndarray, k: int, cap: int) -> list[np.ndarray]:
+    """
+    Track the last k occurrences of a binary event and return their ages.
+
+    Returns a list of k arrays where result[0] = age of most recent event,
+    result[1] = age of 2nd most recent, …, result[k-1] = age of k-th most recent.
+    Ages are capped at `cap` when fewer than i+1 events have occurred.
+
+    All arrays have the same length as `arr`.
+    """
+    N      = len(arr)
+    results = [np.full(N, float(cap), dtype=np.float32) for _ in range(k)]
+    # Store bar indices of last k events (newest first)
+    event_positions: list[int] = []
+
+    for i in range(N):
+        if arr[i]:
+            event_positions.insert(0, i)
+            if len(event_positions) > k:
+                event_positions.pop()
+        for j, pos in enumerate(event_positions):
+            results[j][i] = float(min(i - pos, cap))
+
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main public function
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_smc_features(
-    df:           pd.DataFrame,
-    swing_len:    int   = 50,
-    internal_len: int   = 5,
-    fvg_min_atr:  float = 0.0,
-    eq_threshold: float = 0.125,
-    prefix:       str   = "smc",
+    df:             pd.DataFrame,
+    swing_len:      int   = 50,
+    internal_len:   int   = 5,
+    fvg_min_atr:    float = 0.0,
+    eq_threshold:   float = 0.125,
+    n_last_events:  int   = 3,
+    prefix:         str   = "smc",
 ) -> pd.DataFrame:
     """
     Compute all SMC features for an OHLCV DataFrame.
@@ -375,13 +402,16 @@ def compute_smc_features(
 
     Parameters
     ----------
-    swing_len    : confirmation lag for external pivots (default 50).
-    internal_len : confirmation lag for internal pivots (default 5).
-    fvg_min_atr  : minimum FVG size as fraction of ATR (0 = any gap).
-    eq_threshold : equal-level detection tolerance (× ATR).
-    prefix       : column prefix; "" for no prefix, "smc" → "smc_bos_bull".
+    swing_len      : confirmation lag for external pivots (default 50).
+    internal_len   : confirmation lag for internal pivots (default 5).
+    fvg_min_atr    : minimum FVG size as fraction of ATR (0 = any gap).
+    eq_threshold   : equal-level detection tolerance (× ATR).
+    n_last_events  : how many past events to track per event type (default 3).
+                     Generates columns bars_since_X_1 … bars_since_X_n.
+                     Also emits bars_since_X (alias for _1) for backward compat.
+    prefix         : column prefix; "" for no prefix, "smc" → "smc_bos_bull".
 
-    Returns a DataFrame with ~25 SMC feature columns, same index as df.
+    Returns a DataFrame with SMC feature columns, same index as df.
     """
     h = df["high"];   l = df["low"]
     c = df["close"];  o = df["open"]
@@ -421,34 +451,61 @@ def compute_smc_features(
         ext["ob_bear_lo"], ext["ob_bear_hi"],
     )
 
-    # ── Recency (bars since last event) ───────────────────────────────────
+    # ── Recency (last n_last_events per event type) ───────────────────────
     idx = df.index
     cap = len(idx)
-    bs_bos_bull   = _bars_since(ext["bos_bull"],   cap)
-    bs_bos_bear   = _bars_since(ext["bos_bear"],   cap)
-    bs_choch_bull = _bars_since(ext["choch_bull"], cap)
-    bs_choch_bear = _bars_since(ext["choch_bear"], cap)
-
-    # ── Assemble output ───────────────────────────────────────────────────
+    K   = n_last_events
     p   = (prefix + "_") if prefix else ""
     out = pd.DataFrame(index=idx)
 
+    # External structure events
+    ext_event_keys = {
+        "bos_bull":   ext["bos_bull"],
+        "bos_bear":   ext["bos_bear"],
+        "choch_bull": ext["choch_bull"],
+        "choch_bear": ext["choch_bear"],
+    }
+    for ev_name, arr in ext_event_keys.items():
+        k_arrays = _last_k_bars_since(arr, K, cap)
+        for rank, arr_k in enumerate(k_arrays, 1):
+            out[f"{p}bars_since_{ev_name}_{rank}"] = arr_k
+        # backward-compat alias: bars_since_X = bars_since_X_1
+        out[f"{p}bars_since_{ev_name}"] = k_arrays[0]
+
+    # Internal structure events
+    int_event_keys = {
+        "int_bos_bull":   int_["bos_bull"],
+        "int_bos_bear":   int_["bos_bear"],
+        "int_choch_bull": int_["choch_bull"],
+        "int_choch_bear": int_["choch_bear"],
+    }
+    for ev_name, arr in int_event_keys.items():
+        k_arrays = _last_k_bars_since(arr, K, cap)
+        for rank, arr_k in enumerate(k_arrays, 1):
+            out[f"{p}bars_since_{ev_name}_{rank}"] = arr_k
+        out[f"{p}bars_since_{ev_name}"] = k_arrays[0]
+
+    # FVG events (formation bars)
+    fvg_bull_ev = fvg["fvg_bull"].values.astype(np.int8)
+    fvg_bear_ev = fvg["fvg_bear"].values.astype(np.int8)
+    for ev_name, arr in (("fvg_bull", fvg_bull_ev), ("fvg_bear", fvg_bear_ev)):
+        k_arrays = _last_k_bars_since(arr, K, cap)
+        for rank, arr_k in enumerate(k_arrays, 1):
+            out[f"{p}bars_since_{ev_name}_{rank}"] = arr_k
+        out[f"{p}bars_since_{ev_name}"] = k_arrays[0]
+
+    # ── State columns (binary / continuous) ───────────────────────────────
     # External structure
     for k in ("trend", "bos_bull", "bos_bear", "choch_bull", "choch_bear",
                "ob_bull_in", "ob_bear_in"):
         out[f"{p}{k}"] = ext[k]
 
-    # Internal structure
-    for k in ("trend", "bos_bull", "bos_bear", "choch_bull", "choch_bear"):
+    # Internal structure trend + events
+    out[f"{p}int_trend"] = int_["trend"]
+    for k in ("bos_bull", "bos_bear", "choch_bull", "choch_bear"):
         out[f"{p}int_{k}"] = int_[k]
 
-    # Recency
-    out[f"{p}bars_since_bos_bull"]   = bs_bos_bull
-    out[f"{p}bars_since_bos_bear"]   = bs_bos_bear
-    out[f"{p}bars_since_choch_bull"] = bs_choch_bull
-    out[f"{p}bars_since_choch_bear"] = bs_choch_bear
-
-    # FVGs
+    # FVGs (active state + formation flags)
     for col in fvg.columns:
         out[f"{p}{col}"] = fvg[col].values
 
