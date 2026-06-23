@@ -66,6 +66,7 @@ def run_backtest(
     signals: pd.DataFrame,
     initial_capital: float = INIT_CAP,
     atr_sl_override: float | None = None,
+    atr_tp1_override: float | None = None,
     sizing_method: str = "fixed_risk",
     size_pct: float | None = None,
     leverage: float = 1.0,
@@ -86,6 +87,8 @@ def run_backtest(
     initial_capital : float
     atr_sl_override : float | None
         Override ATR_SL multiplier.
+    atr_tp1_override : float | None
+        Override ATR_TP1 multiplier.  TP2 = 2×TP1, TP3 = 3×TP1 automatically.
     sizing_method : str
         "fixed_risk"     – size so that the SL costs exactly *size_pct* of equity.
         "fixed_fraction" – invest *size_pct* × leverage of equity per trade (notional).
@@ -115,7 +118,10 @@ def run_backtest(
     -------
     dict  with keys: equity, drawdown, trades, kpis
     """
-    _atr_sl   = atr_sl_override if atr_sl_override is not None else ATR_SL
+    _atr_sl   = atr_sl_override  if atr_sl_override  is not None else ATR_SL
+    _atr_tp1  = atr_tp1_override if atr_tp1_override is not None else ATR_TP1
+    _atr_tp2  = _atr_tp1 * 2.0
+    _atr_tp3  = _atr_tp1 * 3.0
     _size_pct = size_pct if size_pct is not None else RISK_PCT
     _leverage = max(float(leverage), 1.0)
 
@@ -367,15 +373,15 @@ def run_backtest(
 
                 if new_sig == 1:
                     sl  = ep - curr_atr * _atr_sl
-                    tp1 = ep + curr_atr * ATR_TP1
-                    tp2 = ep + curr_atr * ATR_TP2
-                    tp3 = ep + curr_atr * ATR_TP3
+                    tp1 = ep + curr_atr * _atr_tp1
+                    tp2 = ep + curr_atr * _atr_tp2
+                    tp3 = ep + curr_atr * _atr_tp3
                     worst = ep; best = ep
                 else:
                     sl  = ep + curr_atr * _atr_sl
-                    tp1 = ep - curr_atr * ATR_TP1
-                    tp2 = ep - curr_atr * ATR_TP2
-                    tp3 = ep - curr_atr * ATR_TP3
+                    tp1 = ep - curr_atr * _atr_tp1
+                    tp2 = ep - curr_atr * _atr_tp2
+                    tp3 = ep - curr_atr * _atr_tp3
                     worst = ep; best = ep
 
         equity_arr[i] = _mark()
