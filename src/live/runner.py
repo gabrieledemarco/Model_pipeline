@@ -19,7 +19,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict
+from typing import Callable, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.strategy.indicators import add_indicators
 from src.strategy.signals    import build_signal_matrix, LONG_THRESH, SHORT_THRESH
-from src.strategy.optimizer  import SCENARIOS, apply_filters
+from src.strategy.optimizer  import SCENARIOS, ScenarioConfig, apply_filters
 
 from src.live.bootstrap   import (bootstrap_all, fetch_funding,
                                    fetch_premium_1h, fetch_rest_bars)
@@ -55,17 +55,24 @@ class LiveRunner:
     """
     Parameters
     ----------
-    traders  : dict label → PaperTrader
-    verbose  : print every 15m/1m event (adds noise)
+    traders        : dict label → PaperTrader
+    signal_filters : optional dict label → Callable(signal, composite, df_1h, df_1d) → (int, float)
+                     Per-variant signal post-processors applied before passing to each trader.
+    scenario_cfg   : optional ScenarioConfig override (default: SCENARIOS["Session 08-21"])
+    verbose        : print every 15m/1m event (adds noise)
     """
 
     def __init__(
         self,
         traders: Dict[str, PaperTrader],
+        signal_filters: Optional[Dict[str, Callable]] = None,
+        scenario_cfg: Optional[ScenarioConfig] = None,
         verbose: bool = False,
     ) -> None:
-        self.traders = traders
-        self.verbose = verbose
+        self.traders        = traders
+        self._signal_filters = signal_filters or {}
+        self._scenario_cfg  = scenario_cfg
+        self.verbose        = verbose
 
         # Rolling OHLCV windows (raw, no indicators yet)
         self._buf_1h:  pd.DataFrame = pd.DataFrame()
@@ -173,7 +180,7 @@ class LiveRunner:
             return
 
         # ── Apply scenario (session) filter ─────────────────────────────────
-        cfg     = SCENARIOS[SCENARIO]
+        cfg     = self._scenario_cfg or SCENARIOS[SCENARIO]
         signals = apply_filters(signals, cfg)
 
         # ── Current bar's signal ─────────────────────────────────────────────
@@ -187,7 +194,7 @@ class LiveRunner:
         atr_val  = float(df_1h["atr_14"].iloc[-1]) if "atr_14" in df_1h.columns else 1.0
         rvol_val = float(df_1h["rvol_20"].iloc[-1]) if "rvol_20" in df_1h.columns else 0.20
 
-        # ── Update all paper traders ─────────────────────────────────────────
+        # ── Update all paper traders (with per-variant signal filters) ────────
         ohlc = bar
 
         print(f"\n[{ts}] 1H close  "
@@ -196,7 +203,17 @@ class LiveRunner:
               f"sig={signal:+d}  score={composite:.1f}  "
               f"ATR={atr_val:.0f}  rvol={rvol_val:.3f}")
 
-        for trader in self.traders.values():
+        for label, trader in self.traders.items():
+            # Apply per-variant signal filter if registered
+            t_signal, t_composite = signal, composite
+            if label in self._signal_filters:
+                try:
+                    t_signal, t_composite = self._signal_filters[label](
+                        t_signal, t_composite, df_1h, df_1d
+                    )
+                except Exception as exc:
+                    log.warning("Signal filter for %s failed: %s", label, exc)
+
             events = trader.on_bar(
                 ts       = ts,
                 open_px  = ohlc.open,
@@ -205,8 +222,8 @@ class LiveRunner:
                 close_px = ohlc.close,
                 atr      = atr_val,
                 rvol     = rvol_val,
-                signal   = signal,
-                composite= composite,
+                signal   = t_signal,
+                composite= t_composite,
             )
             for ev in events:
                 print(f"  [{trader.label}] {ev}")
@@ -220,8 +237,9 @@ class LiveRunner:
     # ── Dashboard ─────────────────────────────────────────────────────────────
 
     def _print_dashboard(self, ts: datetime) -> None:
+        cfg_name = self._scenario_cfg.name if self._scenario_cfg else SCENARIO
         print(f"\n{'─'*80}")
-        print(f"  PAPER TRADING DASHBOARD  {ts}  (UTC)  Scenario: {SCENARIO}")
+        print(f"  PAPER TRADING DASHBOARD  {ts}  (UTC)  Scenario: {cfg_name}")
         print(f"{'─'*80}")
         for trader in self.traders.values():
             print(f"  {trader.summary()}")

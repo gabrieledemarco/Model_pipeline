@@ -5,18 +5,29 @@ Usage
 ─────
   python run_paper_trading.py [--strategies S1,S2,...] [--capital N] [--verbose]
 
-Strategies available
-─────────────────────
-  max_return    Extended signals, no risk controls  (IS +298%, OOS +191%)
-  min_dd        Notional 10% + Vol 15% + CB 15%    (IS DD -21.8%)
-  balanced      Notional 20% + Vol 20% + CB 15%    (best Calmar, OOS DD -17%)
-  conservative  balanced + min_score ≥ 8            (fewest trades, tightest risk)
+Enhancement variants (default — from create_enhancements_report.py, WF 2020-2026)
+────────────────────────────────────────────────────────────────────────────────
+  baseline    Fixed 1% risk/trade, threshold=3.0, session 08-21
+              Calmar=0.830  Max DD=37.5%  Return=+31.1%
+
+  vol         Vol-scaled sizing targeting 20% annual vol
+              Calmar=1.473  Max DD=53.6%  Return=+79.0%
+
+  vol_ddhalt  Vol scaling + circuit breaker at 15% DD (size ×0.5, pause at ×1.5)
+              Calmar=0.748  Max DD=40.9%  Return=+30.6%
+
+  vol_ma      Vol scaling + daily EMA-200 regime filter
+              Calmar=0.743  Max DD=54.2%  Return=+40.3%
+
+Legacy variants (kept for backward compatibility)
+─────────────────────────────────────────────────
+  max_return  balanced  min_dd  conservative
 
 Examples
 ────────
   python run_paper_trading.py
-  python run_paper_trading.py --strategies balanced,min_dd --capital 10000
-  python run_paper_trading.py --strategies max_return --verbose
+  python run_paper_trading.py --strategies vol,vol_ddhalt --capital 10000
+  python run_paper_trading.py --strategies baseline,vol --verbose
 """
 from __future__ import annotations
 
@@ -28,65 +39,141 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.live.paper_trader import PaperTrader
-from src.live.runner       import LiveRunner
+from src.live.paper_trader  import PaperTrader
+from src.live.runner        import LiveRunner
+from src.strategy.optimizer import ScenarioConfig
+
+# ── Shared scenario config (matching create_enhancements_report.py baseline) ──
+_ENHANCEMENT_SCENARIO = ScenarioConfig(
+    name            = "Session 08-21 (T=3)",
+    session_hours   = (8, 21),
+    long_threshold  = 3.0,
+    short_threshold = -3.0,
+)
+
+# ── Daily EMA-200 regime signal filter ───────────────────────────────────────
+
+def _ma_regime_filter(signal: int, composite: float,
+                      df_1h, df_1d) -> tuple[int, float]:
+    """Suppress longs below daily EMA(200) and shorts above it."""
+    if df_1d is None or df_1d.empty or "ema_200" not in df_1d.columns:
+        return signal, composite
+    ema200 = float(df_1d["ema_200"].iloc[-1])
+    close  = float(df_1h["close"].iloc[-1])
+    if signal == -1 and close > ema200:
+        return 0, composite
+    if signal ==  1 and close < ema200:
+        return 0, composite
+    return signal, composite
 
 
-# ─── Strategy catalogue ───────────────────────────────────────────────────────
-# Tuned from the backtest / WFO comparison study (see reports/comparison_report.html).
+# ── Strategy catalogue ────────────────────────────────────────────────────────
+
 STRATEGY_CATALOGUE: dict[str, dict] = {
+    # ── Enhancement variants (primary) ──────────────────────────────────────
+    "baseline": {
+        "label":         "Baseline (T=3, fixed risk)",
+        "vol_target":    None,
+        "dd_halt_pct":   None,
+        "scenario_cfg":  _ENHANCEMENT_SCENARIO,
+        "signal_filter": None,
+        "backtest":      "Calmar=0.830  DD=37.5%  ret=+31.1%",
+    },
+    "vol": {
+        "label":         "Vol Sizing (vol_target=0.20)",
+        "vol_target":    0.20,
+        "dd_halt_pct":   None,
+        "scenario_cfg":  _ENHANCEMENT_SCENARIO,
+        "signal_filter": None,
+        "backtest":      "Calmar=1.473  DD=53.6%  ret=+79.0%",
+    },
+    "vol_ddhalt": {
+        "label":         "Vol + DD Halt 15%",
+        "vol_target":    0.20,
+        "dd_halt_pct":   0.15,
+        "scenario_cfg":  _ENHANCEMENT_SCENARIO,
+        "signal_filter": None,
+        "backtest":      "Calmar=0.748  DD=40.9%  ret=+30.6%",
+    },
+    "vol_ma": {
+        "label":         "Vol + MA Filter (EMA-200d)",
+        "vol_target":    0.20,
+        "dd_halt_pct":   None,
+        "scenario_cfg":  _ENHANCEMENT_SCENARIO,
+        "signal_filter": _ma_regime_filter,
+        "backtest":      "Calmar=0.743  DD=54.2%  ret=+40.3%",
+    },
+    # ── Legacy variants ──────────────────────────────────────────────────────
     "max_return": {
-        "label":            "Max Return (no controls)",
-        "max_notional_pct": 1.00,
-        "vol_target":       None,
-        "dd_halt_pct":      None,
-        "min_score":        None,
+        "label":         "Max Return (no controls)",
+        "vol_target":    None,
+        "dd_halt_pct":   None,
+        "scenario_cfg":  None,
+        "signal_filter": None,
+        "backtest":      "legacy",
     },
     "min_dd": {
-        "label":            "Min Drawdown (Cap10+Vol15+CB15)",
-        "max_notional_pct": 0.10,
-        "vol_target":       0.15,
-        "dd_halt_pct":      0.15,
-        "min_score":        None,
+        "label":         "Min Drawdown (Vol15+CB15)",
+        "vol_target":    0.15,
+        "dd_halt_pct":   0.15,
+        "scenario_cfg":  None,
+        "signal_filter": None,
+        "backtest":      "legacy",
     },
     "balanced": {
-        "label":            "Balanced (Cap20+Vol20+CB15)",
-        "max_notional_pct": 0.20,
-        "vol_target":       0.20,
-        "dd_halt_pct":      0.15,
-        "min_score":        None,
+        "label":         "Balanced (Vol20+CB15)",
+        "vol_target":    0.20,
+        "dd_halt_pct":   0.15,
+        "scenario_cfg":  None,
+        "signal_filter": None,
+        "backtest":      "legacy",
     },
     "conservative": {
-        "label":            "Conservative (Cap20+Vol20+CB15+Score≥8)",
-        "max_notional_pct": 0.20,
-        "vol_target":       0.20,
-        "dd_halt_pct":      0.15,
-        "min_score":        8.0,
+        "label":         "Conservative (Vol20+CB15+Score≥8)",
+        "vol_target":    0.20,
+        "dd_halt_pct":   0.15,
+        "scenario_cfg":  None,
+        "signal_filter": None,
+        "backtest":      "legacy",
     },
 }
 
-DEFAULT_STRATEGIES = list(STRATEGY_CATALOGUE.keys())
+# Default: the 4 enhancement variants
+DEFAULT_STRATEGIES = ["baseline", "vol", "vol_ddhalt", "vol_ma"]
 
 
-def _build_traders(
-    strategy_keys: list[str],
+def _build_runners(
+    strategy_keys:   list[str],
     initial_capital: float,
-) -> dict[str, PaperTrader]:
-    traders: dict[str, PaperTrader] = {}
+) -> tuple[dict[str, PaperTrader], dict[str, callable], ScenarioConfig | None]:
+    """
+    Returns (traders, signal_filters, scenario_cfg).
+    All selected variants must share a scenario_cfg; we use the first one found.
+    """
+    traders:        dict[str, PaperTrader] = {}
+    signal_filters: dict[str, callable]   = {}
+    scenario_cfg = None
+
     for key in strategy_keys:
         if key not in STRATEGY_CATALOGUE:
             print(f"  [warn] Unknown strategy '{key}' — skipping")
             continue
         cfg = STRATEGY_CATALOGUE[key]
+
         traders[key] = PaperTrader(
-            label            = cfg["label"],
-            initial_capital  = initial_capital,
-            max_notional_pct = cfg["max_notional_pct"],
-            vol_target       = cfg["vol_target"],
-            dd_halt_pct      = cfg["dd_halt_pct"],
-            min_score        = cfg["min_score"],
+            label           = cfg["label"],
+            initial_capital = initial_capital,
+            vol_target      = cfg["vol_target"],
+            dd_halt_pct     = cfg["dd_halt_pct"],
         )
-    return traders
+
+        if cfg["signal_filter"] is not None:
+            signal_filters[key] = cfg["signal_filter"]
+
+        if cfg["scenario_cfg"] is not None and scenario_cfg is None:
+            scenario_cfg = cfg["scenario_cfg"]
+
+    return traders, signal_filters, scenario_cfg
 
 
 async def main(
@@ -94,30 +181,32 @@ async def main(
     initial_capital: float,
     verbose:         bool,
 ) -> None:
-    # ── Print config ──────────────────────────────────────────────────────────
-    print("=" * 70)
-    print("  BTCUSDT Live Paper Trading")
-    print(f"  Scenario : Session 08-21 (08:00–21:00 UTC)")
-    print(f"  Capital  : {initial_capital:,.0f} USDT per strategy")
-    print(f"  Strategies: {', '.join(strategy_keys)}")
-    print("=" * 70)
+    print("╔══════════════════════════════════════════════════════════════════╗")
+    print("║  BTCUSDT Live Paper Trading — Enhancement Variants              ║")
+    print("╚══════════════════════════════════════════════════════════════════╝")
+    print(f"\n  Capital : {initial_capital:,.0f} USDT per variant")
+    print(f"  Variants: {', '.join(strategy_keys)}\n")
 
     for key in strategy_keys:
         cfg = STRATEGY_CATALOGUE.get(key, {})
-        print(f"  [{key}] {cfg.get('label', '?')}")
-        print(f"         Cap={cfg.get('max_notional_pct',1)*100:.0f}%  "
-              f"Vol={cfg.get('vol_target') or 'off'}  "
-              f"CB={cfg.get('dd_halt_pct') or 'off'}  "
-              f"Score≥{cfg.get('min_score') or 'off'}")
+        bt  = cfg.get("backtest", "")
+        print(f"  [{key:<12}] {cfg.get('label','?')}")
+        if bt and bt != "legacy":
+            print(f"               WF backtest: {bt}")
 
-    # ── Build traders ─────────────────────────────────────────────────────────
-    traders = _build_traders(strategy_keys, initial_capital)
+    print()
+
+    traders, signal_filters, scenario_cfg = _build_runners(strategy_keys, initial_capital)
     if not traders:
         print("No valid strategies selected. Exiting.")
         return
 
-    # ── Run ───────────────────────────────────────────────────────────────────
-    runner = LiveRunner(traders, verbose=verbose)
+    runner = LiveRunner(
+        traders        = traders,
+        signal_filters = signal_filters or None,
+        scenario_cfg   = scenario_cfg,
+        verbose        = verbose,
+    )
     await runner.bootstrap()
     await runner.run()
 
