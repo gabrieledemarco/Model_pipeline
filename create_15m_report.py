@@ -1,24 +1,21 @@
 """
-15M signal resolution experiment.
+15M signal resolution experiment — v2 (crossing + 1H ATR risk sizing).
 
-Compares the strategy evaluated at 1H vs 15M base timeframe,
-keeping everything else invariant:
-  - Same composite formula (9 components, same weights)
-  - Same ±3 threshold and session 08-21 filter
-  - Same walk-forward scheme (6m train / 2m OOS / 23 windows)
-  - Same ML gate (binary LightGBM, P≥0.50)
-
-At 15M:
-  - s_1h becomes an HTF signal (shifted +1H, forward-filled to 15M)
-  - s_15m becomes the same-TF entry signal (no shift, computed directly)
-  - Entry/exit uses 15M ATR → tighter stops, finer granularity
-  - Up to 4× more signal bars per window
+Fixes applied vs v1:
+  1. crossing_only=True  — signal fires only when composite CROSSES the ±3
+     threshold, not on every bar it stays above/below it.  Prevents chains of
+     re-entries from persistent HTF conditions; signal count becomes comparable
+     to 1H.
+  2. 1H ATR for stop/target sizing — the backtest engine receives a copy of
+     df_15m where atr_14 is replaced by the last-closed 1H bar's ATR (aligned
+     via merge_asof + shift +1H).  Stops are now correctly sized for the
+     expected trade holding period, not for 15M noise.
 
 Strategies compared:
-  A. Baseline 1H    : reference (no ML gate, 1H bars)
-  B. ML Gate 1H     : binary P≥0.50, 1H bars (best config from previous analysis)
-  C. Baseline 15M   : same composite, evaluated at 15M
-  D. ML Gate 15M    : binary P≥0.50, 15M bars
+  A. Baseline 1H            : reference (no ML gate, 1H bars, 1H ATR)
+  B. ML Gate 1H P≥0.50      : best config (1H bars, 1H ATR)
+  C. Baseline 15M (fixed)   : crossing signals, 1H ATR, 15M entry timing
+  D. ML Gate 15M P≥0.50     : ML gate on top of C
 
 Output → reports/report_15m.html
 """
@@ -77,9 +74,33 @@ def kpi_row(name: str, bt: dict, extra: dict = None) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ATR alignment helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_df15m_with_1h_atr(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a copy of df_15m where atr_14 is replaced by the last-closed 1H
+    bar's ATR (aligned via merge_asof + shift +1H).
+
+    At 15M bar T, the last 1H bar that fully closed is at floor(T, 1H) - 1H.
+    Shifting the 1H ATR index by +1H before merge_asof gives exactly this.
+    """
+    src_ts  = (df_1h.index + pd.Timedelta(hours=1)).astype("datetime64[s]")
+    tgt_ts  = df_15m.index.astype("datetime64[s]")
+    src_df  = pd.DataFrame({"ts": src_ts, "v": df_1h["atr_14"].values}).sort_values("ts")
+    tgt_df  = pd.DataFrame({"ts": tgt_ts})
+    merged  = pd.merge_asof(tgt_df, src_df, on="ts", direction="backward")
+    atr_1h  = pd.Series(merged["v"].fillna(method="ffill").fillna(0.0).values,
+                        index=df_15m.index)
+    out = df_15m.copy()
+    out["atr_14"] = atr_1h
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("\n══ 15M Signal Resolution Experiment ═════════════════════════════")
+    print("\n══ 15M Signal Resolution Experiment v2 (crossing + 1H ATR) ══════")
 
     # ── 1. Data ───────────────────────────────────────────────────────────────
     print("\n[1/7] Loading data …")
@@ -92,27 +113,31 @@ def main():
 
     df_1h  = tf_ind["1H"]
     df_15m = tf_ind["15M"]
-    oi_df  = generate_oi(tf_ind["1D"]["close"])
+    oi_df   = generate_oi(tf_ind["1D"]["close"])
     funding = generate_funding(tf_ind["1D"]["close"])
 
+    # df_15m_bt: 15M OHLCV but with 1H ATR for stop/target sizing
+    df_15m_bt = _build_df15m_with_1h_atr(df_15m, df_1h)
     print(f"  1H bars : {len(df_1h):,}   |   15M bars: {len(df_15m):,}")
 
-    # ── 2. Signals at both resolutions ────────────────────────────────────────
+    # ── 2. Signals ────────────────────────────────────────────────────────────
     print("\n[2/7] Building signals …")
     raw_sig_1h  = build_signal_matrix(
         tf_data=tf_ind, oi_df=oi_df, funding=funding,
         premium_1h=None, df_15m=df_15m, df_1m=None,
     )
+    # crossing_only=True (default): fires only on threshold crossings
     raw_sig_15m = build_signal_matrix_15m(
-        tf_data=tf_ind, oi_df=oi_df, funding=funding, premium_1h=None,
+        tf_data=tf_ind, oi_df=oi_df, funding=funding,
+        premium_1h=None, crossing_only=True,
     )
     sig_1h  = apply_filters(raw_sig_1h,  SESSION_CFG)
     sig_15m = apply_filters(raw_sig_15m, SESSION_CFG)
 
     n_1h  = int((sig_1h["signal"]  != 0).sum())
     n_15m = int((sig_15m["signal"] != 0).sum())
-    print(f"  1H  active signal bars: {n_1h:,}")
-    print(f"  15M active signal bars: {n_15m:,}")
+    print(f"  1H  active signal bars (all):      {n_1h:,}")
+    print(f"  15M active signal bars (crossings): {n_15m:,}")
 
     # ── 3. A. Baseline 1H ─────────────────────────────────────────────────────
     print("\n[3/7] A. Baseline 1H …")
@@ -142,24 +167,25 @@ def main():
           f"Trades={row_b['n_trades']}  Calmar={row_b['calmar']:.3f}  "
           f"Filtered={row_b['filter_rate']:.0f}%")
 
-    # ── 5. C. Baseline 15M ───────────────────────────────────────────────────
-    print("\n[5/7] C. Baseline 15M …")
-    bt_c = run_backtest(df_15m, sig_15m)
+    # ── 5. C. Baseline 15M (crossing + 1H ATR) ───────────────────────────────
+    print("\n[5/7] C. Baseline 15M (crossing + 1H ATR) …")
+    bt_c = run_backtest(df_15m_bt, sig_15m)
     row_c = kpi_row("C. Baseline 15M", bt_c,
                     extra={"n_sig": n_15m, "base_tf": "15M"})
     print(f"  → Return={row_c['total_return']:+.1f}%  DD={row_c['max_dd']:.1f}%  "
           f"Trades={row_c['n_trades']}  Calmar={row_c['calmar']:.3f}")
 
-    # ── 6. D. ML Gate 15M P≥0.50 ─────────────────────────────────────────────
-    print("\n[6/7] D. ML Gate 15M P≥0.50 …")
+    # ── 6. D. ML Gate 15M P≥0.50 (crossing + 1H ATR) ────────────────────────
+    print("\n[6/7] D. ML Gate 15M P≥0.50 (crossing + 1H ATR) …")
+    # Feature matrix uses original df_15m (with correct 15M ATR for features)
     feat_15m = build_feature_matrix(tf_ind, sig_15m, base_tf="15M")
     print(f"  Feature matrix: {feat_15m.shape[0]:,} × {feat_15m.shape[1]}")
-    # walk_forward_binary_gate accepts any OHLCV DataFrame as first arg
+    # Backtest in gate training uses df_15m_bt (1H ATR for stop sizing)
     gate_15m = walk_forward_binary_gate(
-        df_15m, sig_15m, feat_15m, gate_threshold=0.50,
+        df_15m_bt, sig_15m, feat_15m, gate_threshold=0.50,
         use_feat_sel=True, verbose=True,
     )
-    bt_d = run_gated_backtest(df_15m, sig_15m, gate_15m)
+    bt_d = run_gated_backtest(df_15m_bt, sig_15m, gate_15m)
     n_d  = int((gate_15m.gated_signal != 0).sum())
     row_d = kpi_row("D. ML Gate 15M P≥0.50", bt_d,
                     extra={"n_sig": n_d, "filter_rate": round((1 - n_d / n_15m) * 100, 1),

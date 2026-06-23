@@ -421,10 +421,11 @@ def build_signal_matrix(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_signal_matrix_15m(
-    tf_data:    Dict[str, pd.DataFrame],
-    oi_df:      pd.DataFrame,
-    funding:    pd.Series,
-    premium_1h: pd.Series = None,
+    tf_data:       Dict[str, pd.DataFrame],
+    oi_df:         pd.DataFrame,
+    funding:       pd.Series,
+    premium_1h:    pd.Series = None,
+    crossing_only: bool = True,
 ) -> pd.DataFrame:
     """
     Same composite signal as build_signal_matrix() but evaluated on the 15M index.
@@ -434,6 +435,11 @@ def build_signal_matrix_15m(
     - s_15m : computed directly on the 15M same-TF bars (no shift)
     - s_vol / s_cycle: computed from 15M bars
     - All HTF shifts are identical (weekly +7d, daily +1d, 4H +4H, funding +1d)
+
+    crossing_only (default True):
+        Emit a signal only when the composite CROSSES the threshold, not on
+        every bar it stays above/below it.  This prevents chains of re-entries
+        from persistent HTF conditions and keeps signal count comparable to 1H.
     """
     df_1w  = tf_data["1W"]
     df_1d  = tf_data["1D"]
@@ -489,10 +495,20 @@ def build_signal_matrix_15m(
     # Weighted composite (same WEIGHTS dict as the 1H version)
     out["composite"] = sum(out[k] * WEIGHTS[k] for k in WEIGHTS)
 
-    out["signal"] = np.where(
-        out["composite"] >= LONG_THRESH,  1,
-        np.where(out["composite"] <= SHORT_THRESH, -1, 0),
-    ).astype(int)
+    if crossing_only:
+        # Fire only on the bar where composite first crosses the threshold.
+        # Prevents repeated entries while HTF conditions hold the composite
+        # persistently above/below threshold.
+        prev = out["composite"].shift(1).fillna(0)
+        long_cross  = (out["composite"] >= LONG_THRESH)  & (prev < LONG_THRESH)
+        short_cross = (out["composite"] <= SHORT_THRESH) & (prev > SHORT_THRESH)
+        out["signal"] = np.where(long_cross, 1,
+                        np.where(short_cross, -1, 0)).astype(int)
+    else:
+        out["signal"] = np.where(
+            out["composite"] >= LONG_THRESH,  1,
+            np.where(out["composite"] <= SHORT_THRESH, -1, 0),
+        ).astype(int)
 
     out["strong"] = (out["composite"].abs() >= STRONG_THRESH).astype(int)
 
