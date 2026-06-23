@@ -414,3 +414,93 @@ def build_signal_matrix(
     )
 
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15M base-timeframe variant
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_signal_matrix_15m(
+    tf_data:    Dict[str, pd.DataFrame],
+    oi_df:      pd.DataFrame,
+    funding:    pd.Series,
+    premium_1h: pd.Series = None,
+) -> pd.DataFrame:
+    """
+    Same composite signal as build_signal_matrix() but evaluated on the 15M index.
+
+    Key differences vs the 1H version:
+    - s_1h  : 1H entry signal is now an HTF source (shifted +1H before align)
+    - s_15m : computed directly on the 15M same-TF bars (no shift)
+    - s_vol / s_cycle: computed from 15M bars
+    - All HTF shifts are identical (weekly +7d, daily +1d, 4H +4H, funding +1d)
+    """
+    df_1w  = tf_data["1W"]
+    df_1d  = tf_data["1D"]
+    df_4h  = tf_data["4H"]
+    df_1h  = tf_data["1H"]
+    df_15m = tf_data["15M"]
+
+    base = df_15m.index
+
+    def _shift(series: pd.Series, delta: pd.Timedelta) -> pd.Series:
+        s = series.copy()
+        s.index = s.index + delta
+        return s
+
+    use_real_basis = (premium_1h is not None and
+                      not premium_1h.empty and len(premium_1h) > 100)
+
+    if use_real_basis:
+        s_oi_raw  = basis_oi_signal(premium_1h, df_1h)
+        oi_source = "real_basis"
+    else:
+        s_oi_raw  = oi_signal(oi_df, df_1d)
+        oi_source = "synthetic"
+
+    out = pd.DataFrame(index=base)
+
+    # HTF signals: shift index forward by bar duration so merge_asof returns
+    # the last bar that was fully closed at the 15M bar's open_time.
+    out["s_weekly"] = _align(_shift(weekly_trend(df_1w),   pd.Timedelta(weeks=1)),  base)
+    out["s_daily"]  = _align(_shift(daily_trend(df_1d),    pd.Timedelta(days=1)),   base)
+    out["s_4h"]     = _align(_shift(fourfour_setup(df_4h), pd.Timedelta(hours=4)),  base)
+    out["s_1h"]     = _align(_shift(one_hour_entry(df_1h), pd.Timedelta(hours=1)),  base)
+
+    # OI: real basis is 1H-indexed → shift +1H; synthetic is daily → shift +1d
+    if use_real_basis:
+        out["s_oi"] = _align(_shift(s_oi_raw, pd.Timedelta(hours=1)), base)
+    else:
+        out["s_oi"] = _align(_shift(s_oi_raw, pd.Timedelta(days=1)),  base)
+
+    out["s_funding"] = _align(
+        _shift(funding_signal(funding), pd.Timedelta(days=1)), base)
+
+    # Same-TF 15M signals: direct computation on 15M bars, no shift needed
+    out["s_15m"]   = fifteen_min_entry(df_15m).reindex(base, fill_value=0).values
+    out["s_vol"]   = volume_signal(df_15m).reindex(base, fill_value=0).values
+    out["s_cycle"] = cyclicality_signal(df_15m).reindex(base, fill_value=0).values
+    out["s_1m"]    = 0.0   # no 1M data; contributes 0 to composite
+
+    out["oi_source"] = oi_source
+    out["has_15m"]   = 1
+    out["has_1m"]    = 0
+
+    # Weighted composite (same WEIGHTS dict as the 1H version)
+    out["composite"] = sum(out[k] * WEIGHTS[k] for k in WEIGHTS)
+
+    out["signal"] = np.where(
+        out["composite"] >= LONG_THRESH,  1,
+        np.where(out["composite"] <= SHORT_THRESH, -1, 0),
+    ).astype(int)
+
+    out["strong"] = (out["composite"].abs() >= STRONG_THRESH).astype(int)
+
+    bull_regime = (df_1d["close"] > df_1d["ema_200"]).astype(int)
+    out["regime"] = _align(
+        _shift(bull_regime.map({1: "bull", 0: "bear"}).rename("regime"),
+               pd.Timedelta(days=1)),
+        base,
+    )
+
+    return out

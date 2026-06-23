@@ -84,37 +84,51 @@ LAG_FEATURES  = [f"lag_ret_{i}" for i in range(1, 9)]
 
 def build_feature_matrix(
     tf_data:  Dict[str, pd.DataFrame],   # TF → DataFrame with indicators
-    signals:  pd.DataFrame,               # bias-free signal matrix (1H index)
+    signals:  pd.DataFrame,               # bias-free signal matrix (base-TF index)
+    base_tf:  str = "1H",                 # base timeframe key: "1H" or "15M"
 ) -> pd.DataFrame:
     """
-    Produce a single DataFrame aligned to the 1H index containing all features
-    needed by the ML gate.
+    Produce a single DataFrame aligned to the base-TF index containing all
+    features needed by the ML gate.
 
     Parameters
     ----------
-    tf_data  : dict with keys '1W', '1D', '4H', '1H' (all with add_indicators applied)
-    signals  : output of build_signal_matrix() — carries signal scores + composite
+    tf_data  : dict with keys '1W', '1D', '4H', '1H' and optionally '15M'
+    signals  : output of build_signal_matrix[_15m]() — indexed at base_tf
+    base_tf  : '1H' (default) or '15M'
 
     Returns
     -------
-    pd.DataFrame  indexed to 1H bars, one column per feature
+    pd.DataFrame  indexed to base-TF bars, one column per feature
     """
-    df_1h = tf_data["1H"]
-    df_4h = tf_data.get("4H", pd.DataFrame())
-    df_1d = tf_data.get("1D", pd.DataFrame())
-    df_1w = tf_data.get("1W", pd.DataFrame())
+    df_base = tf_data[base_tf]
+    df_1h   = tf_data.get("1H", pd.DataFrame())
+    df_4h   = tf_data.get("4H", pd.DataFrame())
+    df_1d   = tf_data.get("1D", pd.DataFrame())
+    df_1w   = tf_data.get("1W", pd.DataFrame())
 
-    base  = df_1h.index
-    feats = pd.DataFrame(index=base)
+    base     = df_base.index
+    base_pfx = base_tf.lower()   # "1h" or "15m"
+    feats    = pd.DataFrame(index=base)
 
-    # ── 1H indicators (same TF, no shift needed) ─────────────────────────────
+    # ── Base-TF indicators (same TF, no shift needed) ─────────────────────────
     for col in _1H_INDICATORS:
-        if col in df_1h.columns:
-            feats[f"1h_{col}"] = df_1h[col].reindex(base).fillna(0).values
+        if col in df_base.columns:
+            feats[f"{base_pfx}_{col}"] = df_base[col].reindex(base).fillna(0).values
 
-    # ── Lagged 1H returns ─────────────────────────────────────────────────────
+    # ── Lagged base-TF returns ────────────────────────────────────────────────
+    log_ret_base = df_base["log_ret"] if "log_ret" in df_base.columns \
+                   else pd.Series(0.0, index=base)
     for i in range(1, 9):
-        feats[f"lag_ret_{i}"] = df_1h["log_ret"].shift(i).reindex(base).fillna(0).values
+        feats[f"lag_ret_{i}"] = log_ret_base.shift(i).reindex(base).fillna(0).values
+
+    # ── When base is 15M: add 1H as an intermediate HTF layer (shift +1H) ────
+    if base_tf == "15M" and not df_1h.empty:
+        avail = [c for c in _4H_INDICATORS if c in df_1h.columns]
+        if avail:
+            htf = _align_htf(df_1h, avail, base, pd.Timedelta(hours=1))
+            htf.columns = [f"1h_{c}" for c in htf.columns]
+            feats = pd.concat([feats, htf], axis=1)
 
     # ── 4H indicators (shift +4h) ─────────────────────────────────────────────
     if not df_4h.empty:
@@ -152,11 +166,12 @@ def build_feature_matrix(
     feats["in_session"] = ((base.hour >= 8) & (base.hour < 21)).astype(float)
 
     # ── ATR-normalised distance from recent swing lows/highs ─────────────────
-    if "close" in df_1h.columns and "high" in df_1h.columns and "atr_14" in df_1h.columns:
-        atr  = df_1h["atr_14"]
-        hi20 = df_1h["high"].rolling(20, min_periods=1).max()
-        lo20 = df_1h["low"].rolling(20, min_periods=1).min()
-        c    = df_1h["close"]
+    if ("close" in df_base.columns and "high" in df_base.columns
+            and "atr_14" in df_base.columns):
+        atr  = df_base["atr_14"]
+        hi20 = df_base["high"].rolling(20, min_periods=1).max()
+        lo20 = df_base["low"].rolling(20, min_periods=1).min()
+        c    = df_base["close"]
         feats["dist_hi20"] = ((hi20 - c) / atr.replace(0, np.nan)).fillna(0).reindex(base).values
         feats["dist_lo20"] = ((c - lo20) / atr.replace(0, np.nan)).fillna(0).reindex(base).values
 
@@ -174,13 +189,15 @@ def build_feature_matrix(
         feats["n_bullish_sig"]  = bull_mask.sum(axis=1).reindex(base).fillna(0).astype(float).values
         feats["composite_abs"]  = signals["composite"].abs().reindex(base).fillna(0).values
 
-    # ── Return autocorrelation (fast rolling corr with shifted series) ────────
-    log_ret = df_1h["log_ret"]
-    feats["autocorr_lag1"] = (log_ret.rolling(24, min_periods=12)
-                               .corr(log_ret.shift(1))
+    # ── Return autocorrelation — use base-TF returns ──────────────────────────
+    # Window: 96 bars = ~1 day at 15M, ~4 days at 1H. min_periods=48.
+    ac_window = 96 if base_tf == "15M" else 24
+    ac_min    = ac_window // 2
+    feats["autocorr_lag1"] = (log_ret_base.rolling(ac_window, min_periods=ac_min)
+                               .corr(log_ret_base.shift(1))
                                .reindex(base).fillna(0).values)
-    feats["autocorr_lag4"] = (log_ret.rolling(24, min_periods=12)
-                               .corr(log_ret.shift(4))
+    feats["autocorr_lag4"] = (log_ret_base.rolling(ac_window, min_periods=ac_min)
+                               .corr(log_ret_base.shift(4))
                                .reindex(base).fillna(0).values)
 
     feats = feats.fillna(0).replace([np.inf, -np.inf], 0)
