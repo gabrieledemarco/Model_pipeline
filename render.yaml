@@ -1,0 +1,28 @@
+# Render deployment configuration for BTCUSDT paper-trading bot.
+# Docs: https://render.com/docs/render-yaml-reference
+
+services:
+  - type: web
+    name: btcusdt-paper-trader
+    runtime: python
+    region: frankfurt          # closest to Binance EU endpoints
+    plan: free                 # upgrade to starter for persistent disk
+    buildCommand: pip install -r requirements-live.txt
+    startCommand: python run_paper_trading.py
+    healthCheckPath: /health
+
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      # Optional overrides (set in Render dashboard → Environment):
+      # PT_STRATEGIES   comma-separated list, e.g. "baseline,vol"   (default: all 4)
+      # PT_CAPITAL      initial USDT per variant                      (default: 100000)
+      # PT_LOG_LEVEL    DEBUG | INFO | WARNING | ERROR                (default: WARNING)
+
+    # Uncomment to add a 1 GB persistent disk for state + cache files:
+    # disk:
+    #   name: paper-trader-data
+    #   mountPath: /opt/render/project/src/data
+    #   sizeGB: 1

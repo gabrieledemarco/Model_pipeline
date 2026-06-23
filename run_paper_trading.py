@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -41,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.live.paper_trader  import PaperTrader
 from src.live.runner        import LiveRunner
+from src.live.monitor       import start_monitor
 from src.strategy.optimizer import ScenarioConfig
 
 # ── Shared scenario config (matching create_enhancements_report.py baseline) ──
@@ -207,6 +209,11 @@ async def main(
         scenario_cfg   = scenario_cfg,
         verbose        = verbose,
     )
+
+    # ── Start HTTP monitor (Render exposes $PORT; local default 8080) ─────────
+    port = int(os.environ.get("PORT", 8080))
+    await start_monitor(traders, runner.last_signal, port=port)
+
     await runner.bootstrap()
     await runner.run()
 
@@ -246,15 +253,24 @@ def _parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = _parse_args()
 
+    # Env-var overrides (used by Render — set in dashboard → Environment)
+    strategies_env = os.environ.get("PT_STRATEGIES", "").strip()
+    capital_env    = os.environ.get("PT_CAPITAL",    "").strip()
+    log_level_env  = os.environ.get("PT_LOG_LEVEL",  "").strip()
+
+    raw_keys  = strategies_env if strategies_env else args.strategies
+    capital   = float(capital_env) if capital_env else args.capital
+    log_level = log_level_env if log_level_env else args.log_level
+
     logging.basicConfig(
-        level=args.log_level,
+        level=log_level,
         format="%(asctime)s  %(name)s  %(levelname)s  %(message)s",
     )
 
-    keys = [k.strip() for k in args.strategies.split(",") if k.strip()]
+    keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
 
     print("\nPress Ctrl+C to stop.\n")
     try:
-        asyncio.run(main(keys, args.capital, args.verbose))
+        asyncio.run(main(keys, capital, args.verbose))
     except KeyboardInterrupt:
         print("\nStopped by user.")

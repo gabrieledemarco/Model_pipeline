@@ -74,6 +74,9 @@ class LiveRunner:
         self._scenario_cfg  = scenario_cfg
         self.verbose        = verbose
 
+        # Shared state dict — read by the HTTP monitor on every request
+        self.last_signal: dict = {"signal": 0, "composite": 0.0, "ts": "—", "atr": 0.0}
+
         # Rolling OHLCV windows (raw, no indicators yet)
         self._buf_1h:  pd.DataFrame = pd.DataFrame()
         self._buf_4h:  pd.DataFrame = pd.DataFrame()
@@ -193,6 +196,12 @@ class LiveRunner:
 
         atr_val  = float(df_1h["atr_14"].iloc[-1]) if "atr_14" in df_1h.columns else 1.0
         rvol_val = float(df_1h["rvol_20"].iloc[-1]) if "rvol_20" in df_1h.columns else 0.20
+
+        # Update shared state for HTTP monitor
+        self.last_signal = {
+            "signal": signal, "composite": composite,
+            "ts": str(ts), "atr": round(atr_val, 0),
+        }
 
         # ── Update all paper traders (with per-variant signal filters) ────────
         ohlc = bar
