@@ -90,7 +90,7 @@ def _build_df15m_with_1h_atr(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> pd.Da
     src_df  = pd.DataFrame({"ts": src_ts, "v": df_1h["atr_14"].values}).sort_values("ts")
     tgt_df  = pd.DataFrame({"ts": tgt_ts})
     merged  = pd.merge_asof(tgt_df, src_df, on="ts", direction="backward")
-    atr_1h  = pd.Series(merged["v"].fillna(method="ffill").fillna(0.0).values,
+    atr_1h  = pd.Series(merged["v"].ffill().fillna(0.0).values,
                         index=df_15m.index)
     out = df_15m.copy()
     out["atr_14"] = atr_1h
