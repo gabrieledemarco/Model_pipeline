@@ -73,8 +73,8 @@ def main():
     print("\n══ ML Gate Report (v2 trade-level + v3 bar-level) ════════════════")
 
     # ── 1. Data ───────────────────────────────────────────────────────────────
-    print("\n[1/6] Loading data …")
-    raw = fetch_extended_data(start_year=2022, start_month=1, fetch_1m=False)
+    print("\n[1/7] Loading data …")
+    raw = fetch_extended_data(start_year=2022, start_month=1, fetch_1m=False, fetch_flow=True)
     tf_ind = {}
     for tf in ["1W", "1D", "4H", "1H", "15M"]:
         df = raw.get(tf, pd.DataFrame())
@@ -86,7 +86,7 @@ def main():
     funding = generate_funding(tf_ind["1D"]["close"])
 
     # ── 2. Signals ────────────────────────────────────────────────────────────
-    print("\n[2/6] Building signals (±3, session 08-21) …")
+    print("\n[2/7] Building signals (±3, session 08-21) …")
     raw_sig = build_signal_matrix(
         tf_data=tf_ind, oi_df=oi_df, funding=funding,
         premium_1h=None, df_15m=df_15m, df_1m=None,
@@ -96,7 +96,7 @@ def main():
     print(f"  Active signal bars: {n_sig:,}")
 
     # ── 3. Baseline ───────────────────────────────────────────────────────────
-    print("\n[3/6] Baseline backtest …")
+    print("\n[3/7] Baseline backtest …")
     base_bt  = run_backtest(df_1h, signals)
     baseline = kpi_row("A. Baseline (no gate)", base_bt,
                        extra={"n_allowed": n_sig, "filter_rate": 0.0,

@@ -87,6 +87,75 @@ def _months_range(start_year: int, start_month: int,
 # Binance Vision – generic OHLCV klines (any interval)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _fetch_klines_flow_month(interval: str, year: int, month: int) -> Optional[pd.DataFrame]:
+    """Download klines with taker_buy_base + n_trades (separate cache key from OHLCV-only)."""
+    cache = _ensure_cache() / f"BTCUSDT-{interval}-flow-{year}-{month:02d}.parquet"
+    if cache.exists():
+        return pd.read_parquet(cache)
+
+    url = (f"{BVISION}/klines/BTCUSDT/{interval}/"
+           f"BTCUSDT-{interval}-{year}-{month:02d}.zip")
+    data = _get_zip(url)
+    if data is None:
+        return None
+
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        raw = z.open(z.namelist()[0]).read()
+        first = raw.split(b"\n")[0].decode(errors="ignore").strip()
+        skip  = 0 if first and first[0].isdigit() else 1
+        df = pd.read_csv(io.BytesIO(raw), header=None, names=KLINES_COLS, skiprows=skip)
+
+    df["ts"] = pd.to_datetime(df["open_time"].astype("int64"), unit="ms")
+    cols = ["open", "high", "low", "close", "volume", "taker_buy_base", "n_trades"]
+    df = df.set_index("ts")[cols].astype(float)
+    df.index = df.index.tz_localize(None).astype("datetime64[s]")
+    df.to_parquet(cache)
+    return df
+
+
+def fetch_binance_vision_taker_flow(
+    interval: str,
+    start_year: int = 2022,
+    start_month: int = 1,
+    end_year: Optional[int] = None,
+    end_month: Optional[int] = None,
+    workers: int = 6,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """
+    Download BTCUSDT OHLCV + taker_buy_base + n_trades for CVD computation.
+    Cached separately from regular OHLCV klines.
+    """
+    now = datetime.now()
+    if end_year is None:
+        end_year = now.year
+    if end_month is None:
+        end_month = now.month - 1 or 12
+
+    months = _months_range(start_year, start_month, end_year, end_month)
+    frames: List[Optional[pd.DataFrame]] = [None] * len(months)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_fetch_klines_flow_month, interval, y, m): i
+                for i, (y, m) in enumerate(months)}
+        for fut in as_completed(futs):
+            idx = futs[fut]
+            y, m = months[idx]
+            result = fut.result()
+            if result is not None:
+                frames[idx] = result
+                if verbose:
+                    print(f"  ✓ {interval}-flow {y}-{m:02d}: {len(result):6d} bars")
+
+    valid = [f for f in frames if f is not None]
+    if not valid:
+        return pd.DataFrame()
+
+    out = pd.concat(valid).sort_index()
+    out = out[~out.index.duplicated(keep="first")]
+    return out
+
+
 def _fetch_klines_month_generic(interval: str, year: int, month: int) -> Optional[pd.DataFrame]:
     """Download one monthly klines zip for any interval (1m, 15m, 1h, …)."""
     cache = _ensure_cache() / f"BTCUSDT-{interval}-{year}-{month:02d}.parquet"
@@ -324,6 +393,7 @@ def fetch_extended_data(
     symbol: str = SYMBOL,
     fetch_15m: bool = True,
     fetch_1m: bool = True,
+    fetch_flow: bool = True,
 ) -> Dict[str, pd.DataFrame]:
     """
     Fetch multi-TF data entirely from Binance Vision perpetual futures.
@@ -375,6 +445,17 @@ def fetch_extended_data(
                           "low": "min",   "close": "last",
                           "volume": "sum"})
                     .dropna(subset=["open"]))
+
+    # ── 1H taker flow (CVD features) ─────────────────────────────────────────
+    if fetch_flow:
+        print("  Downloading 1H taker flow from Binance Vision …")
+        df_flow = fetch_binance_vision_taker_flow(
+            "1h", start_year=start_year, start_month=start_month,
+            workers=workers, verbose=False)
+        if not df_flow.empty:
+            for col in ["taker_buy_base", "n_trades"]:
+                if col in df_flow.columns:
+                    result["1H"][col] = df_flow[col].reindex(result["1H"].index).fillna(0)
 
     # ── 15M from Binance Vision (~2,900 bars/month) ──────────────────────────
     if fetch_15m:

@@ -57,6 +57,11 @@ _1H_INDICATORS = [
     "bb_pct", "vol_ratio", "log_ret", "atr_pct", "rvol_20",
     "ema_bull_21_50", "ema_bull_50_200", "price_vs_ema200",
     "stoch_k", "obv_trend", "vwap_dev",
+    # price dynamics (always computed)
+    "price_accel", "ema21_slope", "rvol_ratio",
+    # taker flow / CVD (present only when fetch_flow=True was used)
+    "cvd_div", "cvd_slope_4", "flow_ratio", "flow_imb_8", "cvd_price_div",
+    "n_trades_ratio",
 ]
 
 _4H_INDICATORS = [
@@ -147,8 +152,6 @@ def build_feature_matrix(
     feats["in_session"] = ((base.hour >= 8) & (base.hour < 21)).astype(float)
 
     # ── ATR-normalised distance from recent swing lows/highs ─────────────────
-    if "atr_14" in df_1h.columns and "atr_14" in feats.columns:
-        pass   # atr_pct already captures normalised ATR
     if "close" in df_1h.columns and "high" in df_1h.columns and "atr_14" in df_1h.columns:
         atr  = df_1h["atr_14"]
         hi20 = df_1h["high"].rolling(20, min_periods=1).max()
@@ -156,6 +159,29 @@ def build_feature_matrix(
         c    = df_1h["close"]
         feats["dist_hi20"] = ((hi20 - c) / atr.replace(0, np.nan)).fillna(0).reindex(base).values
         feats["dist_lo20"] = ((c - lo20) / atr.replace(0, np.nan)).fillna(0).reindex(base).values
+
+    # ── Cross-timeframe signal divergence ─────────────────────────────────────
+    sig_available = [c for c in ["s_1h", "s_4h", "s_daily", "s_weekly", "s_oi", "s_funding"]
+                     if c in signals.columns]
+    if "s_1h" in signals.columns and "s_4h" in signals.columns:
+        feats["tf_agree_1h_4h"] = (np.sign(signals["s_1h"]) *
+                                    np.sign(signals["s_4h"])).reindex(base).fillna(0).values
+    if "s_1h" in signals.columns and "s_daily" in signals.columns:
+        feats["tf_agree_1h_1d"] = (np.sign(signals["s_1h"]) *
+                                    np.sign(signals["s_daily"])).reindex(base).fillna(0).values
+    if sig_available:
+        bull_mask = signals[sig_available].gt(0)
+        feats["n_bullish_sig"]  = bull_mask.sum(axis=1).reindex(base).fillna(0).astype(float).values
+        feats["composite_abs"]  = signals["composite"].abs().reindex(base).fillna(0).values
+
+    # ── Return autocorrelation (fast rolling corr with shifted series) ────────
+    log_ret = df_1h["log_ret"]
+    feats["autocorr_lag1"] = (log_ret.rolling(24, min_periods=12)
+                               .corr(log_ret.shift(1))
+                               .reindex(base).fillna(0).values)
+    feats["autocorr_lag4"] = (log_ret.rolling(24, min_periods=12)
+                               .corr(log_ret.shift(4))
+                               .reindex(base).fillna(0).values)
 
     feats = feats.fillna(0).replace([np.inf, -np.inf], 0)
     return feats

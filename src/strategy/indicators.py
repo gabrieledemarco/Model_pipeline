@@ -164,4 +164,33 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["lower_wick"] = df[["close", "open"]].min(axis=1) - l
     df["is_bull"]    = (c > o).astype(int)
 
+    # ── Price dynamics ────────────────────────────────────────────────────────
+    df["price_accel"] = (c.pct_change() - c.pct_change().shift(1)).fillna(0)
+    df["ema21_slope"] = ((df["ema_21"] - df["ema_21"].shift(4)) /
+                          df["ema_21"].shift(4).replace(0, np.nan)).fillna(0)
+    df["rvol_ratio"]  = (df["rvol_20"] /
+                          df["rvol_20"].rolling(120, min_periods=10).mean()
+                          .replace(0, np.nan)).fillna(1.0)
+
+    # ── Taker flow / CVD (only present when taker_buy_base is available) ──────
+    if "taker_buy_base" in df.columns:
+        taker_buy  = df["taker_buy_base"]
+        taker_sell = v - taker_buy
+        raw_delta  = taker_buy - taker_sell
+        df["cvd"]           = raw_delta.cumsum()
+        df["cvd_ema21"]     = ema(df["cvd"], 21)
+        df["cvd_div"]       = df["cvd"] - df["cvd_ema21"]
+        df["cvd_slope_4"]   = (df["cvd"] - df["cvd"].shift(4)).fillna(0)
+        df["flow_ratio"]    = (taker_buy / v.replace(0, np.nan)).fillna(0.5)
+        df["flow_imb_8"]    = df["flow_ratio"].rolling(8, min_periods=1).mean() - 0.5
+        # Negative = CVD going down while price goes up (or vice versa): divergence
+        df["cvd_price_div"] = (np.sign(df["cvd_slope_4"]) *
+                                np.sign((c - c.shift(4)).fillna(0))).fillna(0)
+
+    # ── Trade count (only present when n_trades is available) ────────────────
+    if "n_trades" in df.columns:
+        nt = df["n_trades"]
+        df["n_trades_ratio"] = (nt / nt.rolling(20, min_periods=1).mean()
+                                 .replace(0, np.nan)).fillna(1.0)
+
     return df
