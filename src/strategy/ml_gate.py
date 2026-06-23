@@ -225,6 +225,7 @@ def walk_forward_binary_gate(
     gate_threshold: float = 0.55,
     use_feat_sel:   bool  = True,
     verbose:        bool  = True,
+    hmm_df:         Optional[pd.DataFrame] = None,
 ) -> MLGateResult:
     """
     Binary gate with early stopping and optional progressive feature selection.
@@ -233,10 +234,17 @@ def walk_forward_binary_gate(
     ----------
     use_feat_sel : after WARMUP_WINDOWS windows, restrict to top-N features
                    by accumulated OOS importance
+    hmm_df       : if provided, fit a GaussianHMM per window on training bars
+                   and append 5 HMM regime features to feat_tr / feat_oos.
+                   HMM is fitted on TRAINING data only (no lookahead).
     """
+    from .hmm_regime import fit_hmm, predict_hmm_features, HMM_FEATURE_NAMES
+
     index     = df_1h.index
     windows   = _wf_windows(index)
     all_cols  = list(feat_df.columns)
+    if hmm_df is not None:
+        all_cols = all_cols + HMM_FEATURE_NAMES
     feat_cols = all_cols[:]          # starts with all features
 
     all_probs = pd.Series(np.nan, index=index)
@@ -245,6 +253,8 @@ def walk_forward_binary_gate(
 
     if verbose:
         mode = "binary+early-stop" + ("+feat-sel" if use_feat_sel else "")
+        if hmm_df is not None:
+            mode += "+HMM"
         print(f"  Mode: {mode}  |  {len(windows)} windows")
 
     for i, (tr_s, tr_e, oo_s, oo_e) in enumerate(windows):
@@ -253,6 +263,21 @@ def walk_forward_binary_gate(
 
         df_tr   = df_1h[tr_mask];    sig_tr  = signals[tr_mask];  feat_tr  = feat_df[tr_mask]
         df_oos  = df_1h[oos_mask];   sig_oos = signals[oos_mask]; feat_oos = feat_df[oos_mask]
+
+        # Per-window HMM: fit on training bars only, predict train + OOS
+        if hmm_df is not None:
+            try:
+                hmm_model, sorted_idx = fit_hmm(hmm_df[tr_mask])
+                hmm_tr  = predict_hmm_features(hmm_model, sorted_idx, hmm_df[tr_mask])
+                hmm_oos = predict_hmm_features(hmm_model, sorted_idx, hmm_df[oos_mask])
+                feat_tr  = pd.concat([feat_tr,  hmm_tr],  axis=1)
+                feat_oos = pd.concat([feat_oos, hmm_oos], axis=1)
+            except Exception:
+                # HMM failed for this window — pad with zeros and continue
+                zeros_tr  = pd.DataFrame(0.0, index=feat_tr.index,  columns=HMM_FEATURE_NAMES)
+                zeros_oos = pd.DataFrame(0.0, index=feat_oos.index, columns=HMM_FEATURE_NAMES)
+                feat_tr  = pd.concat([feat_tr,  zeros_tr],  axis=1)
+                feat_oos = pd.concat([feat_oos, zeros_oos], axis=1)
 
         if len(df_tr) < 200 or len(df_oos) < 10:
             continue
