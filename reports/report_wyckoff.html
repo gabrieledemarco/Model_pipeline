@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Wyckoff Strategy — BTCUSDT 2020-2026</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0f1117;color:#e0e0e0;margin:0;padding:24px}
+h1{font-size:1.6rem;color:#fff;border-bottom:2px solid #2196f3;padding-bottom:8px}
+h2{font-size:1.1rem;color:#90caf9;margin-top:32px}
+h3{font-size:.95rem;color:#b0bec5;margin-top:20px}
+p.meta{color:#546e7a;font-size:.8rem}
+table{border-collapse:collapse;width:100%;margin-top:12px;font-size:.82rem}
+th{background:#1e2130;color:#90caf9;padding:7px 10px;text-align:center;
+   border-bottom:2px solid #2196f3}
+td{padding:6px 10px;border-bottom:1px solid #1e2130;text-align:center}
+td:first-child{text-align:left}
+tr:hover td{background:#1a1e2e}
+.pos{color:#4caf50;font-weight:600}
+.neg{color:#f44336;font-weight:600}
+.warn{color:#ff9800;font-weight:600}
+.hl td{background:#1e2a1e!important;border-left:3px solid #4caf50}
+.card{background:#12151f;border:1px solid #1e2130;border-radius:8px;
+      padding:16px;margin-top:16px}
+.scroll{overflow-x:auto}
+</style>
+</head>
+<body>
+<h1>Wyckoff Spring/Upthrust Strategy — BTCUSDT Perpetual Futures</h1>
+<p class="meta">
+Period: 2020-01 → 2026-05 · Signals: 220 spring/upthrust events (08-21 UTC) ·
+WF: 6m train / 2m OOS / step 2m · 35 windows ·
+Fees: 0.04% per side · Generated in 19s
+</p>
+
+<h2>Strategy Comparison (full period, stitched OOS trades)</h2>
+<p class="meta">
+WF-opt rows use stitched OOS trades (IS-selected SL/TP per window) — same initial capital continuity.
+Baseline shown for reference (composite signal system, walk-forward results from enhancements report).
+</p>
+<div class="scroll">
+<table>
+<thead><tr>
+  <th>Strategy</th><th>Total Return</th><th>Max DD</th>
+  <th>Calmar</th><th>Sharpe</th><th>Win Rate</th><th>Trades</th>
+</tr></thead>
+<tbody><tr><td>Baseline (composite, T=3)</td><td class="neg">-30.15%</td><td class="neg">58.3%</td><td class="neg">-0.517</td><td>3.154</td><td>51.2%</td><td>2669</td></tr><tr class="hl"><td>Wyckoff (default SL=2× TP=2×)</td><td class="neg">-0.72%</td><td class="neg">16.4%</td><td class="neg">-0.044</td><td>0.207</td><td>50.5%</td><td>194</td></tr><tr class="hl"><td>Wyckoff (default) + Vol (0.20)</td><td class="pos">+7.27%</td><td class="neg">19.0%</td><td class="warn">0.383</td><td>0.485</td><td>50.5%</td><td>194</td></tr><tr><td>Wyckoff WF-optimised (OOS stitched)</td><td class="pos">+12.68%</td><td class="neg">6.3%</td><td class="pos">2.005</td><td>0.871</td><td>35.0%</td><td>177</td></tr><tr><td>Wyckoff WF-opt + Vol 0.20 (OOS)</td><td class="pos">+18.34%</td><td class="neg">10.3%</td><td class="pos">1.778</td><td>0.997</td><td>35.6%</td><td>177</td></tr></tbody>
+</table>
+</div>
+<p class="meta">
+OOS t-stat = 1.06, p = 0.1484 (one-sided, OOS returns &gt; 0)
+· OOS positive-window rate: 57% (20/35)
+</p>
+
+<h2>Calmar Ratio Comparison</h2>
+<div class="card"><table><thead><tr><th>Strategy</th><th>Calmar</th><th>Max DD</th><th>Return</th><th>Trades</th></tr></thead><tbody><tr><td style="width:240px">Baseline (composite, T=3)</td><td><div style="background:#f44336;height:14px;width:69px;border-radius:3px;display:inline-block"></div> -0.517</td><td style="color:#f44336">58.3%</td><td>-30.1%</td><td>2669</td></tr><tr><td style="width:240px">Wyckoff (default SL=2× TP=2×)</td><td><div style="background:#f44336;height:14px;width:6px;border-radius:3px;display:inline-block"></div> -0.044</td><td style="color:#f44336">16.4%</td><td>-0.7%</td><td>194</td></tr><tr><td style="width:240px">Wyckoff (default) + Vol (0.20)</td><td><div style="background:#4caf50;height:14px;width:51px;border-radius:3px;display:inline-block"></div> 0.383</td><td style="color:#f44336">19.0%</td><td>+7.3%</td><td>194</td></tr><tr><td style="width:240px">Wyckoff WF-optimised (OOS stitched)</td><td><div style="background:#4caf50;height:14px;width:267px;border-radius:3px;display:inline-block"></div> 2.005</td><td style="color:#f44336">6.3%</td><td>+12.7%</td><td>177</td></tr><tr><td style="width:240px">Wyckoff WF-opt + Vol 0.20 (OOS)</td><td><div style="background:#4caf50;height:14px;width:237px;border-radius:3px;display:inline-block"></div> 1.778</td><td style="color:#f44336">10.3%</td><td>+18.3%</td><td>177</td></tr></tbody></table></div>
+
+<h2>WF Walk-Forward Detail (optimised variant)</h2>
+<p class="meta">IS = 6-month in-sample optimisation; OOS = 2-month out-of-sample evaluation.</p>
+<div class="scroll">
+<table>
+<thead><tr>
+  <th>#</th><th>OOS Window</th><th>IS Signals</th>
+  <th>Best SL</th><th>Best TP1</th>
+  <th>IS Calmar</th><th>IS Trades</th>
+  <th>OOS Ret</th><th>OOS DD</th><th>OOS Trades</th><th>OOS WR</th>
+</tr></thead>
+<tbody><tr><td>W01</td><td>2020-07-01→2020-09-01</td><td>24</td><td>2.0×</td><td>3.0×</td><td class="pos">+0.798</td><td>19</td><td class="pos">+0.34%</td><td>1.4%</td><td>3</td><td>33%</td></tr>
+<tr><td>W02</td><td>2020-09-01→2020-11-01</td><td>22</td><td>2.5×</td><td>1.0×</td><td class="pos">+0.410</td><td>19</td><td class="pos">+0.37%</td><td>1.2%</td><td>4</td><td>75%</td></tr>
+<tr><td>W03</td><td>2020-11-01→2021-01-01</td><td>17</td><td>0.5×</td><td>3.0×</td><td class="pos">+1.123</td><td>14</td><td class="pos">+3.84%</td><td>5.5%</td><td>8</td><td>25%</td></tr>
+<tr><td>W04</td><td>2021-01-01→2021-03-01</td><td>19</td><td>0.5×</td><td>1.5×</td><td class="pos">+1.463</td><td>17</td><td class="pos">+0.90%</td><td>3.3%</td><td>3</td><td>67%</td></tr>
+<tr><td>W05</td><td>2021-03-01→2021-05-01</td><td>17</td><td>1.0×</td><td>1.0×</td><td class="pos">+1.060</td><td>15</td><td class="pos">+3.18%</td><td>4.0%</td><td>5</td><td>80%</td></tr>
+<tr><td>W06</td><td>2021-05-01→2021-07-01</td><td>17</td><td>0.5×</td><td>3.0×</td><td class="pos">+1.037</td><td>16</td><td class="neg">-4.24%</td><td>4.9%</td><td>5</td><td>0%</td></tr>
+<tr><td>W07</td><td>2021-07-01→2021-09-01</td><td>13</td><td>2.0×</td><td>3.0×</td><td class="pos">+1.105</td><td>11</td><td class="pos">+0.70%</td><td>1.8%</td><td>1</td><td>100%</td></tr>
+<tr><td>W08</td><td>2021-09-01→2021-11-01</td><td>11</td><td>1.5×</td><td>2.0×</td><td class="pos">+1.132</td><td>10</td><td class="neg">-0.18%</td><td>3.2%</td><td>3</td><td>33%</td></tr>
+<tr><td>W09</td><td>2021-11-01→2022-01-01</td><td>9</td><td>1.5×</td><td>3.0×</td><td class="pos">+0.877</td><td>8</td><td class="pos">+1.68%</td><td>3.6%</td><td>6</td><td>50%</td></tr>
+<tr><td>W10</td><td>2022-01-01→2022-03-01</td><td>10</td><td>0.5×</td><td>1.5×</td><td class="pos">+0.784</td><td>10</td><td class="neg">-2.36%</td><td>4.4%</td><td>4</td><td>0%</td></tr>
+<tr><td>W11</td><td>2022-03-01→2022-05-01</td><td>13</td><td>1.0×</td><td>3.0×</td><td class="pos">+0.787</td><td>13</td><td class="pos">+3.07%</td><td>5.0%</td><td>6</td><td>50%</td></tr>
+<tr><td>W12</td><td>2022-05-01→2022-07-01</td><td>16</td><td>1.5×</td><td>3.0×</td><td class="pos">+1.114</td><td>16</td><td class="neg">-1.98%</td><td>2.3%</td><td>2</td><td>0%</td></tr>
+<tr><td>W13</td><td>2022-07-01→2022-09-01</td><td>12</td><td>1.5×</td><td>3.0×</td><td class="pos">+0.609</td><td>12</td><td class="pos">+0.65%</td><td>4.2%</td><td>5</td><td>40%</td></tr>
+<tr><td>W14</td><td>2022-09-01→2022-11-01</td><td>13</td><td>2.0×</td><td>3.0×</td><td class="pos">+0.877</td><td>12</td><td class="neg">-1.08%</td><td>2.1%</td><td>4</td><td>50%</td></tr>
+<tr><td>W15</td><td>2022-11-01→2023-01-01</td><td>13</td><td>0.5×</td><td>1.5×</td><td class="pos">+1.029</td><td>13</td><td class="neg">-0.45%</td><td>1.1%</td><td>7</td><td>29%</td></tr>
+<tr><td>W16</td><td>2023-01-01→2023-03-01</td><td>19</td><td>2.0×</td><td>1.0×</td><td class="pos">+1.017</td><td>17</td><td class="pos">+2.50%</td><td>2.6%</td><td>9</td><td>78%</td></tr>
+<tr><td>W17</td><td>2023-03-01→2023-05-01</td><td>24</td><td>0.5×</td><td>1.0×</td><td class="pos">+1.040</td><td>23</td><td class="neg">-1.60%</td><td>2.9%</td><td>4</td><td>0%</td></tr>
+<tr><td>W18</td><td>2023-05-01→2023-07-01</td><td>22</td><td>1.0×</td><td>3.0×</td><td class="pos">+0.895</td><td>21</td><td class="pos">+1.83%</td><td>3.5%</td><td>5</td><td>40%</td></tr>
+<tr><td>W19</td><td>2023-07-01→2023-09-01</td><td>23</td><td>0.5×</td><td>2.0×</td><td class="pos">+0.931</td><td>21</td><td class="neg">-0.40%</td><td>0.7%</td><td>4</td><td>25%</td></tr>
+<tr><td>W20</td><td>2023-09-01→2023-11-01</td><td>17</td><td>0.5×</td><td>2.0×</td><td class="pos">+0.371</td><td>15</td><td class="pos">+0.63%</td><td>2.6%</td><td>11</td><td>18%</td></tr>
+<tr><td>W21</td><td>2023-11-01→2024-01-01</td><td>24</td><td>0.5×</td><td>2.0×</td><td class="pos">+0.654</td><td>22</td><td class="">-0.00%</td><td>2.0%</td><td>5</td><td>20%</td></tr>
+<tr><td>W22</td><td>2024-01-01→2024-03-01</td><td>20</td><td>0.5×</td><td>2.0×</td><td class="pos">+0.057</td><td>20</td><td class="neg">-1.19%</td><td>1.9%</td><td>3</td><td>0%</td></tr>
+<tr><td>W23</td><td>2024-03-01→2024-05-01</td><td>20</td><td>2.5×</td><td>3.0×</td><td class="neg">-0.001</td><td>15</td><td class="pos">+3.08%</td><td>4.4%</td><td>4</td><td>75%</td></tr>
+<tr><td>W24</td><td>2024-05-01→2024-07-01</td><td>15</td><td>0.5×</td><td>2.0×</td><td class="pos">+0.804</td><td>13</td><td class="pos">+2.02%</td><td>2.5%</td><td>9</td><td>33%</td></tr>
+<tr><td>W25</td><td>2024-07-01→2024-09-01</td><td>19</td><td>2.5×</td><td>1.0×</td><td class="pos">+1.163</td><td>17</td><td class="neg">-3.08%</td><td>3.1%</td><td>3</td><td>0%</td></tr>
+<tr><td>W26</td><td>2024-09-01→2024-11-01</td><td>19</td><td>0.5×</td><td>3.0×</td><td class="pos">+0.818</td><td>16</td><td class="neg">-2.49%</td><td>2.5%</td><td>6</td><td>0%</td></tr>
+<tr><td>W27</td><td>2024-11-01→2025-01-01</td><td>19</td><td>1.0×</td><td>3.0×</td><td class="pos">+0.082</td><td>17</td><td class="pos">+3.12%</td><td>4.0%</td><td>3</td><td>67%</td></tr>
+<tr><td>W28</td><td>2025-01-01→2025-03-01</td><td>13</td><td>1.0×</td><td>3.0×</td><td class="neg">-0.002</td><td>11</td><td class="neg">-1.54%</td><td>1.7%</td><td>3</td><td>0%</td></tr>
+<tr><td>W29</td><td>2025-03-01→2025-05-01</td><td>12</td><td>1.5×</td><td>3.0×</td><td class="pos">+0.322</td><td>11</td><td class="pos">+1.94%</td><td>4.8%</td><td>5</td><td>60%</td></tr>
+<tr><td>W30</td><td>2025-05-01→2025-07-01</td><td>11</td><td>0.5×</td><td>1.5×</td><td class="pos">+0.728</td><td>11</td><td class="pos">+0.01%</td><td>1.6%</td><td>9</td><td>44%</td></tr>
+<tr><td>W31</td><td>2025-07-01→2025-09-01</td><td>18</td><td>0.5×</td><td>3.0×</td><td class="pos">+0.757</td><td>16</td><td class="neg">-0.08%</td><td>2.5%</td><td>9</td><td>11%</td></tr>
+<tr><td>W32</td><td>2025-09-01→2025-11-01</td><td>24</td><td>0.5×</td><td>3.0×</td><td class="pos">+0.730</td><td>22</td><td class="neg">-1.85%</td><td>2.1%</td><td>6</td><td>0%</td></tr>
+<tr><td>W33</td><td>2025-11-01→2026-01-01</td><td>25</td><td>2.5×</td><td>3.0×</td><td class="neg">-0.004</td><td>20</td><td class="pos">+2.37%</td><td>3.2%</td><td>5</td><td>60%</td></tr>
+<tr><td>W34</td><td>2026-01-01→2026-03-01</td><td>21</td><td>1.0×</td><td>3.0×</td><td class="pos">+1.007</td><td>19</td><td class="pos">+0.03%</td><td>3.0%</td><td>4</td><td>25%</td></tr>
+<tr><td>W35</td><td>2026-03-01→2026-05-01</td><td>16</td><td>2.5×</td><td>3.0×</td><td class="pos">+0.985</td><td>13</td><td class="pos">+3.01%</td><td>3.9%</td><td>4</td><td>75%</td></tr></tbody>
+</table>
+</div>
+
+<h2>IS-Selected Parameter Frequency</h2>
+<div class="card"><table><thead><tr><th>Param Combo</th><th>Selected (# windows)</th><th>Frequency</th></tr></thead><tbody><tr><td>SL=0.5×ATR  TP1=3.0×ATR</td><td>5</td><td>14%</td></tr><tr><td>SL=1.0×ATR  TP1=3.0×ATR</td><td>5</td><td>14%</td></tr><tr><td>SL=0.5×ATR  TP1=2.0×ATR</td><td>5</td><td>14%</td></tr><tr><td>SL=0.5×ATR  TP1=1.5×ATR</td><td>4</td><td>11%</td></tr><tr><td>SL=1.5×ATR  TP1=3.0×ATR</td><td>4</td><td>11%</td></tr><tr><td>SL=2.0×ATR  TP1=3.0×ATR</td><td>3</td><td>9%</td></tr><tr><td>SL=2.5×ATR  TP1=3.0×ATR</td><td>3</td><td>9%</td></tr><tr><td>SL=2.5×ATR  TP1=1.0×ATR</td><td>2</td><td>6%</td></tr><tr><td>SL=1.0×ATR  TP1=1.0×ATR</td><td>1</td><td>3%</td></tr><tr><td>SL=1.5×ATR  TP1=2.0×ATR</td><td>1</td><td>3%</td></tr><tr><td>SL=2.0×ATR  TP1=1.0×ATR</td><td>1</td><td>3%</td></tr><tr><td>SL=0.5×ATR  TP1=1.0×ATR</td><td>1</td><td>3%</td></tr></tbody></table></div>
+
+<h2>Strategy Logic</h2>
+<div class="card">
+<h3>1 — Range Detection</h3>
+<p>The market is classified as <em>ranging</em> when ADX &lt; 25 AND the
+price band (rolling 24-bar high − low) / low &lt; 10%. Range boundaries
+are computed using shifted highs/lows (no look-ahead).</p>
+
+<h3>2 — Volume Bias (Accumulation vs Distribution)</h3>
+<p><em>Accumulation</em>: OBV is above its 21-bar EMA within a ranging
+market — smart money is absorbing supply without moving price.
+<em>Distribution</em>: OBV is below its 21-bar EMA — smart money is
+quietly unloading.</p>
+
+<h3>3 — Manipulation Events</h3>
+<p><strong>Spring</strong> (long setup): The current bar's low pierces
+below the range boundary AND closes back inside, on volume &ge; 1.3×
+20-bar average, within an accumulation context. This is the classic
+Wyckoff spring — a false breakdown designed to shake out weak longs
+before the mark-up phase begins.</p>
+<p><strong>Upthrust</strong> (short setup): The current bar's high
+pierces above the range boundary AND closes back inside, on elevated
+volume, within a distribution context. The mirror image of the spring —
+a false breakout designed to attract late longs before mark-down.</p>
+
+<h3>4 — Entry Timing</h3>
+<p>Signal fires on the bar <em>after</em> the spring/upthrust event
+(next-bar open execution). No look-ahead: the signal bar's open price
+is used for entry.</p>
+
+<h3>5 — SL/TP Walk-Forward Optimisation</h3>
+<p>For each 6-month IS window, a grid search over
+SL ∈ {0.5, 1.0, 1.5, 2.0, 2.5} × TP1 ∈ {1.0, 1.5, 2.0, 3.0} ATR multiples
+selects the combo with the highest Calmar ratio (minimum 5 IS trades).
+The TP2 = 2×TP1, TP3 = 3×TP1 scale automatically. The selected params
+are applied to the OOS window.</p>
+
+<h3>6 — Composite Score</h3>
+<p>Score = (penetration depth / ATR) × vol_ratio × 2.
+Positive for longs (spring), negative for shorts (upthrust).
+Used for analytics; all valid events are traded (no score threshold).</p>
+</div>
+</body>
+</html>
