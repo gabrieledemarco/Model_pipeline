@@ -61,7 +61,7 @@ SEP2 = "═" * 78
 # Load data
 # ─────────────────────────────────────────────────────────────────────────────
 print(SEP2)
-print("ORB TP/SL Scan — Ottimizzazione parametri ICT Reversion")
+print("ORB TP/SL Scan — ICT Reversion | SL calcolato su ATR 1H e low/high 1H")
 print(SEP2)
 print("\n[1/3] Caricamento dati …")
 raw    = fetch_extended_data(start_year=START_YEAR, start_month=1,
@@ -83,13 +83,12 @@ asian_daily["atr_1h_mean"] = atr_by_date.reindex(asian_daily.index)
 asian_daily["range_to_atr"] = (
     asian_daily["asian_range"] / asian_daily["atr_1h_mean"].clip(lower=1))
 
-# Arrays
+# Arrays 15M
 IDX = df_15m.index
 H   = IDX.hour
 HI  = df_15m["high"].values
 LO  = df_15m["low"].values
 CL  = df_15m["close"].values
-ATR = df_15m["atr_14"].clip(lower=1.0).values
 N   = len(df_15m)
 
 date_idx   = IDX.normalize()
@@ -103,6 +102,22 @@ al_arr  = np.array([al_map.get(d, np.nan)  for d in date_idx], dtype=float)
 ar_arr  = np.array([ar_map.get(d, np.nan)  for d in date_idx], dtype=float)
 rta_arr = np.array([rta_map.get(d, np.nan) for d in date_idx], dtype=float)
 yr_arr  = np.array([d.year for d in date_idx], dtype=int)
+
+# Align 1H ATR and extremes to 15M bars (SL calcolato su dati 1H)
+print("  Allineamento dati 1H → 15M per calcolo SL …")
+floor_1h   = IDX.floor("h")
+atr_1h_map = df_1h["atr_14"].clip(lower=1.0).to_dict()
+lo_1h_map  = df_1h["low"].to_dict()
+hi_1h_map  = df_1h["high"].to_dict()
+
+ATR_1H = np.array([atr_1h_map.get(t, np.nan) for t in floor_1h], dtype=float)
+LO_1H  = np.array([lo_1h_map.get(t,  np.nan) for t in floor_1h], dtype=float)
+HI_1H  = np.array([hi_1h_map.get(t,  np.nan) for t in floor_1h], dtype=float)
+
+# Fallback to 15M ATR dove 1H non disponibile
+ATR_1H = np.where(np.isnan(ATR_1H),
+                  df_15m["atr_14"].clip(lower=1.0).values,
+                  ATR_1H)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 1: collect all sweep + MSS events with raw geometry
@@ -123,12 +138,17 @@ for i in range(N - MAX_HOLD_BARS - MSS_LOOKBACK - 2):
     if np.isnan(ah) or np.isnan(al) or ar < 1.0:
         continue
 
-    atr_i = ATR[i]
+    # SL calcolato su 1H: ATR e low/high della barra 1H contenente il sweep bar
+    atr_1h_i = ATR_1H[i]
+    lo_1h_i  = LO_1H[i]   # low della barra 1H (swept extreme per LONG SL)
+    hi_1h_i  = HI_1H[i]   # high della barra 1H (swept extreme per SHORT SL)
+
+    if np.isnan(lo_1h_i) or np.isnan(hi_1h_i):
+        continue
 
     # ── LONG sweep ──────────────────────────────────────────────────────
     if LO[i] < al and CL[i] >= al:
-        swept_ext  = LO[i]          # swept low
-        sweep_hi   = HI[i]          # high of sweep bar (used as MSS trigger)
+        sweep_hi = HI[i]   # high del bar 15M usato come trigger MSS
 
         mss_bar = None
         for j in range(i + 1, min(i + MSS_LOOKBACK + 1, N)):
@@ -139,28 +159,26 @@ for i in range(N - MAX_HOLD_BARS - MSS_LOOKBACK - 2):
         if mss_bar is None or mss_bar + MAX_HOLD_BARS >= N:
             continue
 
-        # entry = open of bar AFTER mss_bar (next bar open, zero look-ahead)
         entry_i  = mss_bar + 1
-        entry_px = CL[mss_bar]  # use close of MSS bar as entry price
+        entry_px = CL[mss_bar]
 
         events.append({
             "direction":   "long",
             "sweep_i":     i,
             "entry_i":     entry_i,
             "entry_px":    entry_px,
-            "swept_ext":   swept_ext,
+            "swept_ext":   lo_1h_i,   # low 1H barra sweep (più rappresentativo)
             "ah":          ah,
             "al":          al,
             "ar":          ar,
-            "atr_sweep":   atr_i,
+            "atr_sweep":   atr_1h_i,  # ATR 1H
             "rta":         rta,
             "year":        yr_arr[i],
         })
 
     # ── SHORT sweep ─────────────────────────────────────────────────────
     elif HI[i] > ah and CL[i] <= ah:
-        swept_ext = HI[i]           # swept high
-        sweep_lo  = LO[i]
+        sweep_lo = LO[i]
 
         mss_bar = None
         for j in range(i + 1, min(i + MSS_LOOKBACK + 1, N)):
@@ -179,11 +197,11 @@ for i in range(N - MAX_HOLD_BARS - MSS_LOOKBACK - 2):
             "sweep_i":     i,
             "entry_i":     entry_i,
             "entry_px":    entry_px,
-            "swept_ext":   swept_ext,
+            "swept_ext":   hi_1h_i,   # high 1H barra sweep
             "ah":          ah,
             "al":          al,
             "ar":          ar,
-            "atr_sweep":   atr_i,
+            "atr_sweep":   atr_1h_i,  # ATR 1H
             "rta":         rta,
             "year":        yr_arr[i],
         })
