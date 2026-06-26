@@ -15,7 +15,9 @@ Setup base (invariato):
 Parametri scansionati:
   tp_frac     ∈ {0.20, 0.25, 0.33, 0.40, 0.50, 0.60, 0.75, 1.00}
                TP = entry + tp_frac × asian_range (verso il lato opposto)
-  sl_buf      ∈ {0.10, 0.20, 0.50}  (× ATR oltre lo swept extreme)
+  sl_buf      ∈ {0.00, 0.10, 0.20, 0.50, 1.00, 1.50, 2.00}  (× ATR oltre lo swept extreme)
+               0.00 = SL esattamente al minimo/massimo dello sweep bar
+               2.00 = SL molto largo per evitare stop prematuri
   range_atr_max ∈ {inf, 2.0, 1.5, 1.2}
                Filtra sessioni asiatiche "strette" (range/ATR < soglia)
 
@@ -48,7 +50,7 @@ from src.strategy.orb_ict      import (
 # ─────────────────────────────────────────────────────────────────────────────
 START_YEAR    = 2020
 TP_FRAC_GRID  = [0.20, 0.25, 0.33, 0.40, 0.50, 0.60, 0.75, 1.00]
-SL_BUF_GRID   = [0.10, 0.20, 0.50]
+SL_BUF_GRID   = [0.00, 0.10, 0.20, 0.50, 1.00, 1.50, 2.00]
 RANGE_ATR_MAX = [999, 2.0, 1.5, 1.2]  # 999 = no filter
 MAX_HOLD_BARS = 32  # ~8h in 15M bars
 MSS_LOOKBACK  = 8   # max bars to find MSS confirmation
@@ -206,7 +208,8 @@ for ev in events:
     event_paths.append((path_hi, path_lo))
 
 print(f"\n  Scanning {len(TP_FRAC_GRID)}×{len(SL_BUF_GRID)}×{len(RANGE_ATR_MAX)} = "
-      f"{len(TP_FRAC_GRID)*len(SL_BUF_GRID)*len(RANGE_ATR_MAX)} combinazioni …\n")
+      f"{len(TP_FRAC_GRID)*len(SL_BUF_GRID)*len(RANGE_ATR_MAX)} combinazioni "
+      f"(SL da 0.00 a 2.00×ATR) …\n")
 
 results = []
 
@@ -379,5 +382,48 @@ if len(pos) > 0:
     print(f"    WR       = {best_pos.wr:.1f}%  R:R = {best_pos.rr:.2f}  N = {best_pos.n}")
 else:
     print("  NESSUNA combinazione con Expected P&L positivo trovata.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analisi effetto sl_buf: per ogni tp_frac fisso al best, varia sl_buf
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{SEP2}")
+print("EFFETTO SL_BUF — WR e ExpPnL al variare dello stop (nessun filtro rta)")
+print("(mostra come allargare SL impatta WR e R:R)")
+print(SEP2)
+
+best_tp = df_res[df_res.rta_max == 999].sort_values("exp_pnl", ascending=False).iloc[0].tp_frac
+sub_tp = df_res[(df_res.rta_max == 999) & (df_res.tp_frac == best_tp)].sort_values("sl_buf")
+
+print(f"\n  tp_frac fisso = {best_tp:.2f}")
+print(f"\n  {'sl_buf':>8} {'N':>6} {'WR%':>7} {'R:R':>6} {'BE%':>6} "
+      f"{'Margin':>8} {'ExpPnL%':>9}")
+print(f"  {SEP}")
+for _, r in sub_tp.iterrows():
+    sl_label = "← exact swept low" if r.sl_buf == 0.0 else ""
+    marker   = " ◄ POSITIVO" if r.exp_pnl > 0 else ""
+    print(f"  {r.sl_buf:>6.2f}×ATR  {r.n:>6}  {r.wr:>6.1f}%  {r.rr:>5.2f}  "
+          f"{r.be_wr:>5.1f}%  {r.margin:>+7.2f}pp  {r.exp_pnl:>+8.4f}%"
+          f"{marker}  {sl_label}")
+
+# Anche la tabella completa ordinata per sl_buf (no rta filter, top tp_fracs)
+print(f"\n{SEP2}")
+print("MATRICE SL_BUF × TP_FRAC — Expected P&L% (nessun filtro rta)")
+print(SEP2)
+pivot_data = df_res[df_res.rta_max == 999].pivot_table(
+    index="sl_buf", columns="tp_frac", values="exp_pnl", aggfunc="first"
+)
+header = "  sl_buf\\tp_frac"
+for col in pivot_data.columns:
+    header += f"  {col:.2f}"
+print(header)
+print(f"  {SEP}")
+for idx_val, row in pivot_data.iterrows():
+    line = f"  {idx_val:.2f}×ATR     "
+    for val in row.values:
+        marker = "*" if val > 0 else " "
+        line += f"  {val:+6.3f}{marker}"
+    print(line)
+print("  (* = positivo)")
 
 print(f"\n{SEP2}\n")
