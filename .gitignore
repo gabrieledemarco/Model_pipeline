@@ -6,6 +6,7 @@ __pycache__/
 data/raw/
 data/parquet/
 data/cache/
+data/dukascopy/
 models_store/*.joblib
 reports/charts/**/*.png
 reports/charts/**/*.json
