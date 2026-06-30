@@ -62,12 +62,10 @@ WF_STEP_M  = 2
 TP_FRAC_GRID = [1.0, 1.5, 2.0, 3.0]
 SL_BUF_GRID  = [0.0, 0.25, 0.5, 1.0]
 
-# Killzone windows (UTC) for Silver Bullet
-KILLZONES = [
-    (7, 0, 8, 0),    # London open 07-08 UTC (2-3 AM ET)
-    (14, 0, 15, 0),  # NY AM 14-15 UTC (9-10 AM ET)
-    (18, 0, 19, 0),  # NY PM 18-19 UTC (1-2 PM ET)
-]
+# Killzone windows (UTC) for Silver Bullet — tested individually
+KZ_LONDON = [(7,  0,  8, 0)]   # London open  07-08 UTC (02-03 ET)
+KZ_NY_AM  = [(14, 0, 15, 0)]   # NY AM        14-15 UTC (09-10 ET)
+KZ_NY_PM  = [(18, 0, 19, 0)]   # NY PM        18-19 UTC (13-14 ET)
 
 _BG   = "#0f1117"; _CARD = "#12151f"; _GRID = "#1e2130"
 _TEXT = "#e0e0e0"; _ACC  = "#42a5f5"; _GRN  = "#66bb6a"
@@ -75,12 +73,14 @@ _RED  = "#ef5350"; _YEL  = "#ffd54f"; _ORG  = "#ffa726"
 _PRP  = "#ab47bc"; _TEA  = "#26a69a"; _PNK  = "#ec407a"
 
 MODEL_COLORS = {
-    "FVG":          _ACC,
-    "OB":           _ORG,
-    "Sweep":        _GRN,
-    "SilverBullet": _PRP,
-    "PO3":          _YEL,
-    "Breaker":      _TEA,
+    "FVG":       _ACC,
+    "OB":        _ORG,
+    "Sweep":     _GRN,
+    "SB_London": _PRP,
+    "SB_NY_AM":  _PNK,
+    "SB_NY_PM":  "#7e57c2",
+    "PO3":       _YEL,
+    "Breaker":   _TEA,
 }
 
 SEP  = "─" * 68
@@ -454,10 +454,12 @@ def collect_sweep_events(lbk=16, min_wick_atr=0.15):
 # ── MODEL 4: Silver Bullet (FVG in Killzone) ────────────────────────────────
 # Same as FVG but the candle forming the FVG must be within a killzone window
 # ─────────────────────────────────────────────────────────────────────────────
-def collect_silver_bullet_events(min_fvg_atr_frac=0.05, max_age=16):
+def collect_silver_bullet_events(min_fvg_atr_frac=0.05, max_age=16, killzones=None):
+    if killzones is None:
+        killzones = KZ_LONDON + KZ_NY_AM + KZ_NY_PM
     def in_killzone(idx):
         h, m = H_arr[idx], M_arr[idx]
-        for (sh, sm, eh, em) in KILLZONES:
+        for (sh, sm, eh, em) in killzones:
             if (h * 60 + m) >= (sh * 60 + sm) and (h * 60 + m) < (eh * 60 + em):
                 return True
         return False
@@ -705,12 +707,14 @@ def _table(headers, rows):
 # Run each model
 # ═════════════════════════════════════════════════════════════════════════════
 MODELS = [
-    ("FVG",          "Fair Value Gap Fill",           collect_fvg_events),
-    ("OB",           "Order Block Reversal",          collect_ob_events),
-    ("Sweep",        "Liquidity Sweep + Reversal",    collect_sweep_events),
-    ("SilverBullet", "Silver Bullet (FVG+Killzone)",  collect_silver_bullet_events),
-    ("PO3",          "Power of 3",                    collect_po3_events),
-    ("Breaker",      "Breaker Block",                 collect_breaker_events),
+    ("FVG",          "Fair Value Gap Fill",                collect_fvg_events),
+    ("OB",           "Order Block Reversal",               collect_ob_events),
+    ("Sweep",        "Liquidity Sweep + Reversal",         collect_sweep_events),
+    ("SB_London",    "Silver Bullet — London 07-08 UTC",   lambda: collect_silver_bullet_events(killzones=KZ_LONDON)),
+    ("SB_NY_AM",     "Silver Bullet — NY AM 14-15 UTC",    lambda: collect_silver_bullet_events(killzones=KZ_NY_AM)),
+    ("SB_NY_PM",     "Silver Bullet — NY PM 18-19 UTC",    lambda: collect_silver_bullet_events(killzones=KZ_NY_PM)),
+    ("PO3",          "Power of 3",                         collect_po3_events),
+    ("Breaker",      "Breaker Block",                      collect_breaker_events),
 ]
 
 results = {}
