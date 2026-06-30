@@ -45,11 +45,13 @@ from src.strategy.monte_carlo  import run_monte_carlo
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
-INIT_CAP   = 100_000.0
-RISK_PCT   = 0.01
-FEE        = 0.0004        # 4 bps per side (Binance taker)
-MAX_HOLD   = 32            # 15M bars = 8 h
-IC_HORIZON = 16            # 15M bars = 4 h
+INIT_CAP    = 100_000.0
+RISK_PCT    = 0.01
+FEE         = 0.0004       # 4 bps per side (Binance taker)
+MIN_SL_ATR  = 0.50         # sizing floor: stop treated as ≥ 0.5× ATR_1H (caps notional)
+MAX_LEV     = 5.0          # hard cap: notional ≤ 5× equity
+MAX_HOLD    = 32           # 15M bars = 8 h
+IC_HORIZON  = 16           # 15M bars = 4 h
 START_YEAR = 2020
 N_SIMS     = 5_000
 
@@ -157,13 +159,13 @@ def run_backtest(events, tp_frac, sl_buf, initial_capital=INIT_CAP,
             continue
         if d == -1 and sl_px <= entry:
             continue
-        # Enforce minimum SL distance: 10% of ATR_1H or 0.1% of price
-        # This caps notional and prevents fee destruction from tiny stops
-        min_sl = max(ev["atr_1h"] * 0.1, entry * 0.001)
-        sl_dist = max(sl_dist, min_sl)
+        # Sizing floor: treat stop as ≥ 0.5× ATR_1H so notional stays finite.
+        # Structural stop (sl_px) is unchanged — only position size is affected.
+        sl_dist = max(sl_dist, atr * MIN_SL_ATR)
 
         at_risk  = equity * RISK_PCT
         qty      = at_risk / sl_dist
+        qty      = min(qty, equity * MAX_LEV / entry)   # hard leverage cap
         notional = qty * entry
         e_fee    = notional * FEE
 
@@ -905,7 +907,8 @@ html = f"""<!DOCTYPE html>
 <h1>ICT Model Suite — BTCUSDT 15M | {START_YEAR}–2026</h1>
 <p style="color:#9e9e9e;margin-bottom:18px">
   6 modelli ICT &nbsp;|&nbsp; WF {WF_TRAIN_M}m IS / {WF_OOS_M}m OOS / step {WF_STEP_M}m
-  &nbsp;|&nbsp; Risk {RISK_PCT*100:.0f}%/trade &nbsp;|&nbsp; Fee {FEE*100:.2f}%/lato
+  &nbsp;|&nbsp; Risk {RISK_PCT*100:.0f}%/trade &nbsp;|&nbsp; Fee {FEE*10000:.0f}bps/lato
+  &nbsp;|&nbsp; MinSL={MIN_SL_ATR:.2f}×ATR₁ₕ &nbsp;|&nbsp; MaxLev={MAX_LEV:.0f}×
   &nbsp;|&nbsp; MC {N_SIMS:,} sims
 </p>
 <h2>Comparison Summary</h2>
