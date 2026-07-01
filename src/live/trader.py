@@ -321,8 +321,31 @@ class LiveTrader:
             try:
                 self.client.place_market_close(state.direction, state.size_remaining)
             except Exception as e:
-                log.error("Exit order failed: %s", e)
-                return
+                # The native SL/TP order placed at entry can trigger and
+                # close the position on the exchange before our own
+                # market-close request lands — the exchange then rejects
+                # our reduce-only order because there's nothing left to
+                # reduce (e.g. Bybit 110017 "current position is zero").
+                # Confirm against the exchange rather than guessing from
+                # the error text: if it's genuinely flat, finalize local
+                # state to match (otherwise this repeats every poll
+                # forever and the trade never gets recorded). If the
+                # exchange still shows a real position, something else
+                # went wrong — leave state untouched and retry next poll,
+                # since forcing "closed" while a position is still open
+                # risks a duplicate entry on the next signal.
+                try:
+                    still_open = abs(self.client.get_position_size()) > 1e-9
+                except Exception:
+                    still_open = True  # can't confirm — assume worst case
+                if still_open:
+                    log.error("Exit order failed: %s", e)
+                    return
+                log.warning(
+                    "Exit order failed (%s) but exchange position is already "
+                    "flat — native SL/TP likely triggered first. Finalizing "
+                    "local state to match.", e,
+                )
 
         self.trade_log.write(
             event=f"EXIT_{reason.upper()}",
