@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Strategy Enhancements — BTCUSDT 2020-2026</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#0f1117;color:#e0e0e0;margin:0;padding:24px}
+  h1{font-size:1.6rem;color:#fff;border-bottom:2px solid #2196f3;padding-bottom:8px}
+  h2{font-size:1.1rem;color:#90caf9;margin-top:32px}
+  h3{font-size:.95rem;color:#b0bec5;margin-top:20px}
+  table{border-collapse:collapse;width:100%;margin-top:12px;font-size:.82rem}
+  th{background:#1e2130;color:#90caf9;padding:7px 10px;text-align:center;border-bottom:2px solid #2196f3}
+  td{padding:6px 10px;border-bottom:1px solid #1e2130;text-align:center}
+  td:first-child{text-align:left}
+  tr:hover td{background:#1a1e2e}
+  .pos{color:#4caf50;font-weight:600}
+  .neg{color:#f44336;font-weight:600}
+  .warn{color:#ff9800;font-weight:600}
+  .hl td{background:#1e2a1e!important;border-left:3px solid #4caf50}
+  .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75rem;font-weight:600}
+  .badge-green{background:#1b5e20;color:#a5d6a7}
+  .badge-red{background:#b71c1c;color:#ffcdd2}
+  .badge-yellow{background:#e65100;color:#ffe0b2}
+  .card{background:#12151f;border:1px solid #1e2130;border-radius:8px;padding:16px;margin-top:16px}
+  .meta{color:#546e7a;font-size:.78rem;margin-top:4px}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin:8px 0;font-size:.8rem}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px}
+  .scroll{overflow-x:auto}
+</style>
+</head>
+<body>
+<h1>Strategy Enhancements — BTCUSDT Perpetual Futures</h1>
+<p class="meta">Period: 2020-01 → 2026-05 · 56k bars · WF: 6m train / 2m OOS / step 2m · 35 windows · Fees: 0.04% per side · Generated in 3s</p>
+
+<div class="legend">
+  <span><span class="dot" style="background:#4caf50"></span>Improvement vs baseline</span>
+  <span><span class="dot" style="background:#f44336"></span>Degradation vs baseline</span>
+  <span>★ = t-test p &lt; 0.05 (OOS returns &gt; 0)</span>
+  <span>hl row = recommended combo</span>
+</div>
+
+<h2>Results Summary</h2>
+<div class="scroll">
+<table>
+<thead><tr>
+  <th>Variant</th><th>Return</th><th>Max DD</th><th>ΔDD</th>
+  <th>Calmar</th><th>ΔCalmar</th><th>Sharpe</th><th>Trades</th><th>t / p-val</th>
+</tr></thead>
+<tbody>
+<tr><td>Baseline</td><td class="pos">+31.13%</td><td class="neg">37.5%</td><td class="">+0.0%</td><td class="pos">0.830</td><td class="neg">+0.000</td><td>3.740</td><td>2635</td><td>0.64 / 0.265</td></tr><tr><td>A: Vol Sizing (0.20)</td><td class="pos">+79.02%</td><td class="neg">53.6%</td><td class="neg">-16.1%</td><td class="pos">1.473</td><td class="pos">+0.643</td><td>5.922</td><td>2635</td><td>0.86 / 0.198</td></tr><tr><td>B: Adaptive Threshold</td><td class="pos">+20.49%</td><td class="neg">38.3%</td><td class="">-0.8%</td><td class="pos">0.534</td><td class="neg">-0.296</td><td>2.634</td><td>1282</td><td>0.49 / 0.312</td></tr><tr><td>C: MA Regime Filter</td><td class="pos">+0.34%</td><td class="neg">44.8%</td><td class="neg">-7.3%</td><td class="warn">0.008</td><td class="neg">-0.822</td><td>3.189</td><td>2242</td><td>0.01 / 0.494</td></tr><tr><td>D: Persistence N=2</td><td class="pos">+20.30%</td><td class="neg">49.6%</td><td class="neg">-12.0%</td><td class="warn">0.410</td><td class="neg">-0.420</td><td>5.859</td><td>2472</td><td>0.16 / 0.437</td></tr><tr><td>A2: Vol + DD Halt 15%</td><td class="pos">+30.55%</td><td class="neg">40.9%</td><td class="neg">-3.3%</td><td class="pos">0.748</td><td class="neg">-0.082</td><td>3.991</td><td>1083</td><td>0.68 / 0.251</td></tr><tr class="hl"><td>A+C (Vol + MA Filter)</td><td class="pos">+40.27%</td><td class="neg">54.2%</td><td class="neg">-16.7%</td><td class="pos">0.743</td><td class="neg">-0.087</td><td>5.908</td><td>2242</td><td>0.33 / 0.373</td></tr><tr><td>All (A+B+C+D)</td><td class="pos">+18.38%</td><td class="neg">48.9%</td><td class="neg">-11.4%</td><td class="warn">0.376</td><td class="neg">-0.454</td><td>2.780</td><td>958</td><td>-0.03 / 0.512</td></tr>
+</tbody>
+</table>
+</div>
+<p class="meta">ΔDD = baseline DD − variant DD (positive = drawdown reduced). ΔCalmar = variant Calmar − baseline Calmar.</p>
+
+<h2>Calmar Ratio by Variant</h2>
+<div class="card">
+<table style="width:auto">
+<tbody><tr><td style="width:200px">Baseline</td><td><div style="background:#4caf50;height:16px;width:158px;border-radius:3px;display:inline-block"></div> <span style="">0.830</span></td><td style="color:#f44336">37.5%</td><td>+31.1%</td></tr><tr><td style="width:200px">A: Vol Sizing (0.20)</td><td><div style="background:#4caf50;height:16px;width:281px;border-radius:3px;display:inline-block"></div> <span style="">1.473</span></td><td style="color:#f44336">53.6%</td><td>+79.0%</td></tr><tr><td style="width:200px">B: Adaptive Threshold</td><td><div style="background:#4caf50;height:16px;width:102px;border-radius:3px;display:inline-block"></div> <span style="">0.534</span></td><td style="color:#f44336">38.3%</td><td>+20.5%</td></tr><tr><td style="width:200px">C: MA Regime Filter</td><td><div style="background:#4caf50;height:16px;width:2px;border-radius:3px;display:inline-block"></div> <span style="">0.008</span></td><td style="color:#f44336">44.8%</td><td>+0.3%</td></tr><tr><td style="width:200px">D: Persistence N=2</td><td><div style="background:#4caf50;height:16px;width:78px;border-radius:3px;display:inline-block"></div> <span style="">0.410</span></td><td style="color:#f44336">49.6%</td><td>+20.3%</td></tr><tr><td style="width:200px">A2: Vol + DD Halt 15%</td><td><div style="background:#4caf50;height:16px;width:143px;border-radius:3px;display:inline-block"></div> <span style="">0.748</span></td><td style="color:#f44336">40.9%</td><td>+30.6%</td></tr><tr><td style="font-weight:700;width:200px">A+C (Vol + MA Filter)</td><td><div style="background:#4caf50;height:16px;width:142px;border-radius:3px;display:inline-block"></div> <span style="font-weight:700;">0.743</span></td><td style="color:#f44336">54.2%</td><td>+40.3%</td></tr><tr><td style="width:200px">All (A+B+C+D)</td><td><div style="background:#4caf50;height:16px;width:72px;border-radius:3px;display:inline-block"></div> <span style="">0.376</span></td><td style="color:#f44336">48.9%</td><td>+18.4%</td></tr></tbody>
+</table>
+</div>
+
+<h2>Per-Window OOS Returns (% of initial equity)</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>#</th><th>OOS Window</th><th>Baseline</th><th>A: Vol Sizing (0.20)</th><th>B: Adaptive Threshold</th><th>C: MA Regime Filter</th><th>D: Persistence N=2</th><th>A2: Vol + DD Halt 15%</th><th>A+C (Vol + MA Filter)</th><th>All (A+B+C+D)</th></tr></thead>
+<tbody><tr><td>1</td><td>2020-07-01→2020-09-01</td><td class="pos">+0.92%</td><td class="pos">+1.29%</td><td class="pos">+5.74%</td><td class="pos">+3.77%</td><td class="pos">+8.39%</td><td class="neg">-1.02%</td><td class="pos">+4.55%</td><td class="pos">+4.96%</td></tr>
+<tr><td>2</td><td>2020-09-01→2020-11-01</td><td class="pos">+6.28%</td><td class="pos">+7.99%</td><td class="pos">+14.18%</td><td class="pos">+6.95%</td><td class="pos">+4.61%</td><td class="pos">+3.44%</td><td class="pos">+7.89%</td><td class="pos">+13.42%</td></tr>
+<tr><td>3</td><td>2020-11-01→2021-01-01</td><td class="pos">+28.15%</td><td class="pos">+49.80%</td><td class="pos">+27.73%</td><td class="pos">+32.04%</td><td class="pos">+33.13%</td><td class="pos">+35.48%</td><td class="pos">+59.45%</td><td class="pos">+39.91%</td></tr>
+<tr><td>4</td><td>2021-01-01→2021-03-01</td><td class="neg">-4.35%</td><td class="neg">-3.53%</td><td class="pos">+6.78%</td><td class="neg">-1.50%</td><td class="neg">-0.34%</td><td class="pos">+11.60%</td><td class="pos">+2.00%</td><td class="pos">+2.86%</td></tr>
+<tr><td>5</td><td>2021-03-01→2021-05-01</td><td class="pos">+7.07%</td><td class="pos">+12.00%</td><td class="neg">-6.44%</td><td class="pos">+3.28%</td><td class="pos">+4.94%</td><td class="pos">+6.00%</td><td class="pos">+11.01%</td><td class="neg">-16.07%</td></tr>
+<tr><td>6</td><td>2021-05-01→2021-07-01</td><td class="neg">-6.96%</td><td class="neg">-15.00%</td><td class="neg">-2.11%</td><td class="neg">-6.04%</td><td class="neg">-9.85%</td><td class="pos">+2.42%</td><td class="neg">-4.45%</td><td class="neg">-3.98%</td></tr>
+<tr><td>7</td><td>2021-07-01→2021-09-01</td><td class="neg">-3.43%</td><td class="neg">-11.45%</td><td class="neg">-1.31%</td><td class="neg">-8.90%</td><td class="pos">+0.92%</td><td class="neg">-21.45%</td><td class="neg">-22.35%</td><td class="neg">-3.77%</td></tr>
+<tr><td>8</td><td>2021-09-01→2021-11-01</td><td class="pos">+9.88%</td><td class="pos">+20.30%</td><td class="neg">-1.01%</td><td class="pos">+12.50%</td><td class="pos">+12.29%</td><td class="pos">+7.94%</td><td class="pos">+25.65%</td><td class="pos">+3.92%</td></tr>
+<tr><td>9</td><td>2021-11-01→2022-01-01</td><td class="neg">-12.37%</td><td class="neg">-20.23%</td><td class="neg">-12.24%</td><td class="neg">-9.06%</td><td class="neg">-10.20%</td><td class="neg">-6.28%</td><td class="neg">-19.15%</td><td class="neg">-10.58%</td></tr>
+<tr><td>10</td><td>2022-01-01→2022-03-01</td><td class="neg">-2.35%</td><td class="neg">-3.87%</td><td class="pos">+1.56%</td><td class="neg">-7.31%</td><td class="neg">-6.82%</td><td class="pos">+0.61%</td><td class="neg">-9.94%</td><td class="pos">+2.29%</td></tr>
+<tr><td>11</td><td>2022-03-01→2022-05-01</td><td class="pos">+9.21%</td><td class="pos">+13.90%</td><td class="pos">+5.24%</td><td class="pos">+2.35%</td><td class="pos">+11.59%</td><td class="pos">+4.11%</td><td class="pos">+1.10%</td><td class="neg">-1.97%</td></tr>
+<tr><td>12</td><td>2022-05-01→2022-07-01</td><td class="pos">+14.96%</td><td class="pos">+29.09%</td><td class="pos">+12.95%</td><td class="pos">+23.72%</td><td class="pos">+17.45%</td><td class="pos">+0.18%</td><td class="pos">+48.75%</td><td class="pos">+4.29%</td></tr>
+<tr><td>13</td><td>2022-07-01→2022-09-01</td><td class="pos">+0.97%</td><td class="neg">-0.24%</td><td class="neg">-3.67%</td><td class="pos">+1.27%</td><td class="neg">-0.89%</td><td class="pos">+1.26%</td><td class="pos">+3.09%</td><td class="neg">-6.15%</td></tr>
+<tr><td>14</td><td>2022-09-01→2022-11-01</td><td class="neg">-10.52%</td><td class="neg">-16.14%</td><td class="neg">-15.73%</td><td class="neg">-2.20%</td><td class="neg">-12.15%</td><td class="neg">-1.91%</td><td class="neg">-9.59%</td><td class="neg">-13.93%</td></tr>
+<tr><td>15</td><td>2022-11-01→2023-01-01</td><td class="neg">-5.73%</td><td class="neg">-9.05%</td><td class="pos">+1.36%</td><td class="neg">-0.30%</td><td class="neg">-2.09%</td><td class="neg">-3.78%</td><td class="neg">-4.77%</td><td class="neg">-2.11%</td></tr>
+<tr><td>16</td><td>2023-01-01→2023-03-01</td><td class="pos">+1.23%</td><td class="neg">-5.40%</td><td class="pos">+6.16%</td><td class="neg">-10.84%</td><td class="neg">-5.93%</td><td class="neg">-1.81%</td><td class="neg">-23.88%</td><td class="pos">+0.66%</td></tr>
+<tr><td>17</td><td>2023-03-01→2023-05-01</td><td class="pos">+1.76%</td><td class="pos">+2.61%</td><td class="pos">+3.07%</td><td class="pos">+1.05%</td><td class="pos">+6.03%</td><td class="pos">+3.57%</td><td class="pos">+2.80%</td><td class="pos">+1.93%</td></tr>
+<tr><td>18</td><td>2023-05-01→2023-07-01</td><td class="neg">-16.61%</td><td class="neg">-19.25%</td><td class="neg">-12.24%</td><td class="neg">-8.19%</td><td class="neg">-4.98%</td><td class="neg">-8.69%</td><td class="neg">-5.81%</td><td class="neg">-3.95%</td></tr>
+<tr><td>19</td><td>2023-07-01→2023-09-01</td><td class="neg">-15.19%</td><td class="neg">-19.58%</td><td class="neg">-11.65%</td><td class="neg">-15.60%</td><td class="neg">-9.21%</td><td class="neg">+0.00%</td><td class="neg">-22.41%</td><td class="neg">-6.76%</td></tr>
+<tr><td>20</td><td>2023-09-01→2023-11-01</td><td class="pos">+6.04%</td><td class="pos">+12.12%</td><td class="neg">-1.07%</td><td class="neg">-3.50%</td><td class="pos">+4.21%</td><td class="neg">+0.00%</td><td class="pos">+0.17%</td><td class="neg">-5.39%</td></tr>
+<tr><td>21</td><td>2023-11-01→2024-01-01</td><td class="pos">+8.51%</td><td class="pos">+11.95%</td><td class="pos">+3.87%</td><td class="pos">+10.28%</td><td class="neg">-0.92%</td><td class="neg">+0.00%</td><td class="pos">+18.35%</td><td class="neg">-4.04%</td></tr>
+<tr><td>22</td><td>2024-01-01→2024-03-01</td><td class="pos">+18.66%</td><td class="pos">+25.88%</td><td class="pos">+9.34%</td><td class="pos">+18.86%</td><td class="pos">+30.15%</td><td class="neg">+0.00%</td><td class="pos">+32.02%</td><td class="pos">+5.09%</td></tr>
+<tr><td>23</td><td>2024-03-01→2024-05-01</td><td class="neg">-13.58%</td><td class="neg">-25.38%</td><td class="neg">-3.18%</td><td class="neg">-10.15%</td><td class="neg">-10.46%</td><td class="neg">+0.00%</td><td class="neg">-23.41%</td><td class="pos">+4.39%</td></tr>
+<tr><td>24</td><td>2024-05-01→2024-07-01</td><td class="neg">-7.64%</td><td class="neg">-9.41%</td><td class="neg">-12.95%</td><td class="neg">-8.37%</td><td class="neg">-12.26%</td><td class="neg">+0.00%</td><td class="neg">-12.98%</td><td class="neg">-14.91%</td></tr>
+<tr><td>25</td><td>2024-07-01→2024-09-01</td><td class="pos">+3.74%</td><td class="pos">+8.97%</td><td class="neg">-1.48%</td><td class="neg">-7.39%</td><td class="pos">+3.69%</td><td class="neg">+0.00%</td><td class="neg">-5.26%</td><td class="pos">+5.44%</td></tr>
+<tr><td>26</td><td>2024-09-01→2024-11-01</td><td class="pos">+4.56%</td><td class="pos">+7.22%</td><td class="pos">+12.89%</td><td class="neg">-10.33%</td><td class="pos">+11.40%</td><td class="neg">+0.00%</td><td class="neg">-20.15%</td><td class="pos">+3.38%</td></tr>
+<tr><td>27</td><td>2024-11-01→2025-01-01</td><td class="pos">+15.64%</td><td class="pos">+32.11%</td><td class="pos">+2.94%</td><td class="pos">+13.79%</td><td class="pos">+13.36%</td><td class="neg">+0.00%</td><td class="pos">+30.86%</td><td class="pos">+8.99%</td></tr>
+<tr><td>28</td><td>2025-01-01→2025-03-01</td><td class="neg">-1.72%</td><td class="pos">+2.16%</td><td class="pos">+3.10%</td><td class="neg">-8.29%</td><td class="neg">-19.24%</td><td class="neg">+0.00%</td><td class="neg">-9.22%</td><td class="pos">+1.14%</td></tr>
+<tr><td>29</td><td>2025-03-01→2025-05-01</td><td class="pos">+2.49%</td><td class="pos">+2.31%</td><td class="pos">+2.90%</td><td class="neg">-6.52%</td><td class="pos">+0.01%</td><td class="neg">+0.00%</td><td class="neg">-16.76%</td><td class="neg">-0.78%</td></tr>
+<tr><td>30</td><td>2025-05-01→2025-07-01</td><td class="pos">+6.67%</td><td class="pos">+14.75%</td><td class="neg">-2.18%</td><td class="neg">-2.13%</td><td class="neg">-3.40%</td><td class="neg">+0.00%</td><td class="neg">-0.14%</td><td class="pos">+1.60%</td></tr>
+<tr><td>31</td><td>2025-07-01→2025-09-01</td><td class="neg">-6.18%</td><td class="neg">-10.03%</td><td class="neg">-7.22%</td><td class="neg">-2.85%</td><td class="neg">-16.81%</td><td class="neg">+0.00%</td><td class="neg">-4.86%</td><td class="neg">-8.73%</td></tr>
+<tr><td>32</td><td>2025-09-01→2025-11-01</td><td class="neg">-16.88%</td><td class="neg">-28.77%</td><td class="neg">-2.08%</td><td class="neg">-10.81%</td><td class="neg">-17.13%</td><td class="neg">+0.00%</td><td class="neg">-19.03%</td><td class="neg">-2.60%</td></tr>
+<tr><td>33</td><td>2025-11-01→2026-01-01</td><td class="pos">+3.61%</td><td class="pos">+8.19%</td><td class="neg">-0.85%</td><td class="pos">+6.28%</td><td class="neg">-6.68%</td><td class="neg">+0.00%</td><td class="pos">+13.42%</td><td class="neg">-1.86%</td></tr>
+<tr><td>34</td><td>2026-01-01→2026-03-01</td><td class="pos">+18.58%</td><td class="pos">+33.07%</td><td class="pos">+7.76%</td><td class="pos">+9.13%</td><td class="pos">+9.10%</td><td class="neg">+0.00%</td><td class="pos">+18.23%</td><td class="pos">+9.90%</td></tr>
+<tr><td>35</td><td>2026-03-01→2026-05-01</td><td class="neg">-5.27%</td><td class="neg">-6.58%</td><td class="neg">-4.36%</td><td class="neg">-4.08%</td><td class="neg">-10.27%</td><td class="neg">+0.00%</td><td class="neg">-6.45%</td><td class="neg">-8.36%</td></tr></tbody>
+</table>
+</div>
+
+<h2>Enhancement Descriptions</h2>
+<div class="card">
+<h3>A · Volatility-scaled sizing (vol_target = 0.20)</h3>
+<p>Scales position size inversely to realised 20-bar hourly vol (rvol_20),
+targeting 20% annualised portfolio volatility. High-vol periods (2022 bear,
+2024 ETF pump) get smaller positions automatically. Scalar is clipped [0.25, 3.0].
+No signal changes — only affects how much risk is taken per trade.</p>
+
+<h3>B · Adaptive composite threshold (rolling 75th-pct, 90d window)</h3>
+<p>Instead of a fixed threshold of 3.0, the entry bar requires
+composite ≥ p75(|composite| over past 90 days). In high-activity regimes the
+bar rises automatically (fewer, stronger signals); in quiet regimes it stays
+near the base threshold of 3.0. Applied symmetrically for shorts.</p>
+
+<h3>C · Daily EMA-200 regime filter</h3>
+<p>Only longs when 1H close &gt; daily EMA(200); only shorts when 1H close &lt;
+daily EMA(200). Prevents trading against the medium-term trend (~6-month).
+Particularly effective for filtering the 2020-2021 bull run where the composite
+system was generating incorrect short signals.</p>
+
+<h3>D · Signal persistence filter (N=2 bars)</h3>
+<p>A signal fires only when the composite has been above the threshold for 2
+consecutive 1H bars (not just the current one). Eliminates single-bar
+spikes and whipsaw entries in choppy consolidations. The trade-off is slightly
+later entries but higher signal quality.</p>
+
+<h3>A2 · Vol sizing + DD circuit breaker (vol_target=0.20, dd_halt=15%)</h3>
+<p>Combines volatility targeting with an equity circuit breaker: when drawdown
+from peak exceeds 15%, position size is halved; at 22.5% trading pauses
+entirely until equity recovers above 15% DD. Designed to capture the upside of
+vol targeting while hard-limiting tail drawdowns.</p>
+</div>
+</body>
+</html>

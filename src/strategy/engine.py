@@ -66,11 +66,16 @@ def run_backtest(
     signals: pd.DataFrame,
     initial_capital: float = INIT_CAP,
     atr_sl_override: float | None = None,
+    atr_tp1_override: float | None = None,
     sizing_method: str = "fixed_risk",
     size_pct: float | None = None,
     leverage: float = 1.0,
     dd_pause_pct: float = 0.0,
     adaptive_vol: bool = False,
+    max_notional_pct: float = 1.0,
+    vol_target: float | None = None,
+    dd_halt_pct: float | None = None,
+    min_score: float | None = None,
 ) -> dict:
     """
     Event-driven backtest on 1H OHLCV bars.
@@ -84,6 +89,8 @@ def run_backtest(
     initial_capital : float
     atr_sl_override : float | None
         Override ATR_SL multiplier.
+    atr_tp1_override : float | None
+        Override ATR_TP1 multiplier.  TP2 = 2×TP1, TP3 = 3×TP1 automatically.
     sizing_method : str
         "fixed_risk"     – size so that the SL costs exactly *size_pct* of equity.
         "fixed_fraction" – invest *size_pct* × leverage of equity per trade (notional).
@@ -102,12 +109,32 @@ def run_backtest(
           ATR < 30th pct → 1.5 × base_risk (low vol, wider edge)
           ATR > 70th pct → 0.5 × base_risk (high vol, protect capital)
           Otherwise      → 1.0 × base_risk
+    max_notional_pct : float
+        Hard cap on single-position notional as fraction of equity (default 1.0 = off).
+        E.g. 0.20 limits each position to at most 20 % of current equity notional.
+        Prevents oversized positions when ATR is low relative to price.
+    vol_target : float | None
+        Annualised volatility target (e.g. 0.20 = 20 %).  When set, scales the
+        effective risk fraction inversely to realised vol (rvol_20), keeping
+        portfolio vol near the target.  Scalar is clipped to [0.25, 3.0].
+    dd_halt_pct : float | None
+        Drawdown circuit breaker threshold (e.g. 0.15 = 15 %).  When equity
+        drawdown from its rolling peak exceeds this level, position size is
+        halved; at 1.5× the threshold trading pauses entirely until equity
+        recovers above the single-threshold level.
+    min_score : float | None
+        Minimum absolute composite score required to open a new position
+        (e.g. 8.0 = "strong signals only").  Applies on top of the
+        signal direction filter.
 
     Returns
     -------
     dict  with keys: equity, drawdown, trades, kpis
     """
-    _atr_sl   = atr_sl_override if atr_sl_override is not None else ATR_SL
+    _atr_sl   = atr_sl_override  if atr_sl_override  is not None else ATR_SL
+    _atr_tp1  = atr_tp1_override if atr_tp1_override is not None else ATR_TP1
+    _atr_tp2  = _atr_tp1 * 2.0
+    _atr_tp3  = _atr_tp1 * 3.0
     _size_pct = size_pct if size_pct is not None else RISK_PCT
     _leverage = max(float(leverage), 1.0)
 
@@ -126,16 +153,20 @@ def run_backtest(
     equity_arr = np.full(n, float(initial_capital))
     cash = float(initial_capital)
 
-    o   = df_1h["open"].to_numpy(float)
-    h   = df_1h["high"].to_numpy(float)
-    l   = df_1h["low"].to_numpy(float)
-    c   = df_1h["close"].to_numpy(float)
-    atr = df_1h["atr_14"].to_numpy(float)
+    o    = df_1h["open"].to_numpy(float)
+    h    = df_1h["high"].to_numpy(float)
+    l    = df_1h["low"].to_numpy(float)
+    c    = df_1h["close"].to_numpy(float)
+    atr  = df_1h["atr_14"].to_numpy(float)
+    rvol = df_1h["rvol_20"].to_numpy(float) if "rvol_20" in df_1h.columns \
+           else np.full(n, 1.0)
 
-    sig_arr   = signals["signal"].to_numpy(int)
-    comp_arr  = signals["composite"].to_numpy(float)
+    sig_arr    = signals["signal"].to_numpy(int)
+    comp_arr   = signals["composite"].to_numpy(float)
     regime_arr = signals["regime"].to_numpy(object) if "regime" in signals.columns \
                  else np.full(n, "unknown", dtype=object)
+
+    equity_peak = float(initial_capital)   # for circuit breaker
 
     trades: List[Trade] = []
 
@@ -329,7 +360,27 @@ def run_backtest(
             entry_px  = o[i]            # fill at next-bar open
             curr_atr  = atr[i - 1]
 
+            # ── min_score filter ─────────────────────────────────────────
+            if min_score is not None and abs(comp_arr[i - 1]) < min_score:
+                continue
+
+            # ── drawdown circuit breaker ──────────────────────────────────
+            size_scale = 1.0
+            if dd_halt_pct is not None:
+                current_dd = (equity_arr[i - 1] - equity_peak) / equity_peak
+                if current_dd < -(dd_halt_pct * 1.5):
+                    continue                    # full pause
+                elif current_dd < -dd_halt_pct:
+                    size_scale = 0.5            # half size
+
             if curr_atr > 0 and entry_px > 0:
+                # ── volatility targeting ─────────────────────────────────
+                eff_size_pct = _size_pct
+                if vol_target is not None:
+                    rv = max(rvol[i - 1], 1e-6)
+                    vol_scalar = np.clip(vol_target / rv, 0.25, 3.0)
+                    eff_size_pct = _size_pct * vol_scalar
+
                 # leverage-adjusted max notional
                 max_qty = cash * _leverage * 0.95 / entry_px
 
@@ -353,7 +404,12 @@ def run_backtest(
                     risk_per_unit = curr_atr * _atr_sl
                     qty = (cash * eff_size_pct) / risk_per_unit
 
-                qty = min(qty, max_qty)
+                # ── notional cap ─────────────────────────────────────────
+                if max_notional_pct < 1.0:
+                    cap_qty = cash * max_notional_pct / entry_px
+                    qty = min(qty, cap_qty)
+
+                qty = min(qty, max_qty) * size_scale
                 qty = max(qty, 1e-12)
 
                 IN_POS    = True
@@ -373,18 +429,19 @@ def run_backtest(
 
                 if new_sig == 1:
                     sl  = ep - curr_atr * _atr_sl
-                    tp1 = ep + curr_atr * ATR_TP1
-                    tp2 = ep + curr_atr * ATR_TP2
-                    tp3 = ep + curr_atr * ATR_TP3
+                    tp1 = ep + curr_atr * _atr_tp1
+                    tp2 = ep + curr_atr * _atr_tp2
+                    tp3 = ep + curr_atr * _atr_tp3
                     worst = ep; best = ep
                 else:
                     sl  = ep + curr_atr * _atr_sl
-                    tp1 = ep - curr_atr * ATR_TP1
-                    tp2 = ep - curr_atr * ATR_TP2
-                    tp3 = ep - curr_atr * ATR_TP3
+                    tp1 = ep - curr_atr * _atr_tp1
+                    tp2 = ep - curr_atr * _atr_tp2
+                    tp3 = ep - curr_atr * _atr_tp3
                     worst = ep; best = ep
 
         equity_arr[i] = _mark()
+        equity_peak = max(equity_peak, equity_arr[i])
 
     # close any open position at last bar
     if IN_POS:

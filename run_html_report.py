@@ -1,6 +1,6 @@
 """
 Full pipeline → HTML report.
-Runs: data fetch (cache), indicators, signals (real basis OI),
+Runs: data fetch (cache), indicators, signals (real basis OI + 15m + 1m layers),
 backtest, WFO, Monte Carlo (in-sample + OOS), scenarios, leverage grid.
 Writes a single self-contained HTML report.
 """
@@ -37,7 +37,7 @@ print("═" * 66)
 
 # ── 1. Data ──────────────────────────────────────────────────────────────────
 print("\n[1/9] Fetching data (from cache) …")
-tf_data = fetch_extended_data()
+tf_data = fetch_extended_data(fetch_15m=True, fetch_1m=True)
 
 # ── 2. Indicators ────────────────────────────────────────────────────────────
 print("\n[2/9] Computing indicators …")
@@ -45,7 +45,16 @@ for tf in tf_data:
     if not tf_data[tf].empty:
         tf_data[tf] = add_indicators(tf_data[tf])
 
-df_1h = tf_data["1H"]
+df_1h  = tf_data["1H"]
+df_15m = tf_data.get("15M", pd.DataFrame())
+df_1m  = tf_data.get("1M",  pd.DataFrame())
+
+if not df_15m.empty:
+    print(f"  [15M]  {len(df_15m):8,d} bars  "
+          f"[{df_15m.index[0].date()} → {df_15m.index[-1].date()}]")
+if not df_1m.empty:
+    print(f"  [ 1M]  {len(df_1m):8,d} bars  "
+          f"[{df_1m.index[0].date()} → {df_1m.index[-1].date()}]")
 
 # ── 3. OI (real basis) + Funding ─────────────────────────────────────────────
 print("\n[3/9] Loading real basis (premiumIndexKlines) + funding …")
@@ -64,13 +73,22 @@ print(f"  Funding  : {'real' if is_real else 'synthetic'}  "
       f"mean={funding.mean()*100:.4f}%")
 
 # ── 4. Signals ────────────────────────────────────────────────────────────────
-print("\n[4/9] Building signal matrix …")
-signals = build_signal_matrix(tf_data, oi_df, funding,
-                               premium_1h=premium_1h if oi_is_real else None)
+print("\n[4/9] Building signal matrix (10 components: +15m +1m) …")
+signals = build_signal_matrix(
+    tf_data,
+    oi_df,
+    funding,
+    premium_1h = premium_1h if oi_is_real else None,
+    df_15m     = df_15m if not df_15m.empty else None,
+    df_1m      = df_1m  if not df_1m.empty  else None,
+)
 n_long  = int((signals["signal"] ==  1).sum())
 n_short = int((signals["signal"] == -1).sum())
 n_flat  = int((signals["signal"] ==  0).sum())
-print(f"  Signals  : long={n_long:,}  short={n_short:,}  flat={n_flat:,}")
+has_15m = bool(signals["has_15m"].iloc[0])
+has_1m  = bool(signals["has_1m"].iloc[0])
+print(f"  Signals  : long={n_long:,}  short={n_short:,}  flat={n_flat:,}  "
+      f"[15m={'✓' if has_15m else '✗'}  1m={'✓' if has_1m else '✗'}]")
 
 # ── 5. Backtest (baseline) ───────────────────────────────────────────────────
 print(f"\n[5/9] Backtest ({SCENARIO}) …")
@@ -107,7 +125,6 @@ mc_insample: dict = {}
 if not trades_is.empty:
     mc_raw    = run_monte_carlo(trades_is, n_sims=MC_SIMS, initial_capital=INIT_CAP)
     final_ret = mc_raw["total_return"]
-    # Build DataFrame of equity paths for charting
     paths_df  = pd.DataFrame(mc_raw["paths"].T)
     mc_insample = {
         "sim_equity":      paths_df,
@@ -142,8 +159,7 @@ if not oos_trades.empty and len(oos_trades) >= 20:
 # ── 9. Leverage grid ─────────────────────────────────────────────────────────
 print("\n[9/9] Leverage grid …")
 lev_comp_df, lev_equity_store = run_leverage_grid(df_1h, sig_filt)
-# lev_comp_df already has all KPIs; pass it directly to HTML as a simple dict list
-lev_result = lev_comp_df  # pass DataFrame directly
+lev_result = lev_comp_df
 
 # ── HTML report ──────────────────────────────────────────────────────────────
 print("\nGenerating HTML report …")

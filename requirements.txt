@@ -18,3 +18,6 @@ statsmodels>=0.14
 psutil>=5.9
 fastapi>=0.110
 uvicorn[standard]>=0.29
+websockets>=13.0
+aiohttp>=3.9
+requests>=2.28

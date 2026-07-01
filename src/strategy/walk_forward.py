@@ -60,6 +60,7 @@ def _run_window(
     tr_end:   pd.Timestamp,
     te_end:   pd.Timestamp,
     initial_capital: float,
+    backtest_kwargs: dict | None = None,
 ) -> Optional[dict]:
     """
     Run backtest on [tr_start, te_end), extract OOS slice [tr_end, te_end).
@@ -78,7 +79,7 @@ def _run_window(
     sig_w  = sig_w.reindex(common)
 
     try:
-        bt = run_backtest(df_w, sig_w, initial_capital)
+        bt = run_backtest(df_w, sig_w, initial_capital, **(backtest_kwargs or {}))
     except Exception:
         return None
 
@@ -145,6 +146,7 @@ def run_walk_forward(
     test_months:     int   = 2,
     step_months:     int   = 2,
     initial_capital: float = INIT_CAP,
+    backtest_kwargs: dict | None = None,
 ) -> dict:
     """
     Rolling walk-forward backtest with non-overlapping OOS windows.
@@ -189,7 +191,8 @@ def run_walk_forward(
     results: List[dict] = []
     for i, (tr_start, tr_end, te_end) in enumerate(windows):
         res = _run_window(df_1h, filtered_signals,
-                          tr_start, tr_end, te_end, initial_capital)
+                          tr_start, tr_end, te_end, initial_capital,
+                          backtest_kwargs=backtest_kwargs)
         if res is None:
             print(f"  Win {i+1:02d}: {tr_start.date()}–{te_end.date()}  SKIPPED")
             continue
