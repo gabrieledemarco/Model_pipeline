@@ -68,6 +68,13 @@ class PositionState:
     # Realized P&L during current trade
     realized_pnl: float = 0.0        # net after fees
 
+    # Exit model: "ladder" (default, 3-tier TP1/TP2/TP3 + BE trail — used by
+    # the composite-score and Wyckoff strategies) or "single_tp" (one TP, one
+    # SL, optional time-stop — used by strategies with their own validated
+    # exit rule, e.g. ICT Silver Bullet's TP=3x FVG width / SL=FVG edge).
+    exit_mode:    str = "ladder"
+    time_stop_at: str = ""           # ISO8601 UTC deadline; "" = no time-stop
+
     # Self-describing fields (dashboard identification)
     strategy_id: str = ""
     scenario:    str = ""
@@ -118,6 +125,8 @@ def open_position(
     atr: float,
     equity: float,
     sl_order_id: Optional[str] = None,
+    exit_mode: str = "ladder",
+    time_stop_at: str = "",
 ) -> PositionState:
     state = PositionState(
         active          = True,
@@ -134,6 +143,8 @@ def open_position(
         composite       = composite,
         atr_at_entry    = atr,
         equity_at_entry = equity,
+        exit_mode       = exit_mode,
+        time_stop_at    = time_stop_at,
     )
     save(state)
     return state

@@ -36,10 +36,15 @@ KLINES_COLS = [
 
 # ── OHLCV from FAPI (production, no key) ─────────────────────────────────────
 
-def _klines(interval: str, limit: int, symbol: str = SYMBOL) -> pd.DataFrame:
+def _klines(
+    interval: str, limit: int, symbol: str = SYMBOL, end_time: Optional[int] = None,
+) -> pd.DataFrame:
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if end_time is not None:
+        params["endTime"] = end_time
     r = requests.get(
         f"{FAPI}/fapi/v1/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
+        params=params,
         timeout=30,
     )
     r.raise_for_status()
@@ -66,6 +71,36 @@ def fetch_tf_data(symbol: str = SYMBOL) -> Dict[str, pd.DataFrame]:
              .dropna(subset=["open"]))
 
     return {"1H": df_1h, "4H": df_4h, "1D": df_1d, "1W": df_1w}
+
+
+def fetch_15m_bars(symbol: str = SYMBOL, limit: int = 2000) -> pd.DataFrame:
+    """
+    Fetch 15M OHLCV bars from production FAPI (reuses `_klines`, same helper
+    used by `fetch_tf_data`). 2000 bars ≈ 3 weeks — enough history for robust
+    FVG re-entry scanning (ICT Silver Bullet strategy, see
+    src/strategy/ict_silver_bullet.py / src/live/ict_live.py).
+
+    Binance FAPI caps a single `klines` request at 1500 bars, so this paginates
+    backward (via `endTime`) when `limit` exceeds that, then concatenates and
+    trims to the requested length.
+    """
+    chunks: list = []
+    remaining = limit
+    end_time: Optional[int] = None
+    while remaining > 0:
+        batch = min(remaining, 1500)
+        df = _klines("15m", batch, symbol, end_time=end_time)
+        if df.empty:
+            break
+        chunks.append(df)
+        remaining -= len(df)
+        if remaining <= 0 or len(df) < batch:
+            break
+        end_time = int(df.index[0].value // 10 ** 6) - 1  # 1ms before earliest bar
+
+    result = pd.concat(chunks[::-1]).sort_index()
+    result = result[~result.index.duplicated(keep="first")]
+    return result.tail(limit)
 
 
 # ── Premium index (real OI proxy) ────────────────────────────────────────────

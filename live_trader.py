@@ -36,9 +36,15 @@ Usage
    # Strategy id esplicito (per lanciare più strategie in parallelo):
    python live_trader.py --scenario "Strong (≥±18)" --exchange bybit --strategy-id strong_18_bybit
 
+   # Wyckoff Spring/Upthrust (1H, stessa scaletta SL/TP ad ATR):
+   python live_trader.py --strategy-type wyckoff --exchange bybit
+
+   # ICT Silver Bullet NY AM+PM (15M, TP/SL su FVG + time-stop 8h):
+   python live_trader.py --strategy-type ict --exchange bybit
+
 Ogni processo scrive esclusivamente in logs/strategies/{strategy_id}/
 (live_trader.log, trades.csv, position.json, meta.json). Se --strategy-id
-non è passato viene derivato automaticamente da scenario + exchange.
+non è passato viene derivato automaticamente da scenario/strategy-type + exchange.
 """
 from __future__ import annotations
 
@@ -77,6 +83,37 @@ def _setup_logging(log_dir: Path, level: str = "INFO"):
     )
 
 
+def _build_signal_source(strategy_type: str, scenario: str):
+    """Return (label, signal_fn, ws_interval) for the requested strategy type.
+
+    signal_fn : () -> (signal, composite, atr, close, exit_plan) — see
+    LiveTrader's docstring for the exit_plan contract. Imports are local so
+    a missing/broken strategy module only breaks the strategy types that
+    actually need it, not the whole CLI.
+    """
+    if strategy_type == "composite":
+        from src.live.data_live import compute_live_signal
+
+        def signal_fn():
+            return (*compute_live_signal(scenario=scenario), None)
+
+        return scenario, signal_fn, "1h"
+
+    if strategy_type == "wyckoff":
+        from src.live.wyckoff_live import compute_wyckoff_signal
+
+        def signal_fn():
+            return (*compute_wyckoff_signal(), None)
+
+        return "Wyckoff Spring/Upthrust", signal_fn, "1h"
+
+    if strategy_type == "ict":
+        from src.live.ict_live import compute_ict_signal
+        return "ICT Silver Bullet NY AM+PM", compute_ict_signal, "15m"
+
+    raise ValueError(f"Unknown strategy_type: {strategy_type!r}")
+
+
 def _write_meta(log_dir: Path, strategy_id: str, scenario: str, exchange: str,
                  dry_run: bool, capital: float | None) -> None:
     meta = {
@@ -106,7 +143,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--capital", type=float, default=None,
                     help="Override equity in USDT (default: fetched dal conto)")
     ap.add_argument("--scenario", default="Strong (≥±18)",
-                    help="Scenario strategia (default: 'Strong (≥±18)')")
+                    help="Scenario strategia (solo per --strategy-type composite; "
+                         "default: 'Strong (≥±18)')")
+    ap.add_argument("--strategy-type", default="composite",
+                    choices=["composite", "wyckoff", "ict"],
+                    help="Fonte del segnale: 'composite' (score multi-TF, "
+                         "parametrizzato da --scenario), 'wyckoff' (Spring/"
+                         "Upthrust 1H), 'ict' (Silver Bullet NY AM+PM 15M). "
+                         "Default: composite")
     ap.add_argument("--strategy-id", default=None,
                     help="Identificatore univoco della strategia (default: "
                          "slug auto-derivato da scenario+exchange, es. "
@@ -118,7 +162,8 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-async def _main(args: argparse.Namespace, log_dir: Path, strategy_id: str):
+async def _main(args: argparse.Namespace, log_dir: Path, strategy_id: str, label: str,
+                 signal_fn, ws_interval: str):
     log = logging.getLogger("live_trader")
 
     if args.exchange == "bybit":
@@ -148,13 +193,13 @@ async def _main(args: argparse.Namespace, log_dir: Path, strategy_id: str):
     ps.configure(
         state_file  = log_dir / "position.json",
         strategy_id = strategy_id,
-        scenario    = args.scenario,
+        scenario    = label,
         exchange    = args.exchange,
     )
     _write_meta(
         log_dir     = log_dir,
         strategy_id = strategy_id,
-        scenario    = args.scenario,
+        scenario    = label,
         exchange    = args.exchange,
         dry_run     = args.dry_run,
         capital     = args.capital,
@@ -163,10 +208,12 @@ async def _main(args: argparse.Namespace, log_dir: Path, strategy_id: str):
     trader = LiveTrader(
         client           = client,
         dry_run          = args.dry_run,
-        scenario         = args.scenario,
+        scenario         = label,
         capital_override = args.capital,
         log_dir          = log_dir,
         strategy_id      = strategy_id,
+        signal_fn        = signal_fn,
+        ws_interval      = ws_interval,
     )
 
     loop = asyncio.get_running_loop()
@@ -181,7 +228,7 @@ async def _main(args: argparse.Namespace, log_dir: Path, strategy_id: str):
     signal.signal(signal.SIGTERM, _shutdown)
 
     log.info("═" * 62)
-    log.info("  BTCUSDT Live Trader  |  Scenario: %s", args.scenario)
+    log.info("  BTCUSDT Live Trader  |  Strategy: %s", label)
     log.info("  Strategy ID: %s", strategy_id)
     exchange_label = {
         "bybit":  "Bybit USDT-Perps (Testnet)",
@@ -231,13 +278,15 @@ def _refuse_if_already_running(log_dir: Path, strategy_id: str) -> None:
 def main():
     args = parse_args()
 
-    strategy_id = args.strategy_id or slugify_strategy_id(args.scenario, args.exchange)
+    label, signal_fn, ws_interval = _build_signal_source(args.strategy_type, args.scenario)
+
+    strategy_id = args.strategy_id or slugify_strategy_id(label, args.exchange)
     log_dir = STRATEGIES_ROOT / strategy_id
     log_dir.mkdir(parents=True, exist_ok=True)
 
     _refuse_if_already_running(log_dir, strategy_id)
     _setup_logging(log_dir, args.log_level)
-    asyncio.run(_main(args, log_dir, strategy_id))
+    asyncio.run(_main(args, log_dir, strategy_id, label, signal_fn, ws_interval))
 
 
 if __name__ == "__main__":

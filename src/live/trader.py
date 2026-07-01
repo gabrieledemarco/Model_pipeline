@@ -1,14 +1,19 @@
 """
-Live trader — event loop per la strategia BTCUSDT Strong (≥±18).
+Live trader — event loop generico per strategie BTCUSDT.
+
+Il motore (entry/exit/sizing/position-state) è strategia-agnostico: la fonte
+del segnale è iniettata tramite `signal_fn` (composite-score, Wyckoff,
+ICT Silver Bullet, ...), la cadenza tramite `ws_interval` (1H per
+composite/Wyckoff, 15M per ICT).
 
 Architettura
 ────────────
-  WebSocket  wss://fstream.binance.com/ws/btcusdt@kline_1h   (solo timing)
+  WebSocket  wss://fstream.binance.com/ws/btcusdt@kline_{ws_interval}
        │
-       └─► on candle CLOSE ─► compute_live_signal() ─► entry / flat logic
+       └─► on bar CLOSE ─► signal_fn() ─► entry / flat logic
 
   Background monitor (ogni POLL_SECS):
-       └─► BitgetClient.get_mark_price() ─► check SL / TP ─► gestisce posizione
+       └─► BitgetClient.get_mark_price() ─► check SL / TP / time-stop ─► gestisce posizione
 
 Esecuzione ordini: Bitget USDT-Futures (simulated trading / testnet)
 Dati di mercato:   Binance FAPI production (no key — stessa pipeline del backtest)
@@ -22,9 +27,9 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import websockets
 
@@ -40,7 +45,7 @@ ATR_TP3  = 6.0
 RISK_PCT = 0.01    # 1 % equity per trade
 FEE      = 0.0006  # 0.06 % taker Bitget USDT-Futures
 
-WS_URL    = "wss://fstream.binance.com/ws/btcusdt@kline_1h"
+WS_URL_TEMPLATE = "wss://fstream.binance.com/ws/btcusdt@kline_{interval}"
 POLL_SECS = 30
 HEARTBEAT_EVERY_N_POLLS = 10   # ~5 min at POLL_SECS=30 — keeps live_trader.log
                                # from going silent for up to an hour between
@@ -104,6 +109,26 @@ def _size(equity: float, atr: float, entry_price: float) -> float:
     return max(round(min(qty, max_qty), 3), 0.001)
 
 
+def _size_from_stop(
+    equity: float, entry_price: float, sl_price: float, atr: float,
+    min_sl_atr_floor: float = 0.0, max_leverage: float = 1.0,
+) -> float:
+    """Generic risk-based sizing from an explicit stop price, for strategies
+    whose SL isn't a fixed ATR multiple (e.g. ICT Silver Bullet's SL sits on
+    the FVG boundary). Mirrors the backtest sizing exactly:
+      sl_dist = max(|entry - sl|, atr × min_sl_atr_floor)   [prevents a very
+                 tight structural stop from blowing up position size]
+      qty     = min(risk_usd / sl_dist, equity × max_leverage / entry)
+    """
+    risk_usd = equity * RISK_PCT
+    sl_dist  = max(abs(entry_price - sl_price), atr * min_sl_atr_floor)
+    if sl_dist <= 0:
+        return 0.001
+    qty     = risk_usd / sl_dist
+    max_qty = equity * max_leverage / entry_price
+    return max(round(min(qty, max_qty), 3), 0.001)
+
+
 def _levels(direction: int, entry: float, atr: float):
     if direction == 1:
         return (entry - atr * ATR_SL,
@@ -128,12 +153,31 @@ class LiveTrader:
         capital_override: Optional[float] = None,
         log_dir: Optional[Path] = None,
         strategy_id: str = "",
+        signal_fn: Optional[Callable[[], tuple]] = None,
+        ws_interval: str = "1h",
     ):
+        """
+        signal_fn : () -> (signal, composite, atr, close, exit_plan)
+            Pluggable signal source, decoupling the trading engine from any
+            specific strategy. `exit_plan` is either None (use the standard
+            2/2/4/6×ATR ladder — composite-score and Wyckoff strategies) or a
+            dict {"sl": float, "tp": float, "min_sl_atr_floor": float,
+            "max_leverage": float, "time_stop_hours": float} for strategies
+            with their own validated single-TP/SL + time-stop exit rule
+            (e.g. ICT Silver Bullet). Defaults to the original composite-score
+            signal for backward compatibility when not provided.
+        ws_interval : Binance kline stream interval driving on_candle_close()
+            cadence — "1h" for composite/Wyckoff, "15m" for ICT Silver Bullet.
+        """
         self.client   = client
         self.dry_run  = dry_run
         self.scenario = scenario
         self.cap_override = capital_override
         self.strategy_id  = strategy_id
+        self.ws_interval  = ws_interval
+        self.signal_fn = signal_fn or (
+            lambda: (*compute_live_signal(scenario=self.scenario), None)
+        )
 
         log_dir = Path(log_dir) if log_dir is not None else LOG_DIR
         self.trade_log = TradeLog(log_dir / "trades.csv", strategy_id=strategy_id)
@@ -179,15 +223,51 @@ class LiveTrader:
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
-    def _enter(self, direction: int, composite: float, atr: float, entry_price: float):
+    def _enter(self, direction: int, composite: float, atr: float, entry_price: float,
+               exit_plan: Optional[dict] = None):
         equity = self._equity()
-        qty    = _size(equity, atr, entry_price)
-        sl, tp1, tp2, tp3 = _levels(direction, entry_price, atr)
+
+        if exit_plan is None:
+            # Standard 3-tier ATR ladder (composite-score, Wyckoff).
+            qty = _size(equity, atr, entry_price)
+            sl, tp1, tp2, tp3 = _levels(direction, entry_price, atr)
+            exit_mode = "ladder"
+            time_stop_at = ""
+        else:
+            # Strategy-provided single TP/SL (e.g. ICT Silver Bullet).
+            sl = exit_plan["sl"]
+            tp1 = tp2 = tp3 = exit_plan["tp"]
+
+            # Sanity-check the stop is actually on the risk side of entry.
+            # A signal module bug that ever inverted ref_lo/ref_hi would
+            # otherwise be applied silently — exiting at the wrong price
+            # with no error raised. Refuse the trade instead.
+            wrong_side = (direction == 1 and sl >= entry_price) or \
+                         (direction == -1 and sl <= entry_price)
+            if wrong_side:
+                log.error(
+                    "Refusing entry: exit_plan SL=%.2f is not on the risk "
+                    "side of entry=%.2f for direction=%+d — signal module bug?",
+                    sl, entry_price, direction,
+                )
+                return
+
+            qty = _size_from_stop(
+                equity, entry_price, sl, atr,
+                min_sl_atr_floor=exit_plan.get("min_sl_atr_floor", 0.0),
+                max_leverage=exit_plan.get("max_leverage", 1.0),
+            )
+            exit_mode = "single_tp"
+            time_stop_hours = exit_plan.get("time_stop_hours")
+            time_stop_at = (
+                (datetime.now(timezone.utc) + timedelta(hours=time_stop_hours)).isoformat()
+                if time_stop_hours else ""
+            )
 
         dir_label = "LONG" if direction == 1 else "SHORT"
         log.info(
-            "ENTRY %s  qty=%.3f BTC  @%.1f  SL=%.1f  TP1=%.1f  TP2=%.1f  TP3=%.1f  score=%.1f",
-            dir_label, qty, entry_price, sl, tp1, tp2, tp3, composite,
+            "ENTRY %s  qty=%.3f BTC  @%.1f  SL=%.1f  TP1=%.1f  TP2=%.1f  TP3=%.1f  score=%.1f  exit_mode=%s",
+            dir_label, qty, entry_price, sl, tp1, tp2, tp3, composite, exit_mode,
         )
 
         sl_order_id = None
@@ -210,6 +290,7 @@ class LiveTrader:
             sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
             composite=composite, atr=atr, equity=equity,
             sl_order_id=sl_order_id if sl_order_id else None,
+            exit_mode=exit_mode, time_stop_at=time_stop_at,
         )
         self.trade_log.write(
             event="ENTRY", direction=direction, price=entry_price,
@@ -318,7 +399,31 @@ class LiveTrader:
         log.debug("Monitor  mark=%.1f  sl=%.1f  tp1=%.1f  tp2=%.1f  tp3=%.1f",
                   mark, state.sl, state.tp1, state.tp2, state.tp3)
 
-        # ── LONG ─────────────────────────────────────────────────────────────
+        # ── Time-stop (any exit_mode) ────────────────────────────────────────
+        if state.time_stop_at:
+            try:
+                deadline = datetime.fromisoformat(state.time_stop_at)
+            except ValueError:
+                deadline = None
+            if deadline is not None and datetime.now(timezone.utc) >= deadline:
+                self._exit_full(mark, "time_stop")
+                return mark
+
+        # ── Single TP/SL (e.g. ICT Silver Bullet) ────────────────────────────
+        if state.exit_mode == "single_tp":
+            if d == 1:
+                if mark <= state.sl:
+                    self._exit_full(state.sl, "stop_loss")
+                elif mark >= state.tp1:
+                    self._exit_full(state.tp1, "take_profit")
+            else:
+                if mark >= state.sl:
+                    self._exit_full(state.sl, "stop_loss")
+                elif mark <= state.tp1:
+                    self._exit_full(state.tp1, "take_profit")
+            return mark
+
+        # ── LONG (3-tier ATR ladder) ──────────────────────────────────────────
         if d == 1:
             if mark <= state.sl:
                 self._exit_full(state.sl, "stop_loss"); return
@@ -348,12 +453,12 @@ class LiveTrader:
 
         return mark
 
-    # ── On candle 1H chiusa ───────────────────────────────────────────────────
+    # ── On bar chiusa (cadenza = self.ws_interval) ────────────────────────────
 
     def on_candle_close(self):
-        log.info("── 1H candle closed — computing signal ──")
+        log.info("── %s bar closed — computing signal ──", self.ws_interval)
         try:
-            signal, composite, atr, close = compute_live_signal(scenario=self.scenario)
+            signal, composite, atr, close, exit_plan = self.signal_fn()
         except Exception as e:
             log.error("Signal computation failed: %s", e)
             return
@@ -368,7 +473,7 @@ class LiveTrader:
 
         if not self.state.active:
             if signal != 0:
-                self._enter(signal, composite, atr, close)
+                self._enter(signal, composite, atr, close, exit_plan)
         else:
             log.info("Position active (dir=%+d) — SL/TP manage exit", self.state.direction)
 
@@ -376,11 +481,12 @@ class LiveTrader:
 
     async def _ws_loop(self):
         backoff = 5
+        ws_url = WS_URL_TEMPLATE.format(interval=self.ws_interval)
         while self._running:
             try:
-                log.info("WebSocket connecting to %s", WS_URL)
+                log.info("WebSocket connecting to %s", ws_url)
                 async with websockets.connect(
-                    WS_URL, ping_interval=20, ping_timeout=20,
+                    ws_url, ping_interval=20, ping_timeout=20,
                 ) as ws:
                     backoff = 5
                     self._touch()
