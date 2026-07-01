@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Live Trading Monitor</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+</head>
+<body>
+
+<header id="topbar">
+  <button id="hamburger" aria-label="Toggle strategy list">&#9776;</button>
+  <div id="brand">
+    <span class="brand-dot"></span>
+    <span class="brand-name">LIVE TRADING MONITOR</span>
+  </div>
+  <div id="conn-status" class="conn-ok" title="Overview feed connection">
+    <span class="conn-dot"></span><span class="conn-label">connecting…</span>
+  </div>
+  <div id="server-clock">--:--:--</div>
+</header>
+
+<div id="layout">
+  <nav id="sidebar">
+    <div class="sidebar-item active" id="nav-overview" data-target="overview">
+      <span class="sidebar-icon">&#128202;</span>
+      <span class="sidebar-label">Aggregate Overview</span>
+    </div>
+    <div class="sidebar-sep">STRATEGIES</div>
+    <div id="strategy-list"><!-- populated by app.js --></div>
+  </nav>
+
+  <div id="sidebar-backdrop"></div>
+
+  <main id="main-panel">
+
+    <!-- ===================== AGGREGATE OVERVIEW ===================== -->
+    <section id="view-overview" class="view">
+      <div class="stat-row">
+        <div class="stat-card">
+          <div class="stat-label">Total Realized PnL</div>
+          <div class="stat-value" id="stat-total-pnl">--</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Open Positions</div>
+          <div class="stat-value" id="stat-open-positions">--</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Trades Today</div>
+          <div class="stat-value" id="stat-trades-today">--</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Strategies</div>
+        <div class="table-scroll">
+          <table class="data-table" id="overview-table">
+            <thead>
+              <tr>
+                <th>Strategy</th>
+                <th>Scenario</th>
+                <th>Exchange</th>
+                <th>Mode</th>
+                <th>Status</th>
+                <th>Position</th>
+                <th>Realized PnL</th>
+                <th>Equity</th>
+              </tr>
+            </thead>
+            <tbody id="overview-table-body">
+              <tr><td colspan="8" class="empty-row">Waiting for data…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Combined Equity Curves</div>
+        <div id="overview-chart" class="chart"></div>
+      </div>
+    </section>
+
+    <!-- ===================== STRATEGY DETAIL ===================== -->
+    <section id="view-detail" class="view hidden">
+
+      <div id="detail-error" class="error-banner hidden"></div>
+
+      <div class="panel detail-header" id="detail-header">
+        <div class="detail-header-main">
+          <h2 id="detail-title">--</h2>
+          <div id="detail-badges" class="badge-row"></div>
+        </div>
+        <div class="detail-header-metrics">
+          <div class="metric"><span class="metric-label">Uptime</span><span class="metric-value" id="detail-uptime">--</span></div>
+          <div class="metric"><span class="metric-label">CPU</span><span class="metric-value" id="detail-cpu">--</span></div>
+          <div class="metric"><span class="metric-label">RSS</span><span class="metric-value" id="detail-rss">--</span></div>
+        </div>
+      </div>
+
+      <div class="detail-grid">
+        <div class="panel" id="position-card">
+          <div class="panel-title">Current Position</div>
+          <div id="position-body">
+            <div class="empty-row">Waiting for data…</div>
+          </div>
+        </div>
+
+        <div class="panel" id="stats-card">
+          <div class="panel-title">Performance Stats</div>
+          <div id="stats-body">
+            <div class="empty-row">Waiting for data…</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Equity Curve</div>
+        <div id="detail-chart" class="chart"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Trade History</div>
+        <div class="table-scroll">
+          <table class="data-table" id="trades-table">
+            <thead>
+              <tr>
+                <th>Time</th><th>Event</th><th>Dir</th><th>Price</th><th>Qty</th>
+                <th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th>
+                <th>Composite</th><th>ATR</th><th>PnL (net)</th><th>Equity</th><th>Note</th>
+              </tr>
+            </thead>
+            <tbody id="trades-table-body">
+              <tr><td colspan="14" class="empty-row">Waiting for data…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Log Tail</div>
+        <div id="log-tail" class="log-tail"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

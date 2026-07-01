@@ -38,10 +38,16 @@ class ScenarioConfig:
     session_hours:    Optional[Tuple[int,int]] = None  # (8, 21) = London+NY
     monthly_filter:   bool  = False          # block counter-seasonal entries
     atr_sl:           float = 2.0
+    # ── New parameters ───────────────────────────────────────────────────────
+    adx_threshold:    float = 0.0            # min ADX required for entry (0=off)
+    use_obv:          bool  = False          # add s_obv (weight=1) to composite
+    dd_pause_pct:     float = 0.0            # suspend entries on DD > X (0=off)
+    adaptive_vol:     bool  = False          # scale risk by ATR regime
 
 
 # Pre-defined scenarios (ordered for display)
 SCENARIOS: Dict[str, ScenarioConfig] = {
+    # ── Original scenarios ───────────────────────────────────────────────────
     "Baseline":       ScenarioConfig("Baseline"),
     "Regime filter":  ScenarioConfig("Regime filter",   regime_filter=True),
     "Strong (≥±18)":  ScenarioConfig("Strong (≥±18)",  long_threshold=18.0,
@@ -54,6 +60,31 @@ SCENARIOS: Dict[str, ScenarioConfig] = {
                                       long_threshold=18.0, short_threshold=-18.0,
                                       regime_filter=True, session_hours=(8, 21),
                                       monthly_filter=True, atr_sl=2.5),
+    # ── New strategies ───────────────────────────────────────────────────────
+    "ADX Filter":     ScenarioConfig("ADX Filter",
+                                      adx_threshold=25.0,
+                                      session_hours=(8, 21)),
+    "OBV Enhanced":   ScenarioConfig("OBV Enhanced",
+                                      use_obv=True,
+                                      session_hours=(8, 21)),
+    "DD Control":     ScenarioConfig("DD Control",
+                                      session_hours=(8, 21),
+                                      regime_filter=True,
+                                      dd_pause_pct=0.15),
+    "Adaptive Vol":   ScenarioConfig("Adaptive Vol",
+                                      session_hours=(8, 21),
+                                      adaptive_vol=True),
+    "Trend Quality":  ScenarioConfig("Trend Quality",
+                                      adx_threshold=25.0,
+                                      session_hours=(8, 21),
+                                      regime_filter=True,
+                                      use_obv=True),
+    "Ultra Select":   ScenarioConfig("Ultra Select",
+                                      long_threshold=30.0,
+                                      short_threshold=-30.0,
+                                      session_hours=(8, 21),
+                                      regime_filter=True,
+                                      adx_threshold=20.0),
 }
 
 # Months where BTC historically performs strongly (avoid counter-seasonal shorts)
@@ -73,36 +104,48 @@ def apply_filters(signals: pd.DataFrame,
     for analytics; only 'signal' is zeroed out when a filter blocks the trade.
     """
     out = signals.copy()
-    sig = out["signal"].copy()
 
-    # ── 1. Threshold filter ──────────────────────────────────────────────────
-    sig[out["composite"] <  cfg.long_threshold]  = sig[out["composite"] <  cfg.long_threshold].where(lambda x: x <= 0, 0)
-    sig[out["composite"] > cfg.short_threshold] = sig[out["composite"] > cfg.short_threshold].where(lambda x: x >= 0, 0)
-    # Re-apply: only emit signal when composite exceeds the respective threshold
-    sig_l = (out["composite"] >= cfg.long_threshold).astype(int)
-    sig_s = -(out["composite"] <= cfg.short_threshold).astype(int)
+    # ── 1. Working composite (optionally boosted by OBV signal) ──────────────
+    # OBV adds ±1 to composite — raises effective threshold by 1 point for
+    # entries that lack institutional accumulation/distribution confirmation.
+    composite = out["composite"].copy()
+    if cfg.use_obv and "s_obv" in out.columns:
+        composite = composite + out["s_obv"] * 1
+
+    # ── 2. Threshold filter ──────────────────────────────────────────────────
+    sig_l = (composite >= cfg.long_threshold).astype(int)
+    sig_s = -(composite <= cfg.short_threshold).astype(int)
     sig   = (sig_l + sig_s).clip(-1, 1)
 
-    # ── 2. Regime filter ────────────────────────────────────────────────────
+    # ── 3. Regime filter ────────────────────────────────────────────────────
     if cfg.regime_filter and "regime" in out.columns:
         bull_mask = out["regime"] == "bull"
         bear_mask = out["regime"] == "bear"
-        # In bear regime: suppress longs; in bull regime: suppress shorts
         sig[bear_mask & (sig == 1)]  = 0
         sig[bull_mask & (sig == -1)] = 0
 
-    # ── 3. Session filter ────────────────────────────────────────────────────
+    # ── 4. ADX trend quality filter ──────────────────────────────────────────
+    # Block entries in low-momentum / choppy market regimes.
+    # Uses DI+ vs DI- direction alignment in addition to ADX threshold.
+    if cfg.adx_threshold > 0 and "adx_14" in out.columns:
+        weak_trend = out["adx_14"] < cfg.adx_threshold
+        sig[weak_trend] = 0
+        # DI directional alignment: longs need DI+ > DI-, shorts need DI- > DI+
+        if "di_plus" in out.columns and "di_minus" in out.columns:
+            di_misalign_long  = (sig == 1)  & (out["di_plus"]  < out["di_minus"])
+            di_misalign_short = (sig == -1) & (out["di_minus"] < out["di_plus"])
+            sig[di_misalign_long | di_misalign_short] = 0
+
+    # ── 5. Session filter ────────────────────────────────────────────────────
     if cfg.session_hours is not None:
         h_s, h_e = cfg.session_hours
         not_session = ~((out.index.hour >= h_s) & (out.index.hour < h_e))
         sig[not_session] = 0
 
-    # ── 4. Monthly filter ────────────────────────────────────────────────────
+    # ── 6. Monthly filter ────────────────────────────────────────────────────
     if cfg.monthly_filter:
         month = out.index.month
-        # Don't short in historically bullish months
         sig[(sig == -1) & np.isin(month, list(BULL_MONTHS))] = 0
-        # Don't go long in historically bearish months
         sig[(sig ==  1) & np.isin(month, list(BEAR_MONTHS))] = 0
 
     out["signal"] = sig
@@ -126,7 +169,9 @@ def run_comparison(df_1h: pd.DataFrame,
     for name, cfg in SCENARIOS.items():
         filt = apply_filters(signals, cfg)
         bt   = run_backtest(df_1h, filt, initial_capital,
-                            atr_sl_override=cfg.atr_sl)
+                            atr_sl_override=cfg.atr_sl,
+                            dd_pause_pct=cfg.dd_pause_pct,
+                            adaptive_vol=cfg.adaptive_vol)
         kpis = bt["kpis"]
         kpis["equity"]  = bt["equity"]
         kpis["trades"]  = bt["trades"]

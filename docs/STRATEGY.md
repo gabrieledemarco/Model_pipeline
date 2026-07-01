@@ -274,57 +274,40 @@ L'equity OOS è concatenata compound: ogni finestra parte dal capitale finale de
 
 ---
 
-## 10. Risultati — Con OI Reale (basis premiumIndex)
+## 10. Risultati Corretti — Post Bug-Fix Engine (giugno 2026)
+
+> **Nota**: i risultati precedenti con Max DD −74%/−87% erano causati da un bug nel
+> motore di backtest (`equity_arr[i]` non aggiornata dopo exit con `continue`).
+> I valori qui sotto riflettono il codice corretto.
 
 > Dataset: 38,688 barre 1H · 2022-01-01 → 2026-05-31
-> Scenario base: **Session 08-21**
 
-### Backtest In-Sample
+### Confronto Scenari In-Sample
 
-| Metrica | Valore |
-|---|---|
-| Total Return | **+271%** |
-| Sharpe Ratio | 9.72 |
-| Max Drawdown | −74.0% |
-| Calmar Ratio | 3.67 |
-| Win Rate | ~57% |
-| Profit Factor | ~1.25 |
-| # Trades | 1,855 |
+| Scenario | # Trades | Win Rate | Total Ret | Profit Factor | Max DD | Calmar |
+|---|---|---|---|---|---|---|
+| Strong (≥±18) | 1,433 | 58.6% | **+521%** | 1.31 | **−15.4%** | 33.9 |
+| Baseline | 1,911 | 56.6% | +516% | 1.21 | −15.4% | 33.5 |
+| Regime filter | 1,646 | 56.3% | +379% | 1.21 | −12.0% | 31.8 |
+| DD Control | 1,564 | 56.2% | +293% | 1.19 | −11.9% | 24.6 |
+| Combined | 769 | 64.0% | +145% | 1.29 | −8.5% | 17.1 |
+| Ultra Select | 484 | 57.9% | +80% | 1.28 | −8.9% | 9.0 |
 
-### Scenario Migliore (Baseline)
+### Walk-Forward OOS — Top 3 Scenari (23 finestre, 2022–2026)
 
-| Metrica | Valore |
-|---|---|
-| Total Return | **+504%** |
-| Sharpe Ratio | 11.48 |
-| Max Drawdown | −87% |
-
-### Walk-Forward (23 finestre, 2022–2026)
-
-| Metrica | Valore |
-|---|---|
-| Finestre profitable | **70%** (16/23) |
-| Median OOS return | +3.95% per finestra |
-| OOS Sharpe combinato | **2.773** |
-| OOS Return combinato | **+152%** |
-| OOS Max DD | −36.8% |
-| Consistency | +0.464 |
-
-### Monte Carlo — In-Sample (1000 sim)
-
-| Metrica | Valore |
-|---|---|
-| P(profit) | **99.8%** |
-| p50 return | +274% |
-| P(ruin >50% DD) | **0%** |
+| Scenario | Win% | OOS Sharpe | OOS Return | OOS Max DD | Consistency |
+|---|---|---|---|---|---|
+| **Strong (≥±18)** | **87%** (20/23) | **2.273** | **+404%** | **−15.3%** | **+1.126** |
+| Baseline | 83% (19/23) | 1.965 | +385% | −15.5% | +0.915 |
+| Regime filter | 78% (18/23) | 1.834 | +288% | −11.9% | — |
 
 ### Monte Carlo — OOS Trades (1000 sim)
 
-| Metrica | Valore |
-|---|---|
-| P(profit) | **99.1%** |
-| p50 return | +123% |
-| P(ruin) | ~0% |
+| Scenario | P(profit) | p50 Ret | p5 Ret | MDD p50 | P(ruin) |
+|---|---|---|---|---|---|
+| Strong (≥±18) | **100%** | **+201%** | **+93.7%** | −11.4% | **0%** |
+| Baseline | 100% | +190% | +82.5% | −13.9% | 0% |
+| Regime filter | 100% | +163% | +67.4% | −13.8% | 0% |
 
 ---
 
@@ -345,26 +328,53 @@ Test rimuovendo `s_oi` (peso 0 vs peso 2):
 
 ---
 
+## 11b. Bug Fix Critico — Engine Equity Tracking (giugno 2026)
+
+**Problema**: `equity_arr[i]` non veniva aggiornata nelle barre in cui un trade
+usciva via `continue` (stop loss, TP2, TP3). Queste barre mantenevano il valore
+iniziale di $100,000, gonfiando artificialmente il Max Drawdown da ~15% a ~84%.
+
+**Fix**: aggiunta di `equity_arr[i] = _mark()` prima di ogni `continue` nel loop
+principale e dopo l'uscita `eob` alla fine del dataset.
+
+**Impatto**: Max DD corretto da −84% (falso) a −15% (reale) → la strategia è
+**molto più robusta** di quanto precedentemente stimato.
+
 ## 12. Limitazioni e Rischi
 
 | Limitazione | Impatto | Mitigazione |
 |---|---|---|
-| Sharpe inflato su barre orarie | Sharpe 9–12 irrealistici; reale ~1.5–2 | Usare trade-level Sharpe e Calmar |
-| Max DD −74% in-sample | Non gestibile live senza leva ridotta | 1x leva, stop fisso, WFO monitoring |
-| OI sintetico (rimosso) | Segnale autoreferenziale | Sostituito con basis reale |
-| No slippage | Ottimismo del backtest | Conservativo: fee reali Binance |
-| No funding nel P&L | Leggero ottimismo long | Funding BTC medio: +0.01% = trascurabile |
-| Dataset 2022–2026 | Include solo 1 ciclo bear + 1 bull | Necessario paper trading live 3–6 mesi |
+| Max DD −15% reale | Gestibile con 1× leva | Stop fisso ATR, WFO monitoring |
+| No slippage | Leggero ottimismo | Fee reali Binance già incluse (0.04%) |
+| No funding nel P&L | Trascurabile (BTC medio +0.01%) | Margine di sicurezza nel ritorno |
+| Dataset 2022–2026 | 1 ciclo bear + 1 bull | Paper trading live 2–3 mesi raccomandato |
+| OI sintetico rimosso | Segnale più onesto | Sostituito con basis premiumIndex reale |
 
 ---
 
-## 13. Prossimi Passi
+## 13. Strategia Raccomandata per Live Trading
 
-1. **Paper trading live** (3–6 mesi) per validare che l'OI basis reale non distorca il segnale
-2. **Connettore live** via Binance FAPI WebSocket per segnale real-time
-3. **OI raw storico** (possibile source: Laevitas, CoinGlass paid) per confronto diretto con basis proxy
-4. **Ottimizzazione pesi** tramite Bayesian search su WFO OOS (non in-sample per evitare overfitting)
-5. **Multi-asset**: estendere a ETHUSDT, SOLUSDT con stesso framework
+### Scenario Primario: **Strong (≥±18)**
+
+| Parametro | Valore |
+|---|---|
+| Composite threshold | ≥ +18 (long) / ≤ −18 (short) |
+| Stop Loss | 2× ATR |
+| TP1/TP2/TP3 | 2× / 4× / 6× ATR |
+| Risk per trade | 1% equity (primo mese: 0.5%) |
+| Leverage | 1× (fino a 6 mesi di validazione live) |
+| DD pause | Sospendi nuovi trade se equity < 90% del peak |
+| Trade freq | ~26 trade/mese |
+
+### Roadmap Implementazione
+
+1. **Paper trading 2–3 mesi** con segnali reali Binance Vision per validare
+   che il p50 OOS (+201%) e l'OOS Sharpe (2.27) siano stabili
+2. **Connettore live** via Binance FAPI WebSocket per segnale real-time (ogni ora)
+3. **Monitoring**: traccia OOS Sharpe per 2-month window rolling; se scende < 0.5
+   per 2 finestre consecutive → pausa e analisi regime
+4. **Multi-asset**: estendere a ETHUSDT, SOLUSDT con stesso framework
+5. **Ottimizzazione pesi** via Bayesian search su WFO OOS (mai in-sample)
 
 ---
 

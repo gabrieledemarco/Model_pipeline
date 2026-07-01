@@ -189,6 +189,22 @@ def volume_signal(df: pd.DataFrame) -> pd.Series:
     return s.rename("s_vol")
 
 
+def obv_trend_signal(df: pd.DataFrame) -> pd.Series:
+    """
+    OBV Momentum confirmation signal (institutional accumulation/distribution).
+    Score: -1 to +1
+
+    Uses OBV vs its 21-period EMA to detect sustained buying/selling pressure:
+      OBV > EMA-21  →  +1  (accumulation: smart money buying)
+      OBV < EMA-21  →  -1  (distribution: smart money selling)
+
+    Unlike price-based signals, OBV divergences detect institutional activity
+    before price confirms the move.
+    """
+    s = np.sign(df["obv"] - df["obv_ema21"])
+    return pd.Series(s, index=df.index, name="s_obv")
+
+
 def cyclicality_signal(df: pd.DataFrame) -> pd.Series:
     """
     Seasonal / time-based edge.
@@ -315,6 +331,15 @@ def build_signal_matrix(
     # Same-TF signals: direct assignment
     for key in ("s_1h", "s_vol", "s_cycle"):
         out[key] = raw[key].reindex(base, fill_value=0).values
+
+    # OBV momentum signal (always computed, used optionally by optimizer)
+    out["s_obv"] = obv_trend_signal(df_1h).reindex(base, fill_value=0).values
+
+    # Raw indicator columns needed by optimizer filters
+    out["adx_14"]     = df_1h["adx"].reindex(base, fill_value=0).values
+    out["atr_pct"]    = df_1h["atr_pct"].reindex(base, fill_value=0.0).values
+    out["di_plus"]    = df_1h["di_plus"].reindex(base, fill_value=0.0).values
+    out["di_minus"]   = df_1h["di_minus"].reindex(base, fill_value=0.0).values
 
     out["oi_source"] = oi_source
 

@@ -69,6 +69,8 @@ def run_backtest(
     sizing_method: str = "fixed_risk",
     size_pct: float | None = None,
     leverage: float = 1.0,
+    dd_pause_pct: float = 0.0,
+    adaptive_vol: bool = False,
 ) -> dict:
     """
     Event-driven backtest on 1H OHLCV bars.
@@ -91,6 +93,15 @@ def run_backtest(
         Maximum position notional as a multiple of equity (default: 1.0).
         Caps position to equity × leverage / price.  No margin-call / liquidation
         modelling – the ATR stop-loss is assumed to execute without slippage.
+    dd_pause_pct : float
+        Suspend new entries when equity drops more than this fraction from the
+        rolling peak.  Entries resume only after equity recovers to peak × 0.90.
+        0.0 disables the feature (default).
+    adaptive_vol : bool
+        Scale risk per trade inversely to current ATR percentile:
+          ATR < 30th pct → 1.5 × base_risk (low vol, wider edge)
+          ATR > 70th pct → 0.5 × base_risk (high vol, protect capital)
+          Otherwise      → 1.0 × base_risk
 
     Returns
     -------
@@ -101,6 +112,17 @@ def run_backtest(
     _leverage = max(float(leverage), 1.0)
 
     n = len(df_1h)
+
+    # Pre-compute ATR percentile bands for adaptive vol sizing
+    if adaptive_vol and "atr_14" in df_1h.columns:
+        atr_raw = df_1h["atr_14"].to_numpy(float)
+        if len(atr_raw) > 50:
+            atr_p30 = float(np.nanpercentile(atr_raw, 30))
+            atr_p70 = float(np.nanpercentile(atr_raw, 70))
+        else:
+            atr_p30 = atr_p70 = float("nan")
+    else:
+        atr_p30 = atr_p70 = float("nan")
     equity_arr = np.full(n, float(initial_capital))
     cash = float(initial_capital)
 
@@ -116,6 +138,10 @@ def run_backtest(
                  else np.full(n, "unknown", dtype=object)
 
     trades: List[Trade] = []
+
+    # ── Drawdown pause state ─────────────────────────────────────────────────
+    peak_eq    = float(initial_capital)
+    dd_paused  = False
 
     # ── Active position state ────────────────────────────────────────────────
     IN_POS   = False
@@ -222,7 +248,8 @@ def run_backtest(
             # ── Check exits (worst-case order) ────────────────────────────
             if direction == 1:        # ─── LONG ───
                 if l[i] <= sl:
-                    _exit_full(sl, "stop_loss", i); continue
+                    _exit_full(sl, "stop_loss", i)
+                    equity_arr[i] = _mark(); continue
 
                 # TP3 direct hit (skip TP1/TP2)
                 if h[i] >= tp3:
@@ -233,7 +260,8 @@ def run_backtest(
                     if not tp2_hit:
                         _exit_partial(tp2, 0.5)
                         tp2_hit = True
-                    _exit_full(tp3, "tp3", i); continue
+                    _exit_full(tp3, "tp3", i)
+                    equity_arr[i] = _mark(); continue
 
                 if h[i] >= tp2:
                     if not tp1_hit:
@@ -245,7 +273,7 @@ def run_backtest(
                         tp2_hit = True
                     if size_rem > 1e-12:
                         _exit_full(tp2, "tp2", i)
-                    continue
+                    equity_arr[i] = _mark(); continue
 
                 if h[i] >= tp1 and not tp1_hit:
                     _exit_partial(tp1, 0.5)
@@ -254,7 +282,8 @@ def run_backtest(
 
             else:                     # ─── SHORT ───
                 if h[i] >= sl:
-                    _exit_full(sl, "stop_loss", i); continue
+                    _exit_full(sl, "stop_loss", i)
+                    equity_arr[i] = _mark(); continue
 
                 if l[i] <= tp3:
                     if not tp1_hit:
@@ -264,7 +293,8 @@ def run_backtest(
                     if not tp2_hit:
                         _exit_partial(tp2, 0.5)
                         tp2_hit = True
-                    _exit_full(tp3, "tp3", i); continue
+                    _exit_full(tp3, "tp3", i)
+                    equity_arr[i] = _mark(); continue
 
                 if l[i] <= tp2:
                     if not tp1_hit:
@@ -276,15 +306,25 @@ def run_backtest(
                         tp2_hit = True
                     if size_rem > 1e-12:
                         _exit_full(tp2, "tp2", i)
-                    continue
+                    equity_arr[i] = _mark(); continue
 
                 if l[i] <= tp1 and not tp1_hit:
                     _exit_partial(tp1, 0.5)
                     tp1_hit = True
                     sl = ep
 
+        # ── Drawdown pause: update using mark-to-market before entry ─────────
+        if dd_pause_pct > 0:
+            cur_eq  = _mark()
+            peak_eq = max(peak_eq, cur_eq)
+            dd_now  = (peak_eq - cur_eq) / peak_eq if peak_eq > 0 else 0.0
+            if dd_now >= dd_pause_pct:
+                dd_paused = True
+            elif dd_paused and cur_eq >= peak_eq * 0.90:
+                dd_paused = False
+
         # ── New position entry ────────────────────────────────────────────
-        if not IN_POS and sig_arr[i - 1] != 0:
+        if not IN_POS and sig_arr[i - 1] != 0 and not dd_paused:
             new_sig   = int(sig_arr[i - 1])
             entry_px  = o[i]            # fill at next-bar open
             curr_atr  = atr[i - 1]
@@ -293,13 +333,25 @@ def run_backtest(
                 # leverage-adjusted max notional
                 max_qty = cash * _leverage * 0.95 / entry_px
 
+                # Adaptive vol sizing: scale risk by ATR regime
+                if adaptive_vol and not np.isnan(atr_p30):
+                    if curr_atr < atr_p30:
+                        vol_scale = 1.5   # low vol → increase risk (more edge per $)
+                    elif curr_atr > atr_p70:
+                        vol_scale = 0.5   # high vol → protect capital
+                    else:
+                        vol_scale = 1.0
+                    eff_size_pct = _size_pct * vol_scale
+                else:
+                    eff_size_pct = _size_pct
+
                 if sizing_method == "fixed_fraction":
-                    # invest _size_pct × leverage of equity as notional
-                    qty = cash * _size_pct * _leverage / entry_px
+                    # invest eff_size_pct × leverage of equity as notional
+                    qty = cash * eff_size_pct * _leverage / entry_px
                 else:  # fixed_risk (default)
-                    # size so the SL costs exactly _size_pct × equity
+                    # size so the SL costs exactly eff_size_pct × equity
                     risk_per_unit = curr_atr * _atr_sl
-                    qty = (cash * _size_pct) / risk_per_unit
+                    qty = (cash * eff_size_pct) / risk_per_unit
 
                 qty = min(qty, max_qty)
                 qty = max(qty, 1e-12)
@@ -337,6 +389,7 @@ def run_backtest(
     # close any open position at last bar
     if IN_POS:
         _exit_full(c[-1], "eob", n - 1)
+        equity_arr[-1] = _mark()    # fix: update after eob close
 
     equity  = pd.Series(equity_arr, index=df_1h.index)
     running_max = equity.cummax()
