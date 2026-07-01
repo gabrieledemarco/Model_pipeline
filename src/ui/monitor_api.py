@@ -41,6 +41,7 @@ from src.ui.monitor_core import (  # noqa: E402
     compute_performance_stats,
     current_equity,
     discover_strategies,
+    load_analysis,
     load_log_tail,
     load_position,
     load_trades,
@@ -254,6 +255,7 @@ def build_detail_payload(info: StrategyInfo) -> dict:
         "trades": _trades_records(trades),
         "stats": compute_performance_stats(trades),
         "log_tail": load_log_tail(info.dir_path),
+        "analysis": load_analysis(info.dir_path),
     }
 
 
@@ -349,6 +351,7 @@ async def ws_strategy_detail(websocket: WebSocket, strategy_id: str):
                     "trades": [],
                     "stats": {"insufficient_data": True},
                     "log_tail": [],
+                    "analysis": {},
                 }
 
             try:

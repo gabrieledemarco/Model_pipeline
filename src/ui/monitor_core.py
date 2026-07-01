@@ -227,6 +227,14 @@ def load_position(strategy_dir: Path) -> dict:
     return data or {}
 
 
+def load_analysis(strategy_dir: Path) -> dict:
+    """Latest signal-computation diagnostics (indicators + reasoning) written
+    by the trader each bar close — see LiveTrader._write_analysis(). Empty
+    dict if the strategy hasn't produced one yet (e.g. just started)."""
+    data = _safe_load_json(Path(strategy_dir) / "analysis.json")
+    return data or {}
+
+
 def load_log_tail(strategy_dir: Path, n_lines: int = LOG_TAIL_LINES) -> list[str]:
     """Return the last n_lines of live_trader.log with bounded memory use.
 

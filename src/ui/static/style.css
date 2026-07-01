@@ -335,6 +335,156 @@ html, body {
 
 .chart { width: 100%; height: 380px; }
 
+/* ===================== LIVE MARKET CHART ===================== */
+
+.panel-title-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.panel-title-row .panel-title { margin-bottom: 0; }
+
+.tf-selector {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.tf-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.tf-btn:hover { color: var(--text); background: var(--bg-elevated); }
+
+.tf-btn.active {
+  color: var(--blue);
+  border-color: var(--blue);
+  background: rgba(88, 166, 255, 0.1);
+}
+
+.market-conn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  padding: 3px 9px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+.market-conn .conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+.market-conn.reconnecting { color: var(--amber); border-color: var(--amber); }
+.market-conn.reconnecting .conn-dot { background: var(--amber); animation: blink 1s infinite; }
+.market-conn.down { color: var(--red); border-color: var(--red); }
+.market-conn.down .conn-dot { background: var(--red); }
+
+.market-price-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.market-last-price {
+  font-family: var(--mono);
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.market-last-change {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.market-last-change.pnl-pos, .market-last-change.pnl-neg { font-weight: 600; }
+
+.market-chart { width: 100%; height: 460px; }
+
+@media (max-width: 780px) {
+  .market-chart { height: 320px; }
+}
+
+/* ===================== LATEST ANALYSIS ===================== */
+
+.analysis-age {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.analysis-reason {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--blue);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  margin-bottom: 14px;
+}
+
+.analysis-reason.signal-long { border-left-color: var(--green); }
+.analysis-reason.signal-short { border-left-color: var(--red); }
+
+.analysis-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin-bottom: 12px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.mg-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mg-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.mg-value {
+  font-family: var(--mono);
+  font-size: 14px;
+  color: var(--text);
+}
+
+.mg-value.val-pos { color: var(--green); }
+.mg-value.val-neg { color: var(--red); }
+.mg-value.val-neutral { color: var(--text-dim); }
+
 .detail-header {
   display: flex;
   flex-wrap: wrap;

@@ -202,6 +202,14 @@ const el = {
   overviewTableBody: document.getElementById("overview-table-body"),
   overviewChart: document.getElementById("overview-chart"),
 
+  marketChart: document.getElementById("market-chart"),
+  marketPanel: document.getElementById("market-panel"),
+  marketConn: document.getElementById("market-conn"),
+  marketConnLabel: document.querySelector("#market-conn .conn-label"),
+  marketLastPrice: document.getElementById("market-last-price"),
+  marketLastChange: document.getElementById("market-last-change"),
+  tfSelector: document.getElementById("tf-selector"),
+
   detailError: document.getElementById("detail-error"),
   detailHeader: document.getElementById("detail-header"),
   detailTitle: document.getElementById("detail-title"),
@@ -211,6 +219,8 @@ const el = {
   detailRss: document.getElementById("detail-rss"),
   positionBody: document.getElementById("position-body"),
   statsBody: document.getElementById("stats-body"),
+  analysisBody: document.getElementById("analysis-body"),
+  analysisAge: document.getElementById("analysis-age"),
   detailChart: document.getElementById("detail-chart"),
   tradesTableBody: document.getElementById("trades-table-body"),
   logTail: document.getElementById("log-tail"),
@@ -229,6 +239,7 @@ const state = {
   detailSocket: null,
   lastLogLines: [],
   lastDetailStrategyId: null,
+  lastAnalysisTimestamp: null,
 };
 
 // ---------------------------------------------------------------
@@ -471,9 +482,90 @@ function renderDetailPanel(msg) {
 
   renderPosition(msg.position || { active: false });
   renderStats(msg.stats || { insufficient_data: true });
+  renderAnalysis(msg.analysis || {});
   renderDetailChart(msg.equity_curve || []);
   renderTrades(msg.trades || []);
   renderLogTail(msg.log_tail || []);
+}
+
+// ---------------------------------------------------------------
+// Latest Analysis card
+// ---------------------------------------------------------------
+
+function fmtRelativeAge(iso) {
+  if (!iso) return "--";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "--";
+  const seconds = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+  if (seconds < 60) return `updated ${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `updated ${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `updated ${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `updated ${days}d ago`;
+}
+
+function metricValueClass(key, value) {
+  if (typeof value === "boolean") return "";
+  const k = key.toLowerCase();
+  if (typeof value === "number") {
+    // Fields that are directionally signed (positive=bullish, negative=bearish).
+    if (/^(composite|obv_trend)$/.test(k)) {
+      if (value > 0) return "val-pos";
+      if (value < 0) return "val-neg";
+      return "val-neutral";
+    }
+  }
+  if (k === "regime") {
+    if (/long|bull|up/i.test(String(value))) return "val-pos";
+    if (/short|bear|down/i.test(String(value))) return "val-neg";
+    return "val-neutral";
+  }
+  return "";
+}
+
+function fmtMetricValue(value) {
+  if (value === null || value === undefined) return "--";
+  if (typeof value === "boolean") return value ? "✓ Yes" : "✗ No";
+  if (typeof value === "number") return Number.isInteger(value) ? String(value) : value.toFixed(2);
+  return escapeHtml(String(value));
+}
+
+function renderAnalysis(analysis) {
+  if (!analysis || Object.keys(analysis).length === 0) {
+    el.analysisBody.innerHTML = `<div class="empty-row">Waiting for first analysis…</div>`;
+    el.analysisAge.textContent = "--";
+    state.lastAnalysisTimestamp = null;
+    return;
+  }
+
+  state.lastAnalysisTimestamp = analysis.timestamp || null;
+  el.analysisAge.textContent = fmtRelativeAge(analysis.timestamp);
+
+  const signalCls = analysis.signal > 0 ? "signal-long" : analysis.signal < 0 ? "signal-short" : "";
+  const reasonHtml = `<div class="analysis-reason ${signalCls}">${escapeHtml(analysis.reason || "--")}</div>`;
+
+  const metaBits = [];
+  if (analysis.close !== undefined) metaBits.push(`<span>Close: ${fmtNum(analysis.close)}</span>`);
+  if (analysis.composite !== undefined) {
+    metaBits.push(`<span class="${pnlClass(analysis.composite)}">Composite: ${signedFmt(analysis.composite)}</span>`);
+  }
+  if (analysis.atr !== undefined) metaBits.push(`<span>ATR: ${fmtNum(analysis.atr)}</span>`);
+  const metaHtml = metaBits.length ? `<div class="analysis-meta-row">${metaBits.join("")}</div>` : "";
+
+  const metrics = analysis.metrics || {};
+  const metricEntries = Object.entries(metrics);
+  const metricsHtml = metricEntries.length
+    ? `<div class="metrics-grid">${metricEntries.map(([k, v]) => `
+        <div class="mg-item">
+          <span class="mg-label">${escapeHtml(k.replace(/_/g, " "))}</span>
+          <span class="mg-value ${metricValueClass(k, v)}">${fmtMetricValue(v)}</span>
+        </div>
+      `).join("")}</div>`
+    : "";
+
+  el.analysisBody.innerHTML = reasonHtml + metaHtml + metricsHtml;
 }
 
 function renderPosition(pos) {
@@ -657,6 +749,224 @@ function makeLogLineEl(line) {
 }
 
 // ---------------------------------------------------------------
+// Live BTCUSDT market chart (TradingView Lightweight Charts)
+// Talks directly to Binance Futures public REST/WS endpoints —
+// deliberately NOT proxied through our own backend.
+// ---------------------------------------------------------------
+
+const BINANCE_REST = "https://fapi.binance.com/fapi/v1/klines";
+const BINANCE_WS = "wss://fstream.binance.com/ws";
+const market = {
+  chart: null,
+  candleSeries: null,
+  volumeSeries: null,
+  socket: null,
+  timeframe: "1h",
+  resizeObserver: null,
+  lastCandle: null,
+  prevClose: null,
+};
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function setMarketConnState(connState) {
+  el.marketConn.classList.remove("reconnecting", "down");
+  if (connState === "open") {
+    el.marketConnLabel.textContent = "live";
+  } else if (connState === "reconnecting") {
+    el.marketConn.classList.add("reconnecting");
+    el.marketConnLabel.textContent = "reconnecting…";
+  } else if (connState === "connecting") {
+    el.marketConn.classList.add("reconnecting");
+    el.marketConnLabel.textContent = "connecting…";
+  } else {
+    el.marketConn.classList.add("down");
+    el.marketConnLabel.textContent = "disconnected";
+  }
+}
+
+function parseKline(k) {
+  // Binance REST kline array: [openTime, open, high, low, close, volume, closeTime, ...]
+  return {
+    time: Math.floor(k[0] / 1000),
+    open: Number(k[1]),
+    high: Number(k[2]),
+    low: Number(k[3]),
+    close: Number(k[4]),
+    volume: Number(k[5]),
+  };
+}
+
+function volumeBar(c) {
+  const up = c.close >= c.open;
+  return {
+    time: c.time,
+    value: c.volume,
+    color: up ? "rgba(63, 185, 80, 0.5)" : "rgba(248, 81, 73, 0.5)",
+  };
+}
+
+function initMarketChart() {
+  if (typeof LightweightCharts === "undefined") return; // CDN failed to load; degrade gracefully
+  if (!el.marketChart) return;
+
+  const textColor = cssVar("--text") || "#c9d1d9";
+  const gridColor = cssVar("--border") || "#232a37";
+  const dimColor = cssVar("--text-dim") || "#7d8590";
+  const green = cssVar("--green") || "#3fb950";
+  const red = cssVar("--red") || "#f85149";
+
+  market.chart = LightweightCharts.createChart(el.marketChart, {
+    layout: {
+      background: { type: "solid", color: "transparent" },
+      textColor,
+      fontFamily: "JetBrains Mono, monospace",
+      fontSize: 11,
+    },
+    grid: {
+      vertLines: { color: gridColor },
+      horzLines: { color: gridColor },
+    },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: gridColor },
+    timeScale: { borderColor: gridColor, timeVisible: true, secondsVisible: false },
+    watermark: { visible: false },
+    autoSize: false,
+    width: el.marketChart.clientWidth,
+    height: el.marketChart.clientHeight || 460,
+  });
+
+  market.candleSeries = market.chart.addCandlestickSeries({
+    upColor: green,
+    downColor: red,
+    borderUpColor: green,
+    borderDownColor: red,
+    wickUpColor: green,
+    wickDownColor: red,
+    priceScaleId: "right",
+  });
+  market.candleSeries.priceScale().applyOptions({
+    scaleMargins: { top: 0.06, bottom: 0.28 },
+  });
+
+  market.volumeSeries = market.chart.addHistogramSeries({
+    priceFormat: { type: "volume" },
+    priceScaleId: "vol",
+    color: dimColor,
+  });
+  market.chart.priceScale("vol").applyOptions({
+    scaleMargins: { top: 0.78, bottom: 0 },
+  });
+
+  // Responsive sizing.
+  market.resizeObserver = new ResizeObserver(() => {
+    if (!market.chart) return;
+    market.chart.applyOptions({
+      width: el.marketChart.clientWidth,
+      height: el.marketChart.clientHeight || 460,
+    });
+  });
+  market.resizeObserver.observe(el.marketChart);
+  window.addEventListener("resize", () => {
+    if (!market.chart) return;
+    market.chart.applyOptions({
+      width: el.marketChart.clientWidth,
+      height: el.marketChart.clientHeight || 460,
+    });
+  });
+
+  el.tfSelector.addEventListener("click", (evt) => {
+    const btn = evt.target.closest(".tf-btn");
+    if (!btn) return;
+    const tf = btn.dataset.tf;
+    if (tf === market.timeframe) return;
+    el.tfSelector.querySelectorAll(".tf-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    changeTimeframe(tf);
+  });
+
+  loadMarketHistory(market.timeframe).then(() => setupMarketSocket(market.timeframe));
+}
+
+async function loadMarketHistory(interval) {
+  try {
+    const resp = await fetch(`${BINANCE_REST}?symbol=BTCUSDT&interval=${interval}&limit=500`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const raw = await resp.json();
+    const candles = raw.map(parseKline);
+    if (!candles.length) return;
+
+    market.candleSeries.setData(candles.map((c) => ({
+      time: c.time, open: c.open, high: c.high, low: c.low, close: c.close,
+    })));
+    market.volumeSeries.setData(candles.map(volumeBar));
+
+    const last = candles[candles.length - 1];
+    market.lastCandle = last;
+    market.prevClose = candles.length > 1 ? candles[candles.length - 2].close : last.open;
+    updateMarketPriceDisplay(last.close);
+    market.chart.timeScale().fitContent();
+  } catch (e) {
+    setMarketConnState("closed");
+  }
+}
+
+function updateMarketPriceDisplay(price) {
+  el.marketLastPrice.textContent = fmtNum(price, 1);
+  if (market.prevClose === null || market.prevClose === undefined) {
+    el.marketLastChange.textContent = "--";
+    el.marketLastChange.className = "market-last-change";
+    return;
+  }
+  const diff = price - market.prevClose;
+  const pct = market.prevClose !== 0 ? (diff / market.prevClose) * 100 : 0;
+  el.marketLastChange.textContent = `${diff >= 0 ? "+" : ""}${fmtNum(diff, 1)} (${diff >= 0 ? "+" : ""}${pct.toFixed(2)}%)`;
+  el.marketLastChange.className = "market-last-change " + pnlClass(diff);
+}
+
+function setupMarketSocket(interval) {
+  const url = `${BINANCE_WS}/btcusdt@kline_${interval}`;
+  market.socket = new ReconnectingSocket(url, handleMarketMessage, setMarketConnState);
+}
+
+function handleMarketMessage(msg) {
+  if (!msg || msg.e !== "kline" || !msg.k) return;
+  const k = msg.k;
+  const candle = {
+    time: Math.floor(k.t / 1000),
+    open: Number(k.o),
+    high: Number(k.h),
+    low: Number(k.l),
+    close: Number(k.c),
+    volume: Number(k.v),
+  };
+
+  market.candleSeries.update({
+    time: candle.time, open: candle.open, high: candle.high, low: candle.low, close: candle.close,
+  });
+  market.volumeSeries.update(volumeBar(candle));
+  updateMarketPriceDisplay(candle.close);
+
+  if (k.x) {
+    // Candle closed: shift prevClose reference forward for the next one.
+    market.prevClose = candle.close;
+  }
+  market.lastCandle = candle;
+}
+
+function changeTimeframe(tf) {
+  market.timeframe = tf;
+  if (market.socket) {
+    market.socket.close();
+    market.socket = null;
+  }
+  setMarketConnState("connecting");
+  loadMarketHistory(tf).then(() => setupMarketSocket(tf));
+}
+
+// ---------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------
 
@@ -670,3 +980,12 @@ const overviewSocket = new ReconnectingSocket(
 setInterval(() => {
   if (el.serverClock.textContent === "--:--:--") return;
 }, 1000);
+
+// Keep the "Latest Analysis" relative timestamp live between WS ticks.
+setInterval(() => {
+  if (state.currentView !== "overview" && state.lastAnalysisTimestamp) {
+    el.analysisAge.textContent = fmtRelativeAge(state.lastAnalysisTimestamp);
+  }
+}, 1000);
+
+initMarketChart();

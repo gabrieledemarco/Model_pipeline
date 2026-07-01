@@ -157,15 +157,20 @@ class LiveTrader:
         ws_interval: str = "1h",
     ):
         """
-        signal_fn : () -> (signal, composite, atr, close, exit_plan)
+        signal_fn : () -> (signal, composite, atr, close, exit_plan, diagnostics)
             Pluggable signal source, decoupling the trading engine from any
             specific strategy. `exit_plan` is either None (use the standard
             2/2/4/6×ATR ladder — composite-score and Wyckoff strategies) or a
             dict {"sl": float, "tp": float, "min_sl_atr_floor": float,
             "max_leverage": float, "time_stop_hours": float} for strategies
             with their own validated single-TP/SL + time-stop exit rule
-            (e.g. ICT Silver Bullet). Defaults to the original composite-score
-            signal for backward compatibility when not provided.
+            (e.g. ICT Silver Bullet). `diagnostics` is either None or a dict
+            {"reason": str, "metrics": {...}} describing the conditions that
+            led to the decision — persisted to logs/strategies/{id}/
+            analysis.json each bar close for the dashboard to display;
+            purely informational, the engine never reads its contents.
+            Defaults to the original composite-score signal (no diagnostics)
+            for backward compatibility when not provided.
         ws_interval : Binance kline stream interval driving on_candle_close()
             cadence — "1h" for composite/Wyckoff, "15m" for ICT Silver Bullet.
         """
@@ -176,10 +181,11 @@ class LiveTrader:
         self.strategy_id  = strategy_id
         self.ws_interval  = ws_interval
         self.signal_fn = signal_fn or (
-            lambda: (*compute_live_signal(scenario=self.scenario), None)
+            lambda: (*compute_live_signal(scenario=self.scenario), None, None)
         )
 
         log_dir = Path(log_dir) if log_dir is not None else LOG_DIR
+        self.log_dir    = log_dir
         self.trade_log = TradeLog(log_dir / "trades.csv", strategy_id=strategy_id)
         self.state     = ps.load()
         self._running  = True
@@ -481,13 +487,15 @@ class LiveTrader:
     def on_candle_close(self):
         log.info("── %s bar closed — computing signal ──", self.ws_interval)
         try:
-            signal, composite, atr, close, exit_plan = self.signal_fn()
+            signal, composite, atr, close, exit_plan, diagnostics = self.signal_fn()
         except Exception as e:
             log.error("Signal computation failed: %s", e)
             return
 
         log.info("Signal=%+d  composite=%.2f  atr=%.1f  close=%.1f",
                  signal, composite, atr, close)
+
+        self._write_analysis(diagnostics, signal, composite, atr, close)
 
         self.trade_log.write(
             event="SIGNAL", direction=signal, price=close,
@@ -499,6 +507,28 @@ class LiveTrader:
                 self._enter(signal, composite, atr, close, exit_plan)
         else:
             log.info("Position active (dir=%+d) — SL/TP manage exit", self.state.direction)
+
+    def _write_analysis(self, diagnostics: Optional[dict], signal: int,
+                         composite: float, atr: float, close: float) -> None:
+        """Persist the latest signal-computation diagnostics for the
+        dashboard. Purely informational — never read back by the engine."""
+        if diagnostics is None:
+            return
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signal": signal,
+            "composite": composite,
+            "atr": atr,
+            "close": close,
+            "reason": diagnostics.get("reason", ""),
+            "metrics": diagnostics.get("metrics", {}),
+        }
+        try:
+            tmp = self.log_dir / "analysis.json.tmp"
+            tmp.write_text(json.dumps(payload, indent=2, default=str))
+            tmp.replace(self.log_dir / "analysis.json")
+        except Exception as e:
+            log.warning("Could not write analysis.json: %s", e)
 
     # ── WebSocket loop ────────────────────────────────────────────────────────
 

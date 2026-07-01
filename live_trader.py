@@ -86,16 +86,35 @@ def _setup_logging(log_dir: Path, level: str = "INFO"):
 def _build_signal_source(strategy_type: str, scenario: str):
     """Return (label, signal_fn, ws_interval) for the requested strategy type.
 
-    signal_fn : () -> (signal, composite, atr, close, exit_plan) — see
-    LiveTrader's docstring for the exit_plan contract. Imports are local so
-    a missing/broken strategy module only breaks the strategy types that
-    actually need it, not the whole CLI.
+    signal_fn : () -> (signal, composite, atr, close, exit_plan, diagnostics)
+    — see LiveTrader's docstring for the exit_plan/diagnostics contract.
+    Imports are local so a missing/broken strategy module only breaks the
+    strategy types that actually need it, not the whole CLI.
     """
     if strategy_type == "composite":
         from src.live.data_live import compute_live_signal
+        from src.strategy.optimizer import SCENARIOS
+
+        cfg = SCENARIOS[scenario]
 
         def signal_fn():
-            return (*compute_live_signal(scenario=scenario), None)
+            signal, composite, atr, close = compute_live_signal(scenario=scenario)
+            if signal > 0:
+                reason = f"Composite={composite:+.1f} ≥ long threshold {cfg.long_threshold:+.1f} — LONG"
+            elif signal < 0:
+                reason = f"Composite={composite:+.1f} ≤ short threshold {cfg.short_threshold:+.1f} — SHORT"
+            else:
+                reason = (f"Composite={composite:+.1f} within [{cfg.short_threshold:+.1f}, "
+                          f"{cfg.long_threshold:+.1f}] — no entry")
+            diagnostics = {
+                "reason": reason,
+                "metrics": {
+                    "composite": composite,
+                    "long_threshold": cfg.long_threshold,
+                    "short_threshold": cfg.short_threshold,
+                },
+            }
+            return signal, composite, atr, close, None, diagnostics
 
         return scenario, signal_fn, "1h"
 
@@ -103,7 +122,8 @@ def _build_signal_source(strategy_type: str, scenario: str):
         from src.live.wyckoff_live import compute_wyckoff_signal
 
         def signal_fn():
-            return (*compute_wyckoff_signal(), None)
+            signal, composite, atr, close, diagnostics = compute_wyckoff_signal()
+            return signal, composite, atr, close, None, diagnostics
 
         return "Wyckoff Spring/Upthrust", signal_fn, "1h"
 

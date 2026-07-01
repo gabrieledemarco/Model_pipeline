@@ -27,7 +27,7 @@ from typing import Optional, Tuple
 
 from src.live.data_live import fetch_tf_data, fetch_15m_bars
 from src.strategy.indicators import add_indicators
-from src.strategy.ict_silver_bullet import build_silver_bullet_signals
+from src.strategy.ict_silver_bullet import build_silver_bullet_signals, KZ_NY_COMBO
 
 # Validated production defaults — see docs/ICT_SILVER_BULLET_STRATEGY.md
 # section 8 ("Implementazione — File e Parametri").
@@ -40,7 +40,23 @@ SL_ATR_MULT      = 0.5    # sl = ref_lo/ref_hi -/+ 0.5 x ATR_1H
 TIME_STOP_HOURS  = 8.0    # 32 bars of 15M
 
 
-def compute_ict_signal(symbol: str = "BTCUSDT") -> Tuple[int, float, float, float, Optional[dict]]:
+def _killzone_name(ts) -> str:
+    """
+    Name the killzone (if any) containing timestamp `ts`, using the exact
+    same half-open [start, end) minute-precision boundary check as
+    build_silver_bullet_signals()'s internal `in_killzone()` helper.
+    """
+    t = ts.hour * 60 + ts.minute
+    names = ["NY_AM", "NY_PM"]
+    for name, (sh, sm, eh, em) in zip(names, KZ_NY_COMBO):
+        if (sh * 60 + sm) <= t < (eh * 60 + em):
+            return name
+    return "none"
+
+
+def compute_ict_signal(
+    symbol: str = "BTCUSDT",
+) -> Tuple[int, float, float, float, Optional[dict], Optional[dict]]:
     """
     Fetch live 1H + 15M data, run the ICT Silver Bullet FVG-in-killzone
     signal pipeline, and return the signal for the latest completed 15M bar.
@@ -54,6 +70,9 @@ def compute_ict_signal(symbol: str = "BTCUSDT") -> Tuple[int, float, float, floa
     exit_plan : dict | None – None when flat, else {"sl", "tp",
                               "min_sl_atr_floor", "max_leverage",
                               "time_stop_hours"} per LiveTrader's contract.
+    diagnostics: dict | None – {"reason": str, "metrics": {...}} explaining
+                 the current signal/killzone/FVG state for the dashboard's
+                 "why did this strategy do what it did" view.
     """
     # 1. Fetch 1H bars (for ATR_1H context) and 15M bars (signal timeframe).
     df_1h  = add_indicators(fetch_tf_data(symbol)["1H"])
@@ -77,8 +96,41 @@ def compute_ict_signal(symbol: str = "BTCUSDT") -> Tuple[int, float, float, floa
         df_1h["atr_14"].clip(lower=1.0).iloc[-2]
     )
 
+    # ── Diagnostics ──────────────────────────────────────────────────────────
+    bar_ts = df_15m.index[-2]
+    killzone_name = _killzone_name(bar_ts)
+    in_killzone = killzone_name != "none"
+
+    has_fvg = bool(
+        not (row["ref_size"] != row["ref_size"])  # not NaN
+        and float(row["ref_size"]) != 0.0
+    )
+
+    metrics = {
+        "in_killzone": bool(in_killzone),
+        "killzone_name": str(killzone_name),
+    }
+    if has_fvg:
+        metrics["fvg_ref_lo"]   = float(row["ref_lo"])
+        metrics["fvg_ref_hi"]  = float(row["ref_hi"])
+        metrics["fvg_ref_size"] = float(row["ref_size"])
+        metrics["atr_1h"]       = float(row["atr_1h"])
+    else:
+        metrics["fvg_ref_lo"]   = None
+        metrics["fvg_ref_hi"]   = None
+        metrics["fvg_ref_size"] = None
+        metrics["atr_1h"]       = None
+
     if signal == 0:
-        return 0, 0.0, atr_1h, close, None
+        if in_killzone:
+            reason = f"In {killzone_name} killzone — no valid FVG fill this bar"
+        else:
+            reason = (
+                "Outside NY killzones — outside NY AM (14-15 UTC) / "
+                "NY PM (18-19 UTC) killzones"
+            )
+        diagnostics = {"reason": reason, "metrics": metrics}
+        return 0, 0.0, atr_1h, close, None, diagnostics
 
     direction = signal
     ref_lo   = float(row["ref_lo"])
@@ -96,4 +148,11 @@ def compute_ict_signal(symbol: str = "BTCUSDT") -> Tuple[int, float, float, floa
         "time_stop_hours": TIME_STOP_HOURS,
     }
 
-    return direction, composite, atr_1h, close, exit_plan
+    reason = (
+        f"FVG {'bullish' if direction > 0 else 'bearish'} fill in "
+        f"{killzone_name} killzone (FVG width={ref_size:.1f}, "
+        f"ATR_1H={atr_1h:.1f}) — {'LONG' if direction > 0 else 'SHORT'} entry"
+    )
+    diagnostics = {"reason": reason, "metrics": metrics}
+
+    return direction, composite, atr_1h, close, exit_plan, diagnostics
