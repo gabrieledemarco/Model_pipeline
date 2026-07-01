@@ -1,0 +1,361 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// Wyckoff Spring / Upthrust — BTCUSDT 1H
+// ══════════════════════════════════════════════════════════════════════════════
+// Traduzione fedele di SPEC_btc_15m_position_trader.md (sezioni 3-5)
+// Validato: OOS 2020-2026, Calmar 2.005, Sharpe 4.8, 177 trade, WR 56.5%
+//
+// Logica:
+//   1. Range detection   : ADX < 25, range_width < 10%, finestra 24 barre
+//   2. Volume bias       : OBV vs OBV_EMA(21) → accumulation / distribution
+//   3. Manipulation      : Spring (falsa rottura sotto supporto, chiude dentro)
+//                          Upthrust (falsa rottura sopra resistenza, chiude dentro)
+//   4. Entry             : open della barra T+1 (zero look-ahead)
+//   5. Exit              : SL=2×ATR  TP1=2×ATR(50%)  TP2=4×ATR(25%)  TP3=6×ATR(25%)
+//                          Dopo TP1 → stop si sposta al break-even
+//   6. Sizing            : 1% equity a rischio per trade (opz. vol-target 20%)
+//   7. Session           : 08:00-20:59 UTC
+//
+// Parametri default = raccomandati per produzione (sezione 8 della spec).
+// SL/TP default = fallback sicuro (SL 1.5×, TP1 2.0×).
+// ══════════════════════════════════════════════════════════════════════════════
+//@version=5
+strategy(
+    title                   = "Wyckoff Spring/Upthrust — BTCUSDT 1H",
+    shorttitle              = "Wyckoff S/U",
+    overlay                 = true,
+    initial_capital         = 100000,
+    currency                = currency.USDT,
+    default_qty_type        = strategy.fixed,
+    default_qty_value       = 1,
+    commission_type         = strategy.commission.percent,
+    commission_value        = 0.04,   // 0.04% one-way taker fee (Binance perp)
+    process_orders_on_close = false,  // entry fills at open di T+1
+    calc_on_every_tick      = false,
+    max_bars_back           = 500
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+var string G1 = "Range Detection"
+i_n_range  = input.int(  24,   "Look-back barre (n_range)",        group=G1, minval=5, maxval=300)
+i_adx_max  = input.float(25.0, "ADX max (ranging)",                group=G1, minval=1.0)
+i_rw_max   = input.float( 0.10,"Range width max",                  group=G1, minval=0.001, step=0.005,
+                           tooltip="Ampiezza massima del range: (high_max - low_min) / low_min")
+i_vol_thr  = input.float( 1.3, "Volume threshold (× SMA 20)",      group=G1, minval=0.5, step=0.1)
+
+var string G2 = "Risk & Exit"
+i_atr_sl   = input.float( 1.5, "ATR SL multiplier",                group=G2, minval=0.1, step=0.1)
+i_atr_tp1  = input.float( 2.0, "ATR TP1 multiplier (TP2=2× TP3=3×)",group=G2, minval=0.1, step=0.1)
+i_risk_pct = input.float( 1.0, "Risk % equity per trade",          group=G2, minval=0.1, maxval=10.0, step=0.1)
+i_vol_tgt  = input.bool(false, "Volatility target 20% ann.",       group=G2,
+                         tooltip="Scala la size per mantenere RVOL(20) ≈ 20% annuo")
+
+var string G3 = "Session Filter (UTC)"
+i_sess_h0  = input.int(8,  "Start hour (incluso)",                 group=G3, minval=0, maxval=23)
+i_sess_h1  = input.int(21, "End hour   (escluso)",                 group=G3, minval=0, maxval=23)
+
+var string G4 = "Visuals"
+i_show_rng = input.bool(true,  "Range band",                       group=G4)
+i_show_sig = input.bool(true,  "Signal labels",                    group=G4)
+i_show_lvl = input.bool(true,  "SL / TP lines",                    group=G4)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INDICATORI  (sezione 2 della spec — add_indicators())
+// ─────────────────────────────────────────────────────────────────────────────
+atr14         = ta.atr(14)
+[_dip, _dim, adx_val] = ta.dmi(14, 14)
+obv_val       = ta.obv
+obv_ema21     = ta.ema(obv_val, 21)
+obv_trend     = math.sign(obv_val - obv_ema21)   // +1 / -1 / 0
+vol_sma20     = ta.sma(volume, 20)
+vol_ratio     = volume / math.max(vol_sma20, 1.0)
+// RVOL(20) annualizzato per barre 1H
+log_ret       = math.log(close / nz(close[1], close))
+rvol20        = ta.stdev(log_ret, 20) * math.sqrt(365.0 * 24.0)
+ema200        = ta.ema(close, 200)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RANGE DETECTION  (Fase 1 — shift(1) → zero look-ahead bias)
+// ─────────────────────────────────────────────────────────────────────────────
+// rolling_max(high.shift(1), n_range) in Python = ta.highest(high[1], n_range)
+rng_hi      = ta.highest(high[1], i_n_range)   // max delle ultime n barre chiuse
+rng_lo      = ta.lowest( low[1],  i_n_range)   // min delle ultime n barre chiuse
+rng_w       = na(rng_lo) or rng_lo <= 0 ? na : (rng_hi - rng_lo) / rng_lo
+
+is_rng      = not na(rng_hi)
+              and (adx_val < i_adx_max)
+              and (not na(rng_w) and rng_w < i_rw_max)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VOLUME BIAS  (Fase 2)
+// ─────────────────────────────────────────────────────────────────────────────
+accum   = is_rng and obv_trend > 0    // OBV > OBV_EMA21: smart money accumula
+distrib = is_rng and obv_trend < 0    // OBV < OBV_EMA21: smart money distribuisce
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MANIPULATION EVENTS  (Fase 3)
+// ─────────────────────────────────────────────────────────────────────────────
+// Spring: rottura falsa sotto il supporto con chiusura rientrata nel range
+spring   = is_rng and accum
+           and (low  < rng_lo)       // punta sotto supporto
+           and (close >= rng_lo)     // chiude DENTRO il range
+           and (vol_ratio >= i_vol_thr)
+
+// Upthrust: rottura falsa sopra la resistenza con chiusura rientrata nel range
+upthrust = is_rng and distrib
+           and (high  > rng_hi)      // punta sopra resistenza
+           and (close <= rng_hi)     // chiude DENTRO il range
+           and (vol_ratio >= i_vol_thr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION FILTER  (Fase — 08:00-20:59 UTC)
+// ─────────────────────────────────────────────────────────────────────────────
+h_utc    = hour(time, "UTC")
+in_sess  = (h_utc >= i_sess_h0) and (h_utc < i_sess_h1)
+
+// Segnali finali (conflitto stesso bar → skip)
+long_sig  = spring   and in_sess and not upthrust
+short_sig = upthrust and in_sess and not spring
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMPOSITE SCORE  (Fase 5 — solo per analytics / label)
+// ─────────────────────────────────────────────────────────────────────────────
+sp_depth  = math.max(rng_lo  - low,  0.0)    // spring_depth
+up_height = math.max(high - rng_hi, 0.0)     // upthrust_height
+atr_safe  = math.max(atr14, 1e-8)
+
+score_l = math.min(math.max(sp_depth  / atr_safe, 0.2), 4.0)
+          * math.min(math.max(vol_ratio, 1.0), 4.0) * 2.0
+score_s = math.min(math.max(up_height / atr_safe, 0.2), 4.0)
+          * math.min(math.max(vol_ratio, 1.0), 4.0) * 2.0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POSITION SIZING  (sezione 4 della spec)
+// ─────────────────────────────────────────────────────────────────────────────
+// Volatility target scaling (opzionale)
+vol_scl   = i_vol_tgt
+            ? math.min(math.max(0.20 / math.max(rvol20, 0.001), 0.25), 3.0)
+            : 1.0
+eff_risk  = (i_risk_pct / 100.0) * vol_scl
+
+// BTC quantity: risk_$ / sl_distance
+sl_dist_now = i_atr_sl * atr14
+qty_btc     = strategy.equity * eff_risk / math.max(sl_dist_now, 1.0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STATE VARIABLES
+// ─────────────────────────────────────────────────────────────────────────────
+var int   dir       = 0    //  1 = long, -1 = short, 0 = flat
+var float ep        = na   // entry price (actual fill = position_avg_price)
+var float sl_p      = na
+var float tp1_p     = na
+var float tp2_p     = na
+var float tp3_p     = na
+var float cap_atr   = na   // ATR catturato alla barra del segnale (T)
+var float open_qty  = 0.0  // quantità all'ingresso (per rilevare fill TP1)
+var bool  tp1_done  = false
+var bool  pending   = false // in attesa di fill alla barra T+1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTRY  (barra T: segnale rilevato → strategy.entry() → fill a open T+1)
+// ─────────────────────────────────────────────────────────────────────────────
+if long_sig and strategy.position_size == 0 and not pending
+    dir      := 1
+    cap_atr  := atr14          // cattura ATR alla barra del segnale
+    open_qty := qty_btc
+    pending  := true
+    tp1_done := false
+    ep       := na
+    strategy.entry("Long", strategy.long, qty=qty_btc,
+                   comment="↑ Spring  sc=" + str.tostring(score_l, "#.1"))
+
+if short_sig and strategy.position_size == 0 and not pending
+    dir      := -1
+    cap_atr  := atr14
+    open_qty := qty_btc
+    pending  := true
+    tp1_done := false
+    ep       := na
+    strategy.entry("Short", strategy.short, qty=qty_btc,
+                   comment="↓ Upthrust sc=" + str.tostring(score_s, "#.1"))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST-ENTRY SETUP  (barra T+1: fill avvenuto → calcola SL/TP sull'actual fill)
+// strategy.position_avg_price = prezzo di fill effettivo (open di T+1)
+// ─────────────────────────────────────────────────────────────────────────────
+if pending and strategy.position_size != 0
+    pending  := false
+    ep       := strategy.position_avg_price   // prezzo reale di fill
+    sl_d      = i_atr_sl  * cap_atr
+    tp1_d     = i_atr_tp1 * cap_atr
+
+    if dir == 1   // ── LONG ──────────────────────────────────────────────────
+        sl_p  := ep - sl_d
+        tp1_p := ep + tp1_d
+        tp2_p := ep + tp1_d * 2.0
+        tp3_p := ep + tp1_d * 3.0
+        // TP1: chiude il 50% con SL originale
+        strategy.exit("L_TP1", "Long", qty_percent=50,
+                      limit=tp1_p, stop=sl_p, comment="TP1")
+        // TP2: chiude il 50% del restante (25% originale), stessa SL
+        strategy.exit("L_TP2", "Long", qty_percent=50,
+                      limit=tp2_p, stop=sl_p, comment="TP2")
+        // TP3: chiude tutto il restante (25% originale), runner
+        strategy.exit("L_TP3", "Long", qty_percent=100,
+                      limit=tp3_p, stop=sl_p, comment="TP3")
+
+    if dir == -1  // ── SHORT ─────────────────────────────────────────────────
+        sl_p  := ep + sl_d
+        tp1_p := ep - tp1_d
+        tp2_p := ep - tp1_d * 2.0
+        tp3_p := ep - tp1_d * 3.0
+        strategy.exit("S_TP1", "Short", qty_percent=50,
+                      limit=tp1_p, stop=sl_p, comment="TP1")
+        strategy.exit("S_TP2", "Short", qty_percent=50,
+                      limit=tp2_p, stop=sl_p, comment="TP2")
+        strategy.exit("S_TP3", "Short", qty_percent=100,
+                      limit=tp3_p, stop=sl_p, comment="TP3")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BREAK-EVEN DOPO TP1  (sezione 4 della spec)
+// Rileva fill parziale: posizione scende sotto 75% dell'originale.
+// Cancella TP2/TP3 esistenti e li ri-emette con stop = entry price.
+// ─────────────────────────────────────────────────────────────────────────────
+in_long  = strategy.position_size >  0.0 and dir ==  1
+in_short = strategy.position_size <  0.0 and dir == -1
+in_pos   = in_long or in_short
+
+if in_pos and not tp1_done and not na(ep)
+    abs_pos = math.abs(strategy.position_size)
+    if abs_pos < open_qty * 0.75 and abs_pos > 0.0
+        tp1_done := true
+        if in_long
+            strategy.cancel("L_TP2")
+            strategy.cancel("L_TP3")
+            // Ri-emetti con stop al break-even (entry price)
+            strategy.exit("L_BE2", "Long", qty_percent=50,
+                          limit=tp2_p, stop=ep, comment="TP2/BE")
+            strategy.exit("L_BE3", "Long", qty_percent=100,
+                          limit=tp3_p, stop=ep, comment="TP3/BE")
+        if in_short
+            strategy.cancel("S_TP2")
+            strategy.cancel("S_TP3")
+            strategy.exit("S_BE2", "Short", qty_percent=50,
+                          limit=tp2_p, stop=ep, comment="TP2/BE")
+            strategy.exit("S_BE3", "Short", qty_percent=100,
+                          limit=tp3_p, stop=ep, comment="TP3/BE")
+
+// Reset stato quando posizione si chiude
+if strategy.position_size == 0 and dir != 0
+    dir      := 0
+    ep       := na
+    sl_p     := na
+    tp1_p    := na
+    tp2_p    := na
+    tp3_p    := na
+    tp1_done := false
+    pending  := false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUALS
+// ─────────────────────────────────────────────────────────────────────────────
+// Range band
+plot(i_show_rng and is_rng ? rng_hi : na, "Range High",
+     color=color.new(color.blue, 60), linewidth=1)
+plot(i_show_rng and is_rng ? rng_lo : na, "Range Low",
+     color=color.new(color.blue, 60), linewidth=1)
+bgcolor(is_rng ? color.new(color.blue, 93) : na, title="Ranging BG")
+
+// EMA 200 (trend filter)
+plot(ema200, "EMA 200", color=color.new(color.orange, 40), linewidth=1)
+
+// Segnali
+plotshape(i_show_sig and long_sig, "Spring",   shape.triangleup,
+          location.belowbar, color=color.lime, size=size.normal, text="Spring")
+plotshape(i_show_sig and short_sig, "Upthrust", shape.triangledown,
+          location.abovebar, color=color.red,  size=size.normal, text="Upthrust")
+
+// SL / TP / Entry lines (solo quando in posizione)
+plot(i_show_lvl and in_pos ? sl_p  : na, "SL",    color=color.new(color.red,    0), 1, plot.style_linebr)
+plot(i_show_lvl and in_pos ? tp1_p : na, "TP1",   color=color.new(color.green, 40), 1, plot.style_linebr)
+plot(i_show_lvl and in_pos ? tp2_p : na, "TP2",   color=color.new(color.green, 20), 1, plot.style_linebr)
+plot(i_show_lvl and in_pos ? tp3_p : na, "TP3",   color=color.new(color.green,  0), 1, plot.style_linebr)
+plot(i_show_lvl and in_pos ? ep    : na, "Entry", color=color.new(color.white, 40), 1, plot.style_linebr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TABELLA INFO (top-right)
+// ─────────────────────────────────────────────────────────────────────────────
+var table t = table.new(position.top_right, 2, 10,
+                         bgcolor   = color.new(color.black,  55),
+                         border_color = color.new(color.gray, 70),
+                         border_width  = 1,
+                         frame_color   = color.new(color.gray, 50),
+                         frame_width   = 1)
+
+if barstate.islast
+    // Header
+    table.cell(t, 0, 0, "Wyckoff S/U", text_color=color.white,  text_size=size.small)
+    table.cell(t, 1, 0, "1H BTCUSDT",  text_color=color.silver, text_size=size.small)
+
+    // Position status
+    p_txt = dir ==  1 ? "▲ LONG"
+          : dir == -1 ? "▼ SHORT"
+          :             "— FLAT"
+    p_col = dir ==  1 ? color.lime
+          : dir == -1 ? color.red
+          :             color.gray
+    table.cell(t, 0, 1, "Posizione",    text_color=color.silver, text_size=size.tiny)
+    table.cell(t, 1, 1, p_txt,          text_color=p_col,        text_size=size.tiny)
+
+    // Regime
+    r_txt = is_rng ? "✓ Ranging" : "✗ Trending"
+    r_col = is_rng ? color.lime  : color.orange
+    table.cell(t, 0, 2, "Regime",       text_color=color.silver, text_size=size.tiny)
+    table.cell(t, 1, 2, r_txt,          text_color=r_col,        text_size=size.tiny)
+
+    // ADX
+    a_col = adx_val < i_adx_max ? color.lime : color.orange
+    table.cell(t, 0, 3, "ADX",          text_color=color.silver, text_size=size.tiny)
+    table.cell(t, 1, 3, str.tostring(adx_val, "#.1") + " / " + str.tostring(i_adx_max, "#"),
+               text_color=a_col, text_size=size.tiny)
+
+    // Range width
+    rw_txt = na(rng_w) ? "n/a" : str.tostring(rng_w * 100, "#.1") + "% / " + str.tostring(i_rw_max * 100, "#") + "%"
+    rw_col = (not na(rng_w) and rng_w < i_rw_max) ? color.lime : color.orange
+    table.cell(t, 0, 4, "Range Width",  text_color=color.silver, text_size=size.tiny)
+    table.cell(t, 1, 4, rw_txt,         text_color=rw_col,       text_size=size.tiny)
+
+    // OBV bias
+    ob_txt = obv_trend > 0 ? "↑ Accum." : obv_trend < 0 ? "↓ Distrib." : "→ Neutra"
+    ob_col = obv_trend > 0 ? color.lime  : obv_trend < 0 ? color.red    : color.gray
+    table.cell(t, 0, 5, "OBV Bias",     text_color=color.silver, text_size=size.tiny)
+    table.cell(t, 1, 5, ob_txt,          text_color=ob_col,       text_size=size.tiny)
+
+    // Vol ratio
+    vr_col = vol_ratio >= i_vol_thr ? color.lime : color.gray
+    table.cell(t, 0, 6, "Vol Ratio",    text_color=color.silver, text_size=size.tiny)
+    table.cell(t, 1, 6, str.tostring(vol_ratio, "#.2") + "× (soglia " + str.tostring(i_vol_thr, "#.1") + "×)",
+               text_color=vr_col, text_size=size.tiny)
+
+    // ATR
+    table.cell(t, 0, 7, "ATR(14)",      text_color=color.silver, text_size=size.tiny)
+    table.cell(t, 1, 7, str.tostring(atr14, "#.2") + " USD",
+               text_color=color.white, text_size=size.tiny)
+
+    // RVOL
+    rv_col = rvol20 > 0.80 ? color.orange : color.lime
+    table.cell(t, 0, 8, "RVOL(20) ann", text_color=color.silver, text_size=size.tiny)
+    table.cell(t, 1, 8, str.tostring(rvol20 * 100, "#.0") + "%",
+               text_color=rv_col, text_size=size.tiny)
+
+    // Prossimo segnale attivo
+    next_txt = (accum and not in_pos)   ? "Cerca Spring"
+             : (distrib and not in_pos) ? "Cerca Upthrust"
+             :  in_pos                  ? (tp1_done ? "TP1 ✓ → BE" : "Pos. aperta")
+             :                            "—"
+    next_col = accum   ? color.lime
+             : distrib ? color.red
+             :           color.gray
+    table.cell(t, 0, 9, "Setup",        text_color=color.silver, text_size=size.tiny)
+    table.cell(t, 1, 9, next_txt,        text_color=next_col,     text_size=size.tiny)
