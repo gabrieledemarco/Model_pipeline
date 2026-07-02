@@ -42,7 +42,8 @@ from src.strategy.monte_carlo  import run_monte_carlo
 INIT_CAP     = 100_000.0
 RISK_PCT     = 0.01
 FEE          = 0.0004
-MIN_SL_ATR   = 0.50
+FEE_RT_PCT   = FEE * 2 * 100          # 0.08% round-trip fee in pct terms
+MIN_SL_ATR   = 0.25
 MAX_LEV      = 5.0
 MAX_HOLD     = 32          # 32 hours on 1H bars
 IC_HORIZON   = 16          # 16H forward return
@@ -53,8 +54,10 @@ WF_TRAIN_M   = 6
 WF_OOS_M     = 2
 WF_STEP_M    = 2
 
-TP_FRAC_GRID = [1.0, 1.5, 2.0, 3.0]
-SL_BUF_GRID  = [0.0, 0.25, 0.5, 1.0]
+# Symmetric ATR framework: TP = tp_frac×ATR, SL = sl_frac×ATR (no floor at ref_lo)
+# High R:R lowers the fee-adjusted BE below the achievable WR
+TP_FRAC_GRID = [1.0, 2.0, 3.0, 5.0]
+SL_FRAC_GRID = [0.25, 0.5, 0.75, 1.0]
 
 _BG = "#0f1117"; _CARD = "#12151f"; _GRID = "#1e2130"
 _TEXT = "#e0e0e0"; _ACC = "#42a5f5"; _GRN = "#66bb6a"
@@ -252,18 +255,16 @@ class Trade:
     net_pnl: float; gross_pnl: float; total_fees: float
     exit_reason: str; year: int; window_id: int
 
-def run_backtest(events, tp_frac, sl_buf, initial_capital=INIT_CAP, window_id=0):
+def run_backtest(events, tp_frac, sl_frac, initial_capital=INIT_CAP, window_id=0):
     equity = float(initial_capital); trades = []
     for ev in events:
         if equity < initial_capital * 0.005: break
-        entry = ev["entry_px"]; rs = max(ev["ref_size"], 1e-6)
+        entry = ev["entry_px"]
         atr = ev["atr_1h"]; d = 1 if ev["direction"] == "long" else -1
-        tp_px = entry + d * tp_frac * rs
-        sl_px = ev["ref_lo"] - sl_buf * atr if d == 1 else ev["ref_hi"] + sl_buf * atr
+        tp_px = entry + d * tp_frac * atr      # symmetric TP = tp_frac × ATR
+        sl_px = entry - d * sl_frac * atr      # symmetric SL = sl_frac × ATR
         sl_d  = abs(entry - sl_px); tp_d = abs(tp_px - entry)
         if sl_d <= 0 or tp_d <= 0: continue
-        if d == 1 and sl_px >= entry: continue
-        if d == -1 and sl_px <= entry: continue
         sl_d  = max(sl_d, atr * MIN_SL_ATR)
         qty   = min(equity * RISK_PCT / sl_d, equity * MAX_LEV / entry)
         notl  = qty * entry; e_fee = notl * FEE
@@ -297,17 +298,15 @@ def is_scan(events):
     paths = [(HI[e["entry_i"]+1: e["entry_i"]+1+MAX_HOLD],
               LO[e["entry_i"]+1: e["entry_i"]+1+MAX_HOLD]) for e in events]
     results = []
-    for tp_f, sl_b in product(TP_FRAC_GRID, SL_BUF_GRID):
+    for tp_f, sl_f in product(TP_FRAC_GRID, SL_FRAC_GRID):
         wins = losses = n_v = 0; sum_tp = sum_sl = 0.0
         for ev, (ph, pl) in zip(events, paths):
-            entry = ev["entry_px"]; rs = max(ev["ref_size"], 1e-6)
+            entry = ev["entry_px"]
             a = ev["atr_1h"]; d = 1 if ev["direction"] == "long" else -1
-            tp_px = entry + d * tp_f * rs
-            sl_px = ev["ref_lo"] - sl_b * a if d == 1 else ev["ref_hi"] + sl_b * a
-            sd = abs(entry - sl_px); td = abs(tp_px - entry)
+            tp_px = entry + d * tp_f * a          # symmetric TP = tp_frac × ATR
+            sl_px = entry - d * sl_f * a          # symmetric SL = sl_frac × ATR
+            td = abs(tp_px - entry); sd = abs(entry - sl_px)
             if sd <= 0 or td <= 0: continue
-            if d == 1 and sl_px >= entry: continue
-            if d == -1 and sl_px <= entry: continue
             n_v += 1; sum_tp += td / entry * 100; sum_sl += sd / entry * 100
             ht = hs = False
             for h, l in zip(ph, pl):
@@ -321,17 +320,21 @@ def is_scan(events):
             elif hs: losses += 1
         if n_v < 10: continue
         wr = wins / n_v * 100
-        rr = (sum_tp / n_v) / (sum_sl / n_v) if sum_sl > 0 else 0
-        be = 1 / (1 + rr) * 100 if rr > 0 else 50.0
-        exp = wr / 100 * (sum_tp / n_v) - (1 - wr / 100) * (sum_sl / n_v)
+        avg_tp = sum_tp / n_v; avg_sl = sum_sl / n_v
+        rr = avg_tp / avg_sl if avg_sl > 0 else 0
+        be     = 1 / (1 + rr) * 100 if rr > 0 else 50.0
+        be_fee = (avg_sl + FEE_RT_PCT) / (avg_tp + avg_sl) * 100   # fee-adjusted BE
+        # Optimise by fee-adjusted expected PnL
+        exp_adj = wr/100 * (avg_tp - FEE_RT_PCT) - (1-wr/100) * (avg_sl + FEE_RT_PCT)
         pv = st.binomtest(int(round(wr / 100 * n_v)), n_v, be / 100,
                           alternative="greater").pvalue
-        results.append(dict(tp_frac=tp_f, sl_buf=sl_b, n=n_v, wr=round(wr, 2),
-                            rr=round(rr, 2), be=round(be, 2), exp=round(exp, 5),
-                            p_val=round(pv, 4)))
+        results.append(dict(tp_frac=tp_f, sl_frac=sl_f, n=n_v, wr=round(wr, 2),
+                            rr=round(rr, 2), be=round(be, 2), be_fee=round(be_fee, 2),
+                            exp=round(exp_adj, 5), p_val=round(pv, 4)))
     df_r = pd.DataFrame(results)
     if df_r.empty:
-        return df_r, dict(tp_frac=2.0, sl_buf=0.5, n=0, wr=0, rr=0, be=50, exp=0, p_val=1)
+        return df_r, dict(tp_frac=2.0, sl_frac=0.5, n=0, wr=0, rr=0,
+                          be=50, be_fee=50, exp=0, p_val=1)
     return df_r, df_r.sort_values("exp", ascending=False).iloc[0].to_dict()
 
 def _kpis(eq, init=INIT_CAP):
@@ -345,7 +348,7 @@ def _kpis(eq, init=INIT_CAP):
     return dict(total_return=ret, calmar=ret / abs(dd) if dd < 0 else 0,
                 sharpe=ann / vol if vol > 0 else 0, max_dd=dd)
 
-def run_wf(events, tp_frac, sl_buf):
+def run_wf(events, tp_frac, sl_frac):
     from dateutil.relativedelta import relativedelta
     start, end = IDX[0], IDX[-1]; wlist = []; cur = start
     while True:
@@ -358,11 +361,11 @@ def run_wf(events, tp_frac, sl_buf):
         is_ev = [e for e in events if tr_s <= e["ts"] < tr_e]
         oo_ev = [e for e in events if tr_e <= e["ts"] < oo_e]
         if len(is_ev) < 5 or len(oo_ev) < 3: continue
-        _, oo_eq = run_backtest(oo_ev, tp_frac, sl_buf, window_id=wid)
+        _, oo_eq = run_backtest(oo_ev, tp_frac, sl_frac, window_id=wid)
         if oo_eq.empty: continue
         wr_list.append(_kpis(oo_eq)["total_return"]); all_oos.extend(oo_ev)
     oos = sorted(all_oos, key=lambda e: e["ts"])
-    oos_t, oos_eq = run_backtest(oos, tp_frac, sl_buf)
+    oos_t, oos_eq = run_backtest(oos, tp_frac, sl_frac)
     return oos_t, oos_eq, wr_list, len(wlist)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -582,12 +585,13 @@ for cand in top_sig:
     evs = cand["events"]
     print("  IS scan …")
     df_scan, bp = is_scan(evs)
-    tp_f, sl_b  = bp["tp_frac"], bp["sl_buf"]
-    print(f"  Best tp={tp_f}  sl={sl_b}  WR={bp['wr']:.1f}%  BE={bp['be']:.1f}%  "
-          f"ExpPnL={bp['exp']:+.5f}%  p={bp['p_val']:.4f}")
+    tp_f, sl_f  = bp["tp_frac"], bp["sl_frac"]
+    print(f"  Best tp={tp_f}×ATR  sl={sl_f}×ATR  WR={bp['wr']:.1f}%  "
+          f"BE={bp['be']:.1f}%  BE(fee-adj)={bp['be_fee']:.1f}%  "
+          f"ExpPnL(adj)={bp['exp']:+.5f}%  p={bp['p_val']:.4f}")
 
     print("  Walk-Forward …")
-    oos_t, oos_eq, wr_list, n_wins = run_wf(evs, tp_f, sl_b)
+    oos_t, oos_eq, wr_list, n_wins = run_wf(evs, tp_f, sl_f)
     kp = _kpis(oos_eq)
     oos_df = (pd.DataFrame([t.__dict__ for t in oos_t]).sort_values("entry_ts")
               if oos_t else pd.DataFrame())
@@ -611,7 +615,7 @@ for cand in top_sig:
     print(f"  P(profit)={p_profit:.1%}  P(ruin)={p_ruin:.1%}")
 
     pipeline_results.append(dict(
-        cand=cand, bp=bp, tp_f=tp_f, sl_b=sl_b,
+        cand=cand, bp=bp, tp_f=tp_f, sl_f=sl_f,
         oos_t=oos_t, oos_eq=oos_eq, oos_df=oos_df,
         kp=kp, wr_list=wr_list, n_wins=n_wins,
         wins_n=wins_n, wr_oos=wr_oos, be_oos=be_oos,
@@ -751,9 +755,10 @@ def _pipeline_card(res):
         _kv("Strategy",         f'[{cand["key"]}] {cand["label"]}'),
         _kv("IC (Spearman)",    f'{cand["ic"]:+.4f}  p={cand["p"]:.4f}  n={cand["n"]:,}'),
         _kv("Signal logic",     cand["desc"]),
-        _kv("IS best params",   f'tp={res["tp_f"]}×ATR  sl=(1+{res["sl_b"]})×ATR'),
-        _kv("IS WR / BE",       f'{res["bp"]["wr"]:.1f}% / {res["bp"]["be"]:.1f}%  '
-                                f'ExpPnL={res["bp"]["exp"]:+.5f}%'),
+        _kv("IS best params",   f'tp={res["tp_f"]}×ATR  sl={res["sl_f"]}×ATR  (symmetric)'),
+        _kv("IS WR / BE / BE(fee)",
+                                f'{res["bp"]["wr"]:.1f}% / {res["bp"]["be"]:.1f}% / {res["bp"]["be_fee"]:.1f}%  '
+                                f'ExpPnL(adj)={res["bp"]["exp"]:+.5f}%'),
         _kv("OOS trades",       str(len(res["oos_t"]))),
         _kv("WR OOS / BE",      _style(res["wr_oos"],".1%") + f' / {res["be_oos"]:.1f}%'),
         _kv("Total Return OOS", _style(kp["total_return"],".1%")),
@@ -802,6 +807,9 @@ html = f"""<!DOCTYPE html>
 <p>Source: <a href="https://{SOURCE_URL}">{SOURCE_URL}</a></p>
 <p>Same strategies as 15M run but on 1H bars: ATR ~4× larger → fee/move ratio drops from ~25% to ~6%.</p>
 <p>IC = Spearman corr(direction, 16H forward return) · Full pipeline (IS scan + WFO + Monte Carlo) on all strategies with IC&gt;0 and p&lt;0.05.</p>
+<p><b>Fee-aware symmetric framework:</b> TP = tp_frac×ATR · SL = sl_frac×ATR (no floor).
+IS scan optimises fee-adjusted ExpPnL = WR×(TP%−0.08%) − (1−WR)×(SL%+0.08%).
+Grid: tp∈[1,2,3,5]×ATR · sl∈[0.25,0.5,0.75,1.0]×ATR → R:R up to 20:1 → BE(fee-adj) as low as 13%.</p>
 
 <h2>IC Ranking — Visual</h2>
 {_imgt(img_rank)}
