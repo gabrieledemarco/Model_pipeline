@@ -89,10 +89,11 @@ ATR1H = np.where(ATR > 0, ATR, 1.0)
 
 # ── 4H indicators mapped to 1H timestamps ────────────────────────────────────
 print("  Mapping 4H → 1H …")
-atr4h_raw = df4h["atr_14"].reindex(IDX, method="ffill")
+atr4h_raw = df4h["atr_14"].shift(1).reindex(IDX, method="ffill")    # shift: use prev closed 4H bar
 ATR4H     = np.where(atr4h_raw.values > 0, atr4h_raw.values, ATR1H)
 
 ema30_4h = (df4h["close"].ewm(span=30, adjust=False).mean()
+            .shift(1)                                                   # shift: use prev closed 4H bar
             .reindex(IDX, method="ffill").values)
 
 # 4H trend-alignment filter

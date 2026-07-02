@@ -94,8 +94,8 @@ OBV_  = df["obv"].values
 yr_   = np.array([t.year for t in IDX], dtype=int)
 ATR1H = np.where(ATR > 0, ATR, 1.0)
 
-# ── 4H ATR mapped to 1H ──────────────────────────────────────────────────────
-atr4h_raw = df4h["atr_14"].reindex(IDX, method="ffill")
+# ── 4H ATR mapped to 1H (shift 1 bar: use only the previous *closed* 4H bar) ──
+atr4h_raw = df4h["atr_14"].shift(1).reindex(IDX, method="ffill")
 ATR4H     = np.where(atr4h_raw.values > 0, atr4h_raw.values, ATR1H)
 
 # ── HMM helpers ───────────────────────────────────────────────────────────────
@@ -133,8 +133,9 @@ print(f"  Mean 4H log-ret: { {s: f'{v:.3f}%' for s,v in mean_ret_per.items()} }"
 print(f"  BULL={BULL_FULL}  BEAR={BEAR_FULL}  "
       f"SIDEWAYS={[s for s in range(HMM_STATES) if s not in (BULL_FULL,BEAR_FULL)][0]}")
 
-# Map to 1H resolution
+# Map to 1H resolution (shift 1 bar: use only the previous *closed* 4H bar)
 hmm_regime_1h = (pd.Series(states_full, index=df4h.index)
+                 .shift(1)
                  .reindex(IDX, method="ffill").values.astype(float))
 
 hmm_long_ok_full  = hmm_regime_1h == BULL_FULL
@@ -390,9 +391,9 @@ def run_wf_hmm(events_all, tp_frac, sl_frac):
         oo_mask = np.asarray(tail_close.index >= tr_e)
         oo_regime = pd.Series(states_tail[oo_mask],
                               index=tail_close.index[oo_mask])
-        # map to 1H
+        # map to 1H (shift 1 bar: use only the previous *closed* 4H bar)
         idx_oos_1h  = IDX[(IDX>=tr_e)&(IDX<oo_e)]
-        oo_reg_1h   = oo_regime.reindex(idx_oos_1h, method="ffill")
+        oo_reg_1h   = oo_regime.shift(1).reindex(idx_oos_1h, method="ffill")
 
         # ── filter OOS events ─────────────────────────────────────────────
         oo_ev_all = [e for e in events_all if tr_e<=e["ts"]<oo_e]
