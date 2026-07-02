@@ -5,17 +5,29 @@
 **Periodo di validazione:** Gennaio 2020 – Maggio 2026 (6.4 anni)  
 **Stato:** Validato via Walk-Forward Out-of-Sample + Monte Carlo
 
----
+> ⚠️ **CORREZIONE 2026-07-02**: la validazione originale (tabella sotto, versione
+> barrata) conteneva un lookahead bias — il regime HMM 4H e l'ATR4H usati per
+> sizing/TP/SL venivano mappati sulla timeline 1H con `reindex(...,ffill)` da
+> una serie indicizzata per *inizio* barra 4H, senza uno `.shift(1)`
+> compensativo. Le prime ~3 ore di ogni barra 4H usavano quindi dati di una
+> barra ancora "in formazione" — impossibile da replicare dal vivo. Dopo la
+> correzione (shift di una barra prima del ffill, in `create_mtf_hmm_report.py`),
+> **S08 Quantile Channel non regge** (era un artefatto del bug) mentre
+> **S07 OU Mean Reversion regge e migliora**. Solo S07 è in produzione.
 
-## Strategie Validate
+## Strategie Validate (numeri corretti, post-fix lookahead)
 
-| ID | Nome | OOS Return | MaxDD | Win Rate | BE_fee | P(profit) | P(ruin) |
-|----|------|-----------|-------|----------|--------|-----------|---------|
-| **S08** | Quantile Channel | **+214.3%** | -63.9% | 54.5% | 51.6% | 98.5% | **0.0%** |
-| **S07** | OU Mean Reversion | **+78.1%** | -30.2% | 55.5% | ~51.8% | 95.5% | **0.0%** |
+| ID | Nome | OOS Return | MaxDD | Win Rate | BE_fee | P(profit) | P(ruin) | Verdetto |
+|----|------|-----------|-------|----------|--------|-----------|---------|----------|
+| ~~S08~~ | ~~Quantile Channel~~ | ~~-15.1%~~ | ~~-62.1%~~ | ~~45.7%~~ | ~~42.9%~~ | ~~40.0%~~ | ~~19.4%~~ | ❌ **NON VALIDATA** (artefatto del bug) |
+| **S07** | OU Mean Reversion | **+152.1%** | -25.7% | 56.8% | 50.0% | 99.7% | **0.0%** | ✅ **VALIDATA — IN LIVE** |
 
-> I ritorni OOS sono cumulativi su 6 anni senza leva aggiuntiva oltre il risk-sizing interno.  
-> Le strategie S01, S02, S03, S04 non sono state validate (P(ruin) > 10% o OOS negativo).
+> Numeri S07 aggiornati dopo il fix del lookahead bias (in precedenza: +78.1%
+> return, -30.2% MaxDD, 55.5% WR, 95.5% P(profit) — la correzione ha
+> *migliorato* il risultato, segno che l'edge è reale e non un artefatto).
+> IS best params post-fix: S07 tp=1.0×ATR4H sl=1.0×ATR4H (invariati).
+> Le strategie S01, S02, S03, S04, S08, S09, S09b, S10 non sono validate
+> (P(ruin) > 10% o OOS negativo/non significativo).
 
 ---
 
@@ -31,7 +43,10 @@
 
 ## Layer 1 — Strategie di Entry (1H)
 
-### S08 — Quantile Channel Breakout
+### S08 — Quantile Channel Breakout — ❌ NON VALIDATA, NON IN PRODUZIONE
+
+> Mantenuta qui solo a scopo di riferimento storico/metodologico. Non è
+> utilizzata in live — vedi correzione lookahead bias in cima al documento.
 
 **Logica:** Breakout del canale statistico di prezzo a 30 barre. Entra in direzione del breakout quando il prezzo supera la banda esterna con un buffer di sicurezza.
 
