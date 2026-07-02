@@ -566,14 +566,14 @@ for rank, r in enumerate(ranked, 1):
     print(f"  #{rank:2d}  [{r['key']:4s}] {r['label']:<26s}  IC={r['ic']:+.4f}  p={r['p']:.4f}  {sig}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Full pipeline on top-3 significant strategies
+# Full pipeline on ALL significant strategies (IC>0, p<0.05)
 # ─────────────────────────────────────────────────────────────────────────────
-top3 = [r for r in ranked if r["ic"] > 0 and r["p"] < 0.05][:3]
-if not top3:
-    top3 = ranked[:3]
+top_sig = [r for r in ranked if r["ic"] > 0 and r["p"] < 0.05]
+if not top_sig:
+    top_sig = ranked[:3]
 
 pipeline_results = []
-for cand in top3:
+for cand in top_sig:
     print(f"\n{SEP2}")
     print(f"  PIPELINE: [{cand['key']}] {cand['label']}")
     print(f"  IC={cand['ic']:+.4f}  p={cand['p']:.4f}  n={cand['n']:,}")
@@ -801,7 +801,7 @@ html = f"""<!DOCTYPE html>
 <h1>External Strategies — BTCUSDT 1H | 2020-2026</h1>
 <p>Source: <a href="https://{SOURCE_URL}">{SOURCE_URL}</a></p>
 <p>Same strategies as 15M run but on 1H bars: ATR ~4× larger → fee/move ratio drops from ~25% to ~6%.</p>
-<p>IC = Spearman corr(direction, 16H forward return) · Full pipeline on top-3 by IC significance.</p>
+<p>IC = Spearman corr(direction, 16H forward return) · Full pipeline (IS scan + WFO + Monte Carlo) on all strategies with IC&gt;0 and p&lt;0.05.</p>
 
 <h2>IC Ranking — Visual</h2>
 {_imgt(img_rank)}
@@ -809,7 +809,7 @@ html = f"""<!DOCTYPE html>
 <h2>IC Ranking Table</h2>
 {_rank_table()}
 
-<h2>Full Pipeline — Top-3 Strategies</h2>
+<h2>Full Pipeline — All Significant Strategies (p &lt; 0.05)</h2>
 {pipeline_html}
 
 <p style="color:#555;font-size:11px;margin-top:40px">
