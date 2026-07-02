@@ -42,6 +42,9 @@ Usage
    # ICT Silver Bullet NY AM+PM (15M, TP/SL su FVG + time-stop 8h):
    python live_trader.py --strategy-type ict --exchange bybit
 
+   # S07 OU Mean Reversion (1H, HMM-gated 4H, TP/SL 1.0x ATR4H):
+   python live_trader.py --strategy-type ou_hmm --exchange bybit
+
 Ogni processo scrive esclusivamente in logs/strategies/{strategy_id}/
 (live_trader.log, trades.csv, position.json, meta.json). Se --strategy-id
 non è passato viene derivato automaticamente da scenario/strategy-type + exchange.
@@ -131,6 +134,10 @@ def _build_signal_source(strategy_type: str, scenario: str):
         from src.live.ict_live import compute_ict_signal
         return "ICT Silver Bullet NY AM+PM", compute_ict_signal, "15m"
 
+    if strategy_type == "ou_hmm":
+        from src.live.ou_live import compute_ou_signal
+        return "S07 OU Mean Reversion (HMM-gated)", compute_ou_signal, "1h"
+
     raise ValueError(f"Unknown strategy_type: {strategy_type!r}")
 
 
@@ -166,10 +173,11 @@ def parse_args() -> argparse.Namespace:
                     help="Scenario strategia (solo per --strategy-type composite; "
                          "default: 'Strong (≥±18)')")
     ap.add_argument("--strategy-type", default="composite",
-                    choices=["composite", "wyckoff", "ict"],
+                    choices=["composite", "wyckoff", "ict", "ou_hmm"],
                     help="Fonte del segnale: 'composite' (score multi-TF, "
                          "parametrizzato da --scenario), 'wyckoff' (Spring/"
-                         "Upthrust 1H), 'ict' (Silver Bullet NY AM+PM 15M). "
+                         "Upthrust 1H), 'ict' (Silver Bullet NY AM+PM 15M), "
+                         "'ou_hmm' (S07 OU Mean Reversion 1H, HMM-gated 4H). "
                          "Default: composite")
     ap.add_argument("--strategy-id", default=None,
                     help="Identificatore univoco della strategia (default: "

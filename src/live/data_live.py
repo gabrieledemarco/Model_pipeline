@@ -103,6 +103,38 @@ def fetch_15m_bars(symbol: str = SYMBOL, limit: int = 2000) -> pd.DataFrame:
     return result.tail(limit)
 
 
+def fetch_4h_bars_extended(symbol: str = SYMBOL, limit: int = 2200) -> pd.DataFrame:
+    """
+    Fetch extended 4H OHLCV history from production FAPI (reuses `_klines`,
+    same helper used by `fetch_tf_data` / `fetch_15m_bars`). 2200 bars ≈ 366
+    days ≈ 12 months — used by src/live/hmm_regime.py to fit the monthly-
+    refreshed HMM regime model on ~HMM_HISTORY_MONTHS=12 months of 4H data
+    (see docs/VALIDATED_STRATEGIES_SPEC.md).
+
+    Binance FAPI caps a single `klines` request at 1500 bars, so this
+    paginates backward (via `endTime`) when `limit` exceeds that, mirroring
+    `fetch_15m_bars`'s pagination pattern, then concatenates and trims to the
+    requested length.
+    """
+    chunks: list = []
+    remaining = limit
+    end_time: Optional[int] = None
+    while remaining > 0:
+        batch = min(remaining, 1500)
+        df = _klines("4h", batch, symbol, end_time=end_time)
+        if df.empty:
+            break
+        chunks.append(df)
+        remaining -= len(df)
+        if remaining <= 0 or len(df) < batch:
+            break
+        end_time = int(df.index[0].value // 10 ** 6) - 1  # 1ms before earliest bar
+
+    result = pd.concat(chunks[::-1]).sort_index()
+    result = result[~result.index.duplicated(keep="first")]
+    return result.tail(limit)
+
+
 # ── Premium index (real OI proxy) ────────────────────────────────────────────
 
 def fetch_premium(symbol: str = SYMBOL, limit: int = 500) -> pd.Series:
