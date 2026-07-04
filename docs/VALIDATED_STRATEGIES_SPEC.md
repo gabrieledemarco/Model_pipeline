@@ -401,6 +401,41 @@ matplotlib  >= 3.7
 
 ---
 
+---
+
+## Strategie SMC Testate — Non Validate (2026-07-04)
+
+Due strategie Smart Money Concepts (ICT) sono state testate sulla stessa pipeline di validazione. Entrambe hanno fallito il test IC e non sono state promosse a WFO/Monte Carlo.
+
+| ID | Nome | IC | p-value | N segnali | Esito |
+|----|------|----|---------|-----------|-------|
+| SMC_01 | Asia Liquidity Sweep + Fair Value Gap | +0.026 | 0.554 | 517 | ✗ Non validata |
+| SMC_02 | MTF Dealing Range + BSL/SSL Sweep | +0.012 | 0.730 | 786 | ✗ Non validata |
+
+**IC soglia richiesta:** > 0.0 con p < 0.05 (Spearman, orizzonte 16H)
+
+### Logica SMC_01 — ICT 4-Step Asia Sweep + FVG
+
+Segnale SHORT: struttura 4H bearish (LH+LL) + sweep sopra il massimo della sessione Asia (chiusura sotto) + Fair Value Gap bearish nelle ultime 3 barre.
+Segnale LONG: struttura 4H bullish (HH+HL) + sweep sotto il minimo della sessione Asia (chiusura sopra) + FVG bullish nelle ultime 3 barre.
+
+### Logica SMC_02 — MTF Dealing Range + BSL/SSL
+
+Segnale SHORT: struttura 4H bearish + prezzo in zona premium (sopra il midpoint del range 4H a 20 barre) + BSL spazzata nelle ultime 5 barre.
+Segnale LONG: struttura 4H bullish + prezzo in zona discount (sotto il midpoint) + SSL spazzata nelle ultime 5 barre.
+
+### Perché le strategie SMC non passano su 1H
+
+Le strategie ICT/SMC sono progettate per timeframe M1–M15 dove:
+- I Fair Value Gap durano pochi minuti (non ore)
+- I liquidity sweep avvengono in secondi — su 1H una "sweep" è già mediata su 60 minuti di prezzo
+- La sessione Asia (8H) rappresenta il 33% della giornata — il livello H/L perde risoluzione
+
+**Possibile sviluppo futuro:** Applicare la stessa pipeline su dati 15M per avere risoluzione sufficiente. Richiede ~4× i dati e il calcolo, con maggiore numero di segnali che potrebbe migliorare la significatività statistica.
+
+---
+
 *Documento generato da pipeline di validazione quantitativa — BTCUSDT 2020-2026*  
 *Bug fix lookahead 4H applicato: 2026-07-02*  
-*Ultimo aggiornamento: 2026-07-02*
+*SMC strategies test aggiunto: 2026-07-04*  
+*Ultimo aggiornamento: 2026-07-04*
