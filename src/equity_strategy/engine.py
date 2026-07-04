@@ -53,6 +53,7 @@ def run_portfolio_backtest(
     cost_bps: float = COST_BPS,
     whole_shares: bool = False,
     commission_per_leg: float = 0.0,
+    contributions: pd.Series | None = None,
 ) -> dict:
     """
     Simulate the monthly sector-rotation portfolio over `panel`'s date range.
@@ -65,14 +66,21 @@ def run_portfolio_backtest(
     `commission_per_leg` to a flat currency cost applied to every non-zero
     turnover leg at each rebalance, to see the drag this adds at small capital.
 
-    Returns dict with keys: equity, drawdown, trades, kpis
+    `contributions`, if given, is a Series indexed by (a subset of) `plan`'s
+    execution dates giving an additional cash amount (same currency as
+    `initial_capital`) injected right before that rebalance — e.g. a recurring
+    monthly top-up. The cumulative injected amount is returned as
+    `"contributed"` so a caller can plot portfolio value against money in.
+
+    Returns dict with keys: equity, drawdown, trades, kpis, contributed
     """
     if plan.empty:
         idx = panel.index
         equity = pd.Series(initial_capital, index=idx)
         dd = pd.Series(0.0, index=idx)
         return {"equity": equity, "drawdown": dd, "trades": pd.DataFrame(),
-                "kpis": compute_kpis(equity, dd, pd.DataFrame(), initial_capital)}
+                "kpis": compute_kpis(equity, dd, pd.DataFrame(), initial_capital),
+                "contributed": equity.copy()}
 
     assets = sectors + ["CASH"]
     # Later-inception sectors (e.g. XLC, XLRE) carry leading NaNs; they are
@@ -85,6 +93,8 @@ def run_portfolio_backtest(
     exec_set = set(plan.index)
     shares = {a: 0.0 for a in assets}
     equity_arr = np.full(len(idx), np.nan)
+    contrib_arr = np.full(len(idx), np.nan)
+    cum_contributed = float(initial_capital)
     trades: List[Trade] = []
     open_positions: dict = {}
     prev_weights = {a: 0.0 for a in assets}
@@ -96,6 +106,11 @@ def run_portfolio_backtest(
         if dt in exec_set:
             total_value = (sum(shares[a] * price_row[a] for a in assets)
                             if started else initial_capital)
+
+            if contributions is not None:
+                topup = float(contributions.get(dt, 0.0))
+                total_value += topup
+                cum_contributed += topup
 
             target_weights = {a: float(plan.loc[dt].get(a, 0.0)) for a in assets}
             turnover = sum(abs(target_weights[a] - prev_weights[a]) for a in assets)
@@ -144,6 +159,7 @@ def run_portfolio_backtest(
 
         equity_arr[i] = (sum(shares[a] * price_row[a] for a in assets)
                           if started else initial_capital)
+        contrib_arr[i] = cum_contributed
 
     # close remaining open positions at the final bar
     last_dt = idx[-1]
@@ -173,7 +189,31 @@ def run_portfolio_backtest(
         "drawdown": drawdown,
         "trades": trades_df,
         "kpis": compute_kpis(equity, drawdown, trades_df, initial_capital),
+        "contributed": pd.Series(contrib_arr, index=idx).ffill(),
     }
+
+
+def money_weighted_return(dates: List[pd.Timestamp], amounts: List[float]) -> float:
+    """
+    Annualised money-weighted rate of return (XIRR) for a cash-flow series
+    with recurring contributions — CAGR is not meaningful once external money
+    is added mid-period, so a proper IRR is needed to summarise a DCA plan.
+    `amounts` follow the usual convention: negative = cash paid in, positive =
+    terminal value withdrawable.
+    """
+    from scipy.optimize import brentq
+
+    t0 = dates[0]
+    times = np.array([(d - t0).days / 365.25 for d in dates])
+    amounts_arr = np.array(amounts, dtype=float)
+
+    def npv(r: float) -> float:
+        return float(np.sum(amounts_arr / (1.0 + r) ** times))
+
+    try:
+        return brentq(npv, -0.99, 10.0)
+    except Exception:
+        return float("nan")
 
 
 def compute_kpis(equity: pd.Series, drawdown: pd.Series,

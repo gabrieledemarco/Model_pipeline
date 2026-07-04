@@ -49,7 +49,8 @@ from src.equity_strategy.data_fetcher import (
 )
 from src.equity_strategy.signals import build_rebalance_plan
 from src.equity_strategy.engine import (
-    run_portfolio_backtest, compute_kpis, monthly_return_trades, INIT_CAP,
+    run_portfolio_backtest, compute_kpis, monthly_return_trades,
+    money_weighted_return, INIT_CAP,
 )
 from src.equity_strategy.walk_forward import run_walk_forward
 from src.strategy.monte_carlo import run_monte_carlo, mc_summary_table
@@ -284,6 +285,84 @@ def run_small_account_simulation(panel, cash_nav, plan, start_date):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DCA simulation: 1,000 EUR + 150 EUR/month
+# ─────────────────────────────────────────────────────────────────────────────
+
+DCA_INITIAL_EUR = 1000.0
+DCA_MONTHLY_EUR = 150.0
+
+
+def _spy_dca_whole_share(spy_px: pd.Series, exec_dates: pd.DatetimeIndex,
+                          initial_usd: float, contrib_usd: pd.Series):
+    """Monthly DCA into SPY alone, whole shares only, leftover cash carried forward."""
+    shares, cash, months_skipped = 0.0, 0.0, 0
+    values = []
+    for i, dt in enumerate(exec_dates):
+        px = float(spy_px.loc[dt])
+        cash += initial_usd if i == 0 else float(contrib_usd.loc[dt])
+        buy = np.floor(cash / px)
+        if buy == 0:
+            months_skipped += 1
+        shares += buy
+        cash -= buy * px
+        values.append(shares * px + cash)
+    return pd.Series(values, index=exec_dates), months_skipped
+
+
+def run_dca_simulation(panel, cash_nav, plan, start_date):
+    """
+    €1,000 initial + €150/month recurring contribution. CAGR is not meaningful
+    once external cash is added mid-period, so results are summarised with
+    final value, total contributed, and the money-weighted IRR instead.
+    """
+    exec_dates = plan.index
+    fx = fetch_daily_ohlcv("EURUSD=X")
+    fx_close = fx["close"].reindex(panel.index).ffill().bfill()
+
+    contrib_usd = pd.Series(0.0, index=exec_dates)
+    contrib_usd.loc[exec_dates[1:]] = DCA_MONTHLY_EUR * fx_close.loc[exec_dates[1:]].values
+    initial_usd = DCA_INITIAL_EUR * float(fx_close.loc[start_date])
+
+    ideal_bt = run_portfolio_backtest(panel, cash_nav, plan, ALL_SECTORS,
+                                       initial_capital=initial_usd, contributions=contrib_usd)
+    real_bt = run_portfolio_backtest(panel, cash_nav, plan, ALL_SECTORS,
+                                      initial_capital=initial_usd, contributions=contrib_usd,
+                                      whole_shares=True, commission_per_leg=COMMISSION_EUR)
+    spy_dca_usd, spy_months_skipped = _spy_dca_whole_share(
+        panel["SPY"], exec_dates, initial_usd, contrib_usd)
+
+    def to_eur(eq_usd):
+        return eq_usd / fx_close.loc[eq_usd.index]
+
+    curves = {
+        "Strategy — Idealized": to_eur(ideal_bt["equity"].loc[start_date:]),
+        "Strategy — Realistic": to_eur(real_bt["equity"].loc[start_date:]),
+        "SPY DCA (whole shares)": to_eur(spy_dca_usd),
+        "Total Contributed": to_eur(ideal_bt["contributed"].loc[start_date:]),
+    }
+
+    contrib_dates = [start_date] + list(exec_dates[1:])
+    cf_base = [-DCA_INITIAL_EUR] + [-DCA_MONTHLY_EUR] * (len(exec_dates) - 1)
+
+    rows = []
+    for label, series in curves.items():
+        if label == "Total Contributed":
+            continue
+        final_val = float(series.iloc[-1])
+        irr = money_weighted_return(contrib_dates + [series.index[-1]], cf_base + [final_val])
+        rows.append({
+            "Version": label,
+            "Final Value (€)": round(final_val, 0),
+            "Total Contributed (€)": round(float(curves["Total Contributed"].iloc[-1]), 0),
+            "Total Gain (€)": round(final_val - float(curves["Total Contributed"].iloc[-1]), 0),
+            "Money-Weighted IRR (%)": round(irr * 100, 2) if irr == irr else None,
+        })
+    table = pd.DataFrame(rows).set_index("Version")
+
+    return table, curves, spy_months_skipped, len(exec_dates)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -355,6 +434,13 @@ def main():
     small_account_table, small_account_curves = run_small_account_simulation(
         panel, cash_nav, final_plan, start_date)
 
+    # ── DCA simulation (1,000 EUR + 150 EUR/month) ────────────────────────────
+    print("\nRunning DCA simulation (€1,000 + €150/month) …")
+    dca_table, dca_curves, spy_months_skipped, n_months = run_dca_simulation(
+        panel, cash_nav, final_plan, start_date)
+    print(f"  SPY-DCA whole-share: {spy_months_skipped}/{n_months} months couldn't "
+          f"afford a single share and rolled the contribution forward")
+
     # ── Trade analysis ───────────────────────────────────────────────────────
     trades_df = final_bt["trades"]
     by_regime = trades_df.groupby("regime")["net_pnl"].agg(
@@ -380,6 +466,8 @@ def main():
     chart_mc_dist_img = chart_mc_dist(mc_final)
     chart_small_account = chart_equity_comparison(
         small_account_curves, f"€{EUR_CAPITALS[1]:,} Starting Capital — Idealized vs Realistic vs SPY")
+    chart_dca = chart_equity_comparison(
+        dca_curves, f"DCA — €{DCA_INITIAL_EUR:,.0f} initial + €{DCA_MONTHLY_EUR:,.0f}/month")
 
     # ── KPI tables ────────────────────────────────────────────────────────────
     kpi_table = pd.DataFrame([
@@ -410,6 +498,8 @@ def main():
         wf["windows"], wfo_summary, chart_mc_fan_img, chart_mc_dist_img,
         mc_percentiles, mc_compare, mc_final, start_date,
         chart_small_account, small_account_table,
+        chart_dca, dca_table, spy_months_skipped, n_months,
+        float(panel["SPY"].loc[start_date]), float(panel["SPY"].iloc[-1]),
     )
 
     out_path = REPORTS_DIR / "report_sp500_portfolio.html"
@@ -421,7 +511,9 @@ def build_html(panel, kpi_table, chart_main_equity, chart_main_dd, chart_ablatio
                 chart_trades_hist, chart_winrate, by_regime, chart_wfo, chart_wfo_equity,
                 wfo_windows, wfo_summary, chart_mc_fan_img, chart_mc_dist_img,
                 mc_percentiles, mc_compare, mc_final, start_date,
-                chart_small_account, small_account_table) -> str:
+                chart_small_account, small_account_table,
+                chart_dca, dca_table, spy_months_skipped, n_months,
+                spy_price_start, spy_price_end) -> str:
 
     generated = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M UTC")
     universe_str = ", ".join(SECTOR_ETFS) + " (+ " + ", ".join(EXTRA_SECTOR_ETFS) + " once eligible)"
@@ -569,6 +661,29 @@ rounding and flat commissions consume a large fraction of the strategy's edge ov
 SPY — the drag shrinks fast as capital rises. Below roughly &euro;3,000-5,000, a plain
 SPY buy &amp; hold is very likely the more capital-efficient choice; the rotation strategy
 only starts to earn its complexity once per-leg costs are a small fraction of position size.</p>
+
+<h2>7 · Recurring-Contribution (DCA) Simulation</h2>
+<p>&euro;{DCA_INITIAL_EUR:,.0f} initial deposit + &euro;{DCA_MONTHLY_EUR:,.0f} added every month for the
+whole backtest ({n_months} months). CAGR stops being meaningful once external cash keeps
+entering mid-period, so results below are summarised by <b>final value</b>, <b>total
+contributed</b>, and the <b>money-weighted return (IRR)</b> — the correct way to rate a
+recurring-contribution plan. A whole-share SPY-only DCA is included as the passive
+alternative; buying single shares of an increasingly expensive SPY (&#36;{spy_price_start:.0f}
+in 2000 &rarr; &#36;{spy_price_end:.0f} today) meant {spy_months_skipped} of {n_months} months
+couldn't afford even one share and simply rolled the contribution forward.</p>
+<div class="card">{chart_dca}</div>
+<div class="card">{_table(dca_table)}</div>
+<p style="font-size:12px"><b>This flips the lump-sum conclusion from Section 1.</b> A
+recurring monthly contribution is itself a crude form of the crash protection the trend
+filter provides — you're never fully exposed with all your capital right before a top —
+so most of the drawdown-avoidance benefit the rotation strategy pays for (in missed
+melt-up years) is redundant here, while the cost (lagging strong bull markets) is not.
+Money invested via DCA overwhelmingly landed inside the 2009-2025 bull run, where the
+undiversified, always-fully-invested SPY captured 100% of the upside and the rotation
+strategy's structural bull-market drag compounded against a growing contribution base.
+For a monthly savings plan, a plain SPY (or S&amp;P 500 UCITS ETF) DCA is very likely the
+better choice; this rotation strategy is better suited to a lump sum invested with a
+long horizon across multiple market cycles, not to systematic monthly accumulation.</p>
 
 <div class="disclaimer">
 Backtest only — not investment advice. Yahoo Finance adjusted-close data; ETF expense
