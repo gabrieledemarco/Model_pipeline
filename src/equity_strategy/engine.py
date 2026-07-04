@@ -51,9 +51,19 @@ def run_portfolio_backtest(
     sectors: List[str],
     initial_capital: float = INIT_CAP,
     cost_bps: float = COST_BPS,
+    whole_shares: bool = False,
+    commission_per_leg: float = 0.0,
 ) -> dict:
     """
     Simulate the monthly sector-rotation portfolio over `panel`'s date range.
+
+    `whole_shares` and `commission_per_leg` model small-account frictions that
+    are invisible at institutional size: most EU retail brokers do not offer
+    fractional ETF shares, and many charge a flat fee per order rather than a
+    pure bps spread. Set `whole_shares=True` to floor every position to an
+    integer share count (uninvested residual falls back to CASH) and
+    `commission_per_leg` to a flat currency cost applied to every non-zero
+    turnover leg at each rebalance, to see the drag this adds at small capital.
 
     Returns dict with keys: equity, drawdown, trades, kpis
     """
@@ -91,6 +101,10 @@ def run_portfolio_backtest(
             turnover = sum(abs(target_weights[a] - prev_weights[a]) for a in assets)
             total_value -= total_value * turnover * cost_bps
 
+            n_legs_traded = sum(1 for a in assets
+                                 if abs(target_weights[a] - prev_weights[a]) > 1e-9 and a != "CASH")
+            total_value -= n_legs_traded * commission_per_leg
+
             # close out previous holding period -> trade records
             for a, pos in open_positions.items():
                 exit_price = price_row[a]
@@ -105,12 +119,26 @@ def run_portfolio_backtest(
             open_positions = {}
 
             regime = str(plan.loc[dt].get("regime", ""))
+            uninvested = 0.0
             for a in assets:
+                if a == "CASH":
+                    continue
                 w = target_weights[a]
-                shares[a] = (total_value * w) / price_row[a] if price_row[a] > 0 else 0.0
-                if w > 1e-9:
+                raw_shares = (total_value * w) / price_row[a] if price_row[a] > 0 else 0.0
+                if whole_shares:
+                    shares[a] = float(np.floor(raw_shares))
+                    uninvested += raw_shares * price_row[a] - shares[a] * price_row[a]
+                else:
+                    shares[a] = raw_shares
+                if w > 1e-9 and shares[a] > 0:
                     open_positions[a] = dict(entry_ts=dt, entry_price=price_row[a],
                                               shares=shares[a], weight=w, regime=regime)
+            cash_w = target_weights["CASH"]
+            cash_value = total_value * cash_w + uninvested
+            shares["CASH"] = cash_value / price_row["CASH"] if price_row["CASH"] > 0 else 0.0
+            if cash_value > 1e-9:
+                open_positions["CASH"] = dict(entry_ts=dt, entry_price=price_row["CASH"],
+                                               shares=shares["CASH"], weight=cash_w, regime=regime)
             prev_weights = target_weights
             started = True
 

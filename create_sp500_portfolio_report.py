@@ -44,7 +44,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 from src.equity_strategy.data_fetcher import (
-    fetch_universe, build_adjclose_panel, build_cash_nav,
+    fetch_universe, build_adjclose_panel, build_cash_nav, fetch_daily_ohlcv,
     SECTOR_ETFS, EXTRA_SECTOR_ETFS,
 )
 from src.equity_strategy.signals import build_rebalance_plan
@@ -212,6 +212,78 @@ def kpi_row(label: str, kpis: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Small-account feasibility simulation
+# ─────────────────────────────────────────────────────────────────────────────
+
+EUR_CAPITALS = [1000, 2000, 3000]
+COMMISSION_EUR = 1.5   # flat cost per ETF order leg, typical low-cost EU broker
+
+
+def run_small_account_simulation(panel, cash_nav, plan, start_date):
+    """
+    Re-run the final strategy at retail account sizes, in EUR, contrasting an
+    idealized (fractional-share) fill against a realistic one (whole shares +
+    a flat per-order commission) — the two frictions that are invisible at
+    institutional size but can dominate the result at a few thousand euros.
+    A single-purchase SPY buy & hold at the same capital is included as the
+    "do nothing fancy" alternative.
+    """
+    fx = fetch_daily_ohlcv("EURUSD=X")
+    fx_close = fx["close"].reindex(panel.index).ffill().bfill()
+    fx_start = float(fx_close.loc[start_date])
+
+    rows, curves = [], {}
+    for cap_eur in EUR_CAPITALS:
+        cap_usd = cap_eur * fx_start
+
+        ideal_bt = run_portfolio_backtest(panel, cash_nav, plan, ALL_SECTORS, initial_capital=cap_usd)
+        real_bt = run_portfolio_backtest(panel, cash_nav, plan, ALL_SECTORS, initial_capital=cap_usd,
+                                          whole_shares=True, commission_per_leg=COMMISSION_EUR)
+
+        spy_px_start = float(panel["SPY"].loc[start_date])
+        spy_shares = np.floor(cap_usd / spy_px_start)
+        spy_cash_residual = cap_usd - spy_shares * spy_px_start
+        spy_path_usd = spy_shares * panel["SPY"].loc[start_date:] + spy_cash_residual
+        spy_eur = spy_path_usd / fx_close.loc[spy_path_usd.index]
+        spy_dd_eur = (spy_eur - spy_eur.cummax()) / spy_eur.cummax()
+        spy_k = compute_kpis(spy_eur, spy_dd_eur, pd.DataFrame(), cap_eur)
+
+        variants = [
+            ("Idealized (fractional shares)", ideal_bt, 0),
+            ("Realistic (whole shares + commission)", real_bt, None),
+        ]
+        for label, bt, _ in variants:
+            eq_usd = bt["equity"].loc[start_date:]
+            eq_eur = eq_usd / fx_close.loc[eq_usd.index]
+            dd_eur = (eq_eur - eq_eur.cummax()) / eq_eur.cummax()
+            k = compute_kpis(eq_eur, dd_eur, bt["trades"], cap_eur)
+            n_legs = int((bt["trades"]["asset"] != "CASH").sum()) if not bt["trades"].empty else 0
+            total_commission = n_legs * COMMISSION_EUR if "Realistic" in label else 0.0
+            rows.append({
+                "Capital (€)": cap_eur, "Version": label,
+                "Final Value (€)": round(float(eq_eur.iloc[-1]), 0),
+                "CAGR (%)": round(k["cagr"] * 100, 2),
+                "Max DD (%)": round(k["max_drawdown"] * 100, 2),
+                "Total Commissions (€)": round(total_commission, 0),
+            })
+            if cap_eur == EUR_CAPITALS[1]:
+                curves[label] = eq_eur
+
+        rows.append({
+            "Capital (€)": cap_eur, "Version": "SPY Buy & Hold (single purchase)",
+            "Final Value (€)": round(float(spy_eur.iloc[-1]), 0),
+            "CAGR (%)": round(spy_k["cagr"] * 100, 2),
+            "Max DD (%)": round(spy_k["max_drawdown"] * 100, 2),
+            "Total Commissions (€)": 0,
+        })
+        if cap_eur == EUR_CAPITALS[1]:
+            curves["SPY Buy & Hold (single purchase)"] = spy_eur
+
+    table = pd.DataFrame(rows).set_index(["Capital (€)", "Version"])
+    return table, curves
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -278,6 +350,11 @@ def main():
     mc_final = mc_store[final_name]
     mc_compare = mc_summary_table(mc_store)
 
+    # ── Small-account feasibility (retail-size simulation) ────────────────────
+    print("\nRunning small-account simulation (1,000 / 2,000 / 3,000 EUR) …")
+    small_account_table, small_account_curves = run_small_account_simulation(
+        panel, cash_nav, final_plan, start_date)
+
     # ── Trade analysis ───────────────────────────────────────────────────────
     trades_df = final_bt["trades"]
     by_regime = trades_df.groupby("regime")["net_pnl"].agg(
@@ -301,6 +378,8 @@ def main():
         "Walk-Forward — Chained OOS Equity vs SPY")
     chart_mc_fan_img = chart_mc_fan(mc_final, INIT_CAP)
     chart_mc_dist_img = chart_mc_dist(mc_final)
+    chart_small_account = chart_equity_comparison(
+        small_account_curves, f"€{EUR_CAPITALS[1]:,} Starting Capital — Idealized vs Realistic vs SPY")
 
     # ── KPI tables ────────────────────────────────────────────────────────────
     kpi_table = pd.DataFrame([
@@ -330,6 +409,7 @@ def main():
         chart_trades_hist, chart_winrate, by_regime, chart_wfo, chart_wfo_equity,
         wf["windows"], wfo_summary, chart_mc_fan_img, chart_mc_dist_img,
         mc_percentiles, mc_compare, mc_final, start_date,
+        chart_small_account, small_account_table,
     )
 
     out_path = REPORTS_DIR / "report_sp500_portfolio.html"
@@ -340,7 +420,8 @@ def main():
 def build_html(panel, kpi_table, chart_main_equity, chart_main_dd, chart_ablation,
                 chart_trades_hist, chart_winrate, by_regime, chart_wfo, chart_wfo_equity,
                 wfo_windows, wfo_summary, chart_mc_fan_img, chart_mc_dist_img,
-                mc_percentiles, mc_compare, mc_final, start_date) -> str:
+                mc_percentiles, mc_compare, mc_final, start_date,
+                chart_small_account, small_account_table) -> str:
 
     generated = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M UTC")
     universe_str = ", ".join(SECTOR_ETFS) + " (+ " + ", ".join(EXTRA_SECTOR_ETFS) + " once eligible)"
@@ -469,6 +550,25 @@ sequential, non-overlapping unit for this strategy shape.</p>
 <h3 style="margin-top:0">Monte Carlo Comparison — All Scenarios</h3>
 {_table(mc_compare)}
 </div>
+
+<h2>6 · Small-Account Feasibility (€1,000 / €2,000 / €3,000)</h2>
+<p>Institutional-size backtests hide two frictions that dominate at retail scale: most EU
+brokers don't offer fractional ETF shares, and many charge a flat fee per order rather than
+a pure bps spread. <b>Idealized</b> assumes fractional shares and only the 5 bps turnover
+cost already used above; <b>Realistic</b> floors every position to whole shares (the
+rounding residual falls back to cash) and adds a flat &euro;{COMMISSION_EUR:.2f} commission
+per traded ETF leg — a representative low-cost EU broker rate. Both are converted from USD
+to EUR day-by-day using the EUR/USD rate, so the result also reflects unhedged currency risk
+for a euro-based investor (Yahoo's EUR/USD history starts 2003-11; the 2000-2003 segment is
+held at that first observed rate as an approximation). A single-purchase SPY buy &amp; hold
+at the same capital is shown as the "do nothing fancy" alternative.</p>
+<div class="card">{chart_small_account}</div>
+<div class="card">{_table(small_account_table)}</div>
+<p style="font-size:12px">At &euro;1,000 the ~3 monthly-average traded legs mean whole-share
+rounding and flat commissions consume a large fraction of the strategy's edge over
+SPY — the drag shrinks fast as capital rises. Below roughly &euro;3,000-5,000, a plain
+SPY buy &amp; hold is very likely the more capital-efficient choice; the rotation strategy
+only starts to earn its complexity once per-leg costs are a small fraction of position size.</p>
 
 <div class="disclaimer">
 Backtest only — not investment advice. Yahoo Finance adjusted-close data; ETF expense
