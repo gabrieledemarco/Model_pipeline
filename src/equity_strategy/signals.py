@@ -90,6 +90,7 @@ def build_rebalance_plan(
     mom_lookbacks: Tuple[int, ...] = MOM_LOOKBACKS,
     trend_months: int = TREND_MONTHS,
     trend_band: float = TREND_BAND,
+    trend_asset: str = "SPY",
 ) -> pd.DataFrame:
     """
     Compute target portfolio weights at every monthly rebalance execution date
@@ -98,6 +99,10 @@ def build_rebalance_plan(
     `max_leverage` caps the vol-target scalar above 1.0 (e.g. 1.2 allows up
     to 20% leverage, financed/rebated at the cash rate, when realised vol is
     well below target); default 1.0 keeps the book fully unlevered.
+
+    `trend_asset` is the column used for the regime/trend filter (defaults to
+    'SPY'); pass the traded asset itself (e.g. 'ACWI') when the universe isn't
+    the S&P 500 sectors, so the regime signal matches what's actually held.
 
     Returns a DataFrame indexed by execution date with columns
     [sectors..., 'CASH', 'regime', 'vol_scalar', 'selected'].
@@ -121,7 +126,7 @@ def build_rebalance_plan(
         ranked = scores.sort_values(ascending=False)
         picks = list(ranked.index[:top_k])
 
-        risk_on = trend_regime(panel["SPY"], decision_date, trend_months,
+        risk_on = trend_regime(panel[trend_asset], decision_date, trend_months,
                                 prev_regime=prev_regime, band=trend_band) \
                   if use_trend_filter else True
         prev_regime = risk_on
