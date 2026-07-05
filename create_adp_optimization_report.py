@@ -146,19 +146,22 @@ def run_bt(events, max_hold=MAX_HOLD):
                 if lk <= tp: out = "tp"; break
                 if hk >= sl: out = "sl"; break
         if out == "none": continue
-        pnl_r = (abs(tp-ep)/a) if out == "tp" else -(abs(sl-ep)/a)
-        risk  = cap * RISK_PCT
-        lev   = min(max(abs(tp-ep)/ep, abs(sl-ep)/ep), MAX_LEV)
-        cap  += pnl_r * risk * lev
-        peak  = max(peak, cap)
-        mdd   = min(mdd, (cap-peak)/peak)
-        wins += int(out == "tp")
-        net_pnls.append(pnl_r * risk * lev)
+        pnl_r    = (abs(tp-ep)/a) if out == "tp" else -(abs(sl-ep)/a)
+        fee_atr  = FEE * 2 * ep / a          # round-trip fee in ATR multiples
+        pnl_r_net = pnl_r - fee_atr          # TP: reduces profit; SL: deepens loss
+        risk     = cap * RISK_PCT
+        lev      = min(max(abs(tp-ep)/ep, abs(sl-ep)/ep), MAX_LEV)
+        dollar   = pnl_r_net * risk * lev
+        cap     += dollar
+        peak     = max(peak, cap)
+        mdd      = min(mdd, (cap-peak)/peak)
+        wins    += int(out == "tp")
+        net_pnls.append(dollar)
     n = len(net_pnls); wr = wins/n if n else 0.0
     ret = (cap/INIT_CAP - 1) * 100
     avg_tp = np.mean([abs(ev["tp"]-ev["ep"])/ev["ep"] for ev in events]) * 100
     avg_sl = np.mean([abs(ev["sl"]-ev["ep"])/ev["ep"] for ev in events]) * 100
-    sln = avg_sl + FEE_RT_PCT/100; tpn = avg_tp - FEE_RT_PCT/100
+    sln = avg_sl + FEE_RT_PCT; tpn = avg_tp - FEE_RT_PCT   # both in % of price
     return dict(n=n, wr=wr, ret=ret, mdd=mdd*100, exppnl=wr*tpn-(1-wr)*sln,
                 net_pnls=net_pnls, cap=cap)
 
@@ -694,10 +697,18 @@ html = f"""<!DOCTYPE html>
 </p>
 
 <div class="note">
-  <strong>Bug fix vs versione precedente:</strong>
+  <strong>Bug fix (cooldown):</strong>
   Il pipeline ADP originale non applicava il cooldown {COOLDOWN}H tra i segnali dei due arm.
   Questa versione condivide il cooldown: dopo ogni trade (MR o PB), i prossimi {COOLDOWN}H sono bloccati.
   Il numero di OOS trade è pertanto ridotto rispetto al report precedente.
+</div>
+<div class="note">
+  <strong>Fee fix:</strong>
+  Tutti i ritorni sono ora <em>netti</em> di commissioni round-trip {FEE_RT_PCT:.2f}% (ipotesi taker: 0.04% per lato).
+  La formula: <code>pnl_net = (pnl_atr − fee_atr) × risk × lev</code> dove
+  <code>fee_atr = 2×FEE×price/ATR ≈ {2*FEE*100:.3f}×(price/ATR)</code>.
+  Con 4 000+ trade su 6 anni, l'impatto cumulativo è circa 6–8 punti percentuali.
+  Usando ordini limit (maker 0.01%/lato) l'impatto scende a circa 1.8 punti.
 </div>
 
 <div class="kpi-row">

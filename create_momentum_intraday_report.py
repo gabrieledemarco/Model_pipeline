@@ -205,10 +205,12 @@ def run_bt(events, max_hold=MAX_HOLD):
                 if lk <= tp: out = "tp"; break
                 if hk >= sl: out = "sl"; break
         if out == "none": continue
-        pnl_r = (abs(tp-ep)/a) if out == "tp" else -(abs(sl-ep)/a)
-        risk  = cap * RISK_PCT
-        lev   = min(max(abs(tp-ep)/ep, abs(sl-ep)/ep), MAX_LEV)
-        dpnl  = pnl_r * risk * lev
+        pnl_r     = (abs(tp-ep)/a) if out == "tp" else -(abs(sl-ep)/a)
+        fee_atr   = FEE * 2 * ep / a
+        pnl_r_net = pnl_r - fee_atr
+        risk      = cap * RISK_PCT
+        lev       = min(max(abs(tp-ep)/ep, abs(sl-ep)/ep), MAX_LEV)
+        dpnl      = pnl_r_net * risk * lev
         cap += dpnl; peak = max(peak, cap)
         mdd  = min(mdd, (cap-peak)/peak)
         wins += int(out == "tp"); net_pnls.append(dpnl)
@@ -216,7 +218,7 @@ def run_bt(events, max_hold=MAX_HOLD):
     ret = (cap/INIT_CAP - 1) * 100
     avg_tp = np.mean([abs(ev["tp"]-ev["ep"])/ev["ep"] for ev in events]) * 100
     avg_sl = np.mean([abs(ev["sl"]-ev["ep"])/ev["ep"] for ev in events]) * 100
-    sln = avg_sl + FEE_RT_PCT/100; tpn = avg_tp - FEE_RT_PCT/100
+    sln = avg_sl + FEE_RT_PCT; tpn = avg_tp - FEE_RT_PCT
     return dict(n=n, wr=wr, ret=ret, mdd=mdd*100, exppnl=wr*tpn-(1-wr)*sln,
                 net_pnls=net_pnls, cap=cap)
 
