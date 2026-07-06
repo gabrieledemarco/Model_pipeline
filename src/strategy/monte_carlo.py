@@ -147,6 +147,242 @@ def run_monte_carlo(
     }
 
 
+def run_monte_carlo_block(
+    trades_df: pd.DataFrame,
+    initial_capital: float = 100_000.0,
+    n_sims: int = 1_000,
+    block_size: int = 20,
+    seed: int = 42,
+) -> dict:
+    """
+    Block-bootstrap variant of run_monte_carlo.
+
+    The plain (i.i.d.) bootstrap resamples individual trades independently,
+    which implicitly assumes trade outcomes are serially uncorrelated. Real
+    strategies often violate this: a regime-detection error, a liquidity
+    crunch, or a stretch of adverse market conditions tends to hurt several
+    *consecutive* trades together, not a random scattered subset. Resampling
+    contiguous blocks of `block_size` consecutive trades (with replacement,
+    wrapping around the sequence) partially preserves that local
+    autocorrelation structure, typically producing wider (more realistic)
+    drawdown tails than the i.i.d. version for the same trade history.
+
+    Same return shape/keys as run_monte_carlo. Falls back to block_size=1
+    (equivalent to plain i.i.d. bootstrap) if block_size >= n_trades.
+    """
+    if trades_df is None or trades_df.empty or "net_pnl" not in trades_df.columns:
+        return {}
+
+    rng = np.random.default_rng(seed)
+    base_pcts = _trade_pct_returns(trades_df, initial_capital)
+    n_trades  = len(base_pcts)
+    bs = max(1, min(block_size, n_trades))
+    n_blocks_needed = int(np.ceil(n_trades / bs))
+    max_start = n_trades  # allow wrap-around start positions
+
+    paths        = np.zeros((n_sims, n_trades + 1))
+    final_equity = np.zeros(n_sims)
+    max_drawdown = np.zeros(n_sims)
+    sharpes      = np.zeros(n_sims)
+
+    for s in range(n_sims):
+        starts = rng.integers(0, max_start, size=n_blocks_needed)
+        blocks = [np.take(base_pcts, np.arange(st, st + bs) % n_trades)
+                  for st in starts]
+        sampled = np.concatenate(blocks)[:n_trades]
+        eq = _sim_path(sampled, initial_capital)
+        paths[s]        = eq
+        final_equity[s] = eq[-1]
+        max_drawdown[s] = _max_dd(eq)
+        sharpes[s]      = _sharpe(sampled)
+
+    total_return = (final_equity - initial_capital) / initial_capital
+
+    pcts = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+    summary = pd.DataFrame({
+        "percentile":   pcts,
+        "final_equity": np.percentile(final_equity, pcts),
+        "total_return%": np.percentile(total_return * 100, pcts),
+        "max_drawdown%": np.percentile(max_drawdown * 100, pcts),
+        "sharpe":        np.percentile(sharpes, pcts),
+    })
+
+    return {
+        "paths":           paths,
+        "final_equity":    final_equity,
+        "max_drawdown":    max_drawdown,
+        "total_return":    total_return,
+        "sharpe":          sharpes,
+        "summary":         summary,
+        "p_ruin":          float((final_equity < 0.5 * initial_capital).mean()),
+        "p_profit":        float((final_equity > initial_capital).mean()),
+        "n_trades":        n_trades,
+        "n_sims":          n_sims,
+        "initial_capital": initial_capital,
+        "block_size":      bs,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deflated Sharpe Ratio (Bailey & López de Prado, 2014)
+#
+# Corrects the observed Sharpe ratio for two distinct biases:
+#   1. Non-normality of trade returns (skewness/kurtosis)   → PSR
+#   2. Selection bias from testing N variants and reporting the best one → SR0
+#
+# Reference: "The Deflated Sharpe Ratio: Correcting for Selection Bias,
+# Backtest Overfitting and Non-Normality", Bailey & López de Prado, JPM 2014.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EULER_MASCHERONI = 0.5772156649015329
+
+
+def trade_level_sharpe(pnls) -> float:
+    """Sharpe ratio computed directly on a trade P&L sequence (not %-returns)."""
+    arr = np.asarray(pnls, dtype=float)
+    if len(arr) < 2:
+        return 0.0
+    std = arr.std(ddof=1)
+    if std <= 0:
+        return 0.0
+    return float(arr.mean() / std * np.sqrt(len(arr)))
+
+
+def _skew_kurt(pnls) -> tuple:
+    """Sample skewness (γ3) and excess-kurtosis+3 (γ4, Pearson convention)."""
+    arr = np.asarray(pnls, dtype=float)
+    n = len(arr)
+    if n < 3:
+        return 0.0, 3.0
+    std = arr.std(ddof=1)
+    if std <= 0:
+        return 0.0, 3.0
+    z = (arr - arr.mean()) / std
+    skew = float(np.mean(z ** 3))
+    kurt = float(np.mean(z ** 4))          # Pearson kurtosis (normal = 3.0)
+    return skew, kurt
+
+
+def expected_max_sharpe(sr_std_across_trials: float, n_trials: int) -> float:
+    """
+    SR0 = expected maximum Sharpe ratio observable by chance alone when
+    N independent (or weakly correlated) strategies with true skill = 0
+    are backtested, given the empirical cross-sectional dispersion of
+    their Sharpe ratios.
+
+    This is the "how good does the best-of-N look purely by luck" benchmark
+    that the deflated Sharpe ratio tests the winner against.
+    """
+    if n_trials <= 1 or sr_std_across_trials <= 0:
+        return 0.0
+    from scipy.stats import norm
+    z1 = norm.ppf(1.0 - 1.0 / n_trials)
+    z2 = norm.ppf(1.0 - 1.0 / (n_trials * np.e))
+    return float(sr_std_across_trials *
+                 ((1 - _EULER_MASCHERONI) * z1 + _EULER_MASCHERONI * z2))
+
+
+def probabilistic_sharpe_ratio(
+    sr_observed: float,
+    sr_benchmark: float,
+    n_obs: int,
+    skew: float = 0.0,
+    kurt: float = 3.0,
+) -> float:
+    """
+    PSR(SR*) = Φ( (SR_hat − SR*) · sqrt(T−1) / sqrt(1 − γ3·SR_hat + (γ4−1)/4·SR_hat²) )
+
+    Probability that the *true* Sharpe ratio exceeds sr_benchmark, given the
+    observed Sharpe, sample size, and the distribution's skew/kurtosis
+    (fat tails and negative skew — both common in stop-loss/take-profit
+    trade return distributions — inflate the variance of the Sharpe
+    estimator and are penalised here).
+    """
+    if n_obs < 2:
+        return 0.0
+    from scipy.stats import norm
+    denom = 1 - skew * sr_observed + ((kurt - 1) / 4) * sr_observed ** 2
+    if denom <= 0:
+        return 0.0
+    stat = (sr_observed - sr_benchmark) * np.sqrt(n_obs - 1) / np.sqrt(denom)
+    return float(norm.cdf(stat))
+
+
+def deflated_sharpe_ratio_family(
+    results: list,
+    sharpe_key: str = "sharpe_hat",
+    dsr_key: str = "dsr",
+    pnls_key: str = "net_pnls",
+) -> list:
+    """
+    Apply the Deflated Sharpe Ratio correction across a family of N backtested
+    variants (e.g. every combination scored in a grid/parameter search).
+
+    Parameters
+    ----------
+    results : list of dict, each with at least:
+        <pnls_key> : list/array of trade P&Ls (dollar or ATR-multiple units)
+    sharpe_key, dsr_key : output field names (override to compute the
+        correction over multiple, differently-scoped families on the same
+        dict objects without clobbering each other — e.g. a strict global
+        family vs. a narrower, more homogeneous sub-family).
+    pnls_key : input field name holding each variant's trade P&L list
+        (override if the caller's result dicts use a different key, e.g.
+        "oos_pnls").
+
+    Returns
+    -------
+    Same list, with each dict augmented in-place with:
+        sharpe_key : trade-level Sharpe ratio of that variant
+        dsr_key    : Deflated Sharpe Ratio ∈ [0, 1]
+                       (probability true Sharpe > 0, net of selection bias
+                        across all `len(results)` trials and non-normality)
+
+    Notes
+    -----
+    Must be called once, after the full family of trials has been scored —
+    SR0 (the "best-of-N by luck alone" benchmark) depends on the empirical
+    cross-sectional dispersion of Sharpe ratios across the *entire* family,
+    so it cannot be computed one variant at a time during the scan.
+
+    Caveat: SR0 is estimated from the empirical cross-sectional spread of
+    Sharpe ratios in `results`. If the family mixes wildly heterogeneous
+    trial quality (e.g. a broad grid search including many degenerate/
+    clearly-miscalibrated configurations alongside a few good ones), that
+    spread — and hence SR0 — can be inflated well past what any individual
+    variant achieves, making the correction maximally conservative. Prefer
+    scoping `results` to a family of genuinely comparable candidates
+    (e.g. the final parameter sub-scan) when that reading matters more than
+    the strict, whole-search-space correction.
+    """
+    scored = [r for r in results if len(r.get(pnls_key, [])) >= 5]
+    n_trials = len(results)
+    if n_trials < 2 or not scored:
+        for r in results:
+            r[sharpe_key] = trade_level_sharpe(r.get(pnls_key, []))
+            r[dsr_key] = 0.0
+        return results
+
+    for r in results:
+        r[sharpe_key] = trade_level_sharpe(r.get(pnls_key, []))
+
+    sr_values = np.array([r[sharpe_key] for r in scored])
+    sr_std = float(sr_values.std(ddof=1)) if len(sr_values) > 1 else 0.0
+    sr0 = expected_max_sharpe(sr_std, n_trials)
+
+    for r in results:
+        pnls = r.get(pnls_key, [])
+        n_obs = len(pnls)
+        if n_obs < 5:
+            r[dsr_key] = 0.0
+            continue
+        skew, kurt = _skew_kurt(pnls)
+        r[dsr_key] = probabilistic_sharpe_ratio(
+            r[sharpe_key], sr0, n_obs, skew, kurt
+        )
+    return results
+
+
 def mc_summary_table(mc_store: dict) -> pd.DataFrame:
     """
     Aggregate MC stats for multiple scenarios into a single comparison table.
