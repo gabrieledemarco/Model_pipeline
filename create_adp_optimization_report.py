@@ -42,7 +42,7 @@ from hmmlearn import hmm as hmmlib
 
 from src.strategy.data_fetcher import fetch_extended_data
 from src.strategy.indicators import add_indicators
-from src.strategy.monte_carlo import run_monte_carlo
+from src.strategy.monte_carlo import run_monte_carlo, deflated_sharpe_ratio_family
 
 # ── Config ────────────────────────────────────────────────────────────────────
 INIT_CAP   = 100_000.0
@@ -56,6 +56,7 @@ N_SIMS     = 5_000
 COOLDOWN   = 4
 MAX_HOLD   = 48
 WARMUP     = 200
+DSR_THRESHOLD = 0.95   # Deflated Sharpe Ratio gate (Bailey & Lopez de Prado, 2014)
 
 WF_TRAIN_M = 6
 WF_OOS_M   = 2
@@ -465,22 +466,46 @@ for r in ph2_ranked[:10]:
           f"n={r['oos_n']}  mdd={r['oos_mdd']:.1f}%")
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DEFLATED SHARPE RATIO — post-hoc correction across the full family of trials
+#
+# SR0 (the "best-of-N by luck alone" benchmark) depends on the empirical
+# cross-sectional dispersion of Sharpe ratios across ALL variants scored in
+# this run, so it can only be computed once the full scan (Phase 0+1+2) is
+# complete. This mutates the dict objects in-place, so PH1_RESULTS/PH2_RESULTS
+# (same references) pick up "dsr"/"validated_dsr" too.
+# ══════════════════════════════════════════════════════════════════════════════
+deflated_sharpe_ratio_family(ALL_RESULTS)
+for r in ALL_RESULTS:
+    r["validated_dsr"] = r["validated"] and r["dsr"] >= DSR_THRESHOLD
+
+n_trials_dsr = len(ALL_RESULTS)
+print(f"\n{SEP2}")
+print(f"Deflated Sharpe Ratio  (N={n_trials_dsr} trials, threshold={DSR_THRESHOLD})")
+print(SEP2)
+for r in sorted(ALL_RESULTS, key=lambda r: r["dsr"], reverse=True)[:10]:
+    flag = "✅" if r["validated_dsr"] else ("⚠" if r["validated"] else "✗")
+    print(f"  {flag} {r['id']:<36}  SR_hat={r['sharpe_hat']:+.3f}  "
+          f"DSR={r['dsr']:.3f}  pp={r['mc_p_profit']:.3f}")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # GLOBAL SUMMARY
 # ══════════════════════════════════════════════════════════════════════════════
-all_valid = [r for r in ALL_RESULTS if r["validated"]]
+all_valid = [r for r in ALL_RESULTS if r["validated_dsr"]]
 all_ranked = sorted(ALL_RESULTS, key=lambda r: r["oos_ret"], reverse=True)
 
 print(f"\n{SEP2}\nGLOBAL SUMMARY — {len(ALL_RESULTS)} varianti\n{SEP2}")
-print(f"  Validated: {len(all_valid)}/{len(ALL_RESULTS)}\n")
+print(f"  Validated (raw pp/p_ruin gate): "
+      f"{sum(r['validated'] for r in ALL_RESULTS)}/{len(ALL_RESULTS)}")
+print(f"  Validated (DSR-adjusted gate):  {len(all_valid)}/{len(ALL_RESULTS)}\n")
 print(f"  {'ID':<36}  {'n':>5}  {'WR':>6}  {'Ret':>7}  "
-      f"{'MDD':>6}  {'pp':>5}  {'pr':>5}")
+      f"{'MDD':>6}  {'pp':>5}  {'pr':>5}  {'DSR':>5}")
 print(f"  {'-'*36}  {'-'*5}  {'-'*6}  {'-'*7}  "
-      f"{'-'*6}  {'-'*5}  {'-'*5}")
+      f"{'-'*6}  {'-'*5}  {'-'*5}  {'-'*5}")
 for r in all_ranked[:20]:
-    flag = "✅" if r["validated"] else ("⚠" if r["oos_ret"] > 0 else "✗")
+    flag = "✅" if r["validated_dsr"] else ("⚠" if r["oos_ret"] > 0 else "✗")
     print(f"  {flag} {r['id']:<36}  {r['oos_n']:>5}  {r['oos_wr']:>6.1%}  "
           f"{r['oos_ret']:>+6.1f}%  {r['oos_mdd']:>6.1f}%  "
-          f"{r['mc_p_profit']:>5.3f}  {r['mc_p_ruin']:>5.3f}")
+          f"{r['mc_p_profit']:>5.3f}  {r['mc_p_ruin']:>5.3f}  {r['dsr']:>5.3f}")
 print(SEP2)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -593,7 +618,9 @@ def table_rows(results: list[dict], show_params: str = "none") -> str:
         rc = "green" if r["oos_ret"] > 0 else "red"
         pc = "green" if r["mc_p_profit"] > 0.90 else ("yellow" if r["mc_p_profit"] > 0.60 else "red")
         qc = "green" if r["mc_p_ruin"] < 0.05 else "red"
-        flag = ("✅" if r["validated"] else ("⚠" if r["oos_ret"] > 0 else "✗"))
+        dsr = r.get("dsr", 0.0)
+        dc = "green" if dsr >= DSR_THRESHOLD else ("yellow" if dsr >= 0.60 else "red")
+        flag = ("✅" if r.get("validated_dsr", r["validated"]) else ("⚠" if r["oos_ret"] > 0 else "✗"))
         extra = ""
         if show_params == "pb":
             extra = (f"<td>{r.get('t_ema','')}</td>"
@@ -611,6 +638,7 @@ def table_rows(results: list[dict], show_params: str = "none") -> str:
                  f"<td class='red'>{r['oos_mdd']:.1f}%</td>"
                  f"<td class='{pc}'>{r['mc_p_profit']:.3f}</td>"
                  f"<td class='{qc}'>{r['mc_p_ruin']:.3f}</td>"
+                 f"<td class='{dc}'>{dsr:.3f}</td>"
                  f"<td>{r['avg_ranging_pct']:.0f}%</td>"
                  f"<td>{flag}</td></tr>")
     return rows
@@ -710,6 +738,15 @@ html = f"""<!DOCTYPE html>
   Con 4 000+ trade su 6 anni, l'impatto cumulativo è circa 6–8 punti percentuali.
   Usando ordini limit (maker 0.01%/lato) l'impatto scende a circa 1.8 punti.
 </div>
+<div class="note">
+  <strong>Deflated Sharpe Ratio (DSR):</strong>
+  Su {len(ALL_RESULTS)} varianti testate, la probabilità di trovare per puro caso il "vincitore" con Sharpe
+  elevato è tutt'altro che trascurabile (selection bias). Il DSR (Bailey &amp; López de Prado, 2014) corregge
+  lo Sharpe osservato di ogni variante confrontandolo con lo Sharpe massimo atteso "by luck alone" su
+  {len(ALL_RESULTS)} tentativi (SR0), tenendo conto anche di skewness/kurtosis della distribuzione dei trade.
+  Il gate di validazione ora richiede <code>DSR ≥ {DSR_THRESHOLD}</code> oltre a P(profit)&gt;0.90 e P(ruin)&lt;0.05.
+  Colonna <code>DSR</code> nelle tabelle sottostanti; il flag ✅ riflette il gate combinato.
+</div>
 
 <div class="kpi-row">
   <div class="kpi"><div class="val">{len(ALL_RESULTS)}</div>
@@ -746,7 +783,7 @@ html = f"""<!DOCTYPE html>
   <p class="desc">ADP-MR24-PB100x8-d03 con cooldown condiviso. Confronto diretto con il risultato precedente (+20.9%).</p>
   <div class="tbl-wrap"><table class="tbl">
     <thead><tr><th>ID</th><th>OOS n</th><th>WR</th><th>OOS Ret</th>
-      <th>MDD</th><th>P(profit)</th><th>P(ruin)</th><th>Ranging%</th><th>Val</th>
+      <th>MDD</th><th>P(profit)</th><th>P(ruin)</th><th>DSR</th><th>Ranging%</th><th>Val</th>
     </tr></thead>
     <tbody>{base_tbl_rows}</tbody>
   </table></div>
@@ -758,7 +795,7 @@ html = f"""<!DOCTYPE html>
   {hm_dev_pbema}
   <div class="tbl-wrap"><table class="tbl">
     <thead><tr><th>ID</th>{ph1_th}<th>OOS n</th><th>WR</th><th>OOS Ret</th>
-      <th>MDD</th><th>P(profit)</th><th>P(ruin)</th><th>Ranging%</th><th>Val</th>
+      <th>MDD</th><th>P(profit)</th><th>P(ruin)</th><th>DSR</th><th>Ranging%</th><th>Val</th>
     </tr></thead>
     <tbody>{ph1_tbl_rows}</tbody>
   </table></div>
@@ -770,7 +807,7 @@ html = f"""<!DOCTYPE html>
   {hm_mrwin_mrthr}
   <div class="tbl-wrap"><table class="tbl">
     <thead><tr><th>ID</th>{ph2_th}<th>OOS n</th><th>WR</th><th>OOS Ret</th>
-      <th>MDD</th><th>P(profit)</th><th>P(ruin)</th><th>Ranging%</th><th>Val</th>
+      <th>MDD</th><th>P(profit)</th><th>P(ruin)</th><th>DSR</th><th>Ranging%</th><th>Val</th>
     </tr></thead>
     <tbody>{ph2_tbl_rows}</tbody>
   </table></div>
