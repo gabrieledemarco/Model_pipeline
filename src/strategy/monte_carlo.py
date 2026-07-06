@@ -232,7 +232,12 @@ def probabilistic_sharpe_ratio(
     return float(norm.cdf(stat))
 
 
-def deflated_sharpe_ratio_family(results: list) -> list:
+def deflated_sharpe_ratio_family(
+    results: list,
+    sharpe_key: str = "sharpe_hat",
+    dsr_key: str = "dsr",
+    pnls_key: str = "net_pnls",
+) -> list:
     """
     Apply the Deflated Sharpe Ratio correction across a family of N backtested
     variants (e.g. every combination scored in a grid/parameter search).
@@ -240,13 +245,20 @@ def deflated_sharpe_ratio_family(results: list) -> list:
     Parameters
     ----------
     results : list of dict, each with at least:
-        "net_pnls" : list/array of trade P&Ls (dollar or ATR-multiple units)
+        <pnls_key> : list/array of trade P&Ls (dollar or ATR-multiple units)
+    sharpe_key, dsr_key : output field names (override to compute the
+        correction over multiple, differently-scoped families on the same
+        dict objects without clobbering each other — e.g. a strict global
+        family vs. a narrower, more homogeneous sub-family).
+    pnls_key : input field name holding each variant's trade P&L list
+        (override if the caller's result dicts use a different key, e.g.
+        "oos_pnls").
 
     Returns
     -------
     Same list, with each dict augmented in-place with:
-        "sharpe_hat" : trade-level Sharpe ratio of that variant
-        "dsr"        : Deflated Sharpe Ratio ∈ [0, 1]
+        sharpe_key : trade-level Sharpe ratio of that variant
+        dsr_key    : Deflated Sharpe Ratio ∈ [0, 1]
                        (probability true Sharpe > 0, net of selection bias
                         across all `len(results)` trials and non-normality)
 
@@ -256,31 +268,41 @@ def deflated_sharpe_ratio_family(results: list) -> list:
     SR0 (the "best-of-N by luck alone" benchmark) depends on the empirical
     cross-sectional dispersion of Sharpe ratios across the *entire* family,
     so it cannot be computed one variant at a time during the scan.
+
+    Caveat: SR0 is estimated from the empirical cross-sectional spread of
+    Sharpe ratios in `results`. If the family mixes wildly heterogeneous
+    trial quality (e.g. a broad grid search including many degenerate/
+    clearly-miscalibrated configurations alongside a few good ones), that
+    spread — and hence SR0 — can be inflated well past what any individual
+    variant achieves, making the correction maximally conservative. Prefer
+    scoping `results` to a family of genuinely comparable candidates
+    (e.g. the final parameter sub-scan) when that reading matters more than
+    the strict, whole-search-space correction.
     """
-    scored = [r for r in results if len(r.get("net_pnls", [])) >= 5]
+    scored = [r for r in results if len(r.get(pnls_key, [])) >= 5]
     n_trials = len(results)
     if n_trials < 2 or not scored:
         for r in results:
-            r["sharpe_hat"] = trade_level_sharpe(r.get("net_pnls", []))
-            r["dsr"] = 0.0
+            r[sharpe_key] = trade_level_sharpe(r.get(pnls_key, []))
+            r[dsr_key] = 0.0
         return results
 
     for r in results:
-        r["sharpe_hat"] = trade_level_sharpe(r.get("net_pnls", []))
+        r[sharpe_key] = trade_level_sharpe(r.get(pnls_key, []))
 
-    sr_values = np.array([r["sharpe_hat"] for r in scored])
+    sr_values = np.array([r[sharpe_key] for r in scored])
     sr_std = float(sr_values.std(ddof=1)) if len(sr_values) > 1 else 0.0
     sr0 = expected_max_sharpe(sr_std, n_trials)
 
     for r in results:
-        pnls = r.get("net_pnls", [])
+        pnls = r.get(pnls_key, [])
         n_obs = len(pnls)
         if n_obs < 5:
-            r["dsr"] = 0.0
+            r[dsr_key] = 0.0
             continue
         skew, kurt = _skew_kurt(pnls)
-        r["dsr"] = probabilistic_sharpe_ratio(
-            r["sharpe_hat"], sr0, n_obs, skew, kurt
+        r[dsr_key] = probabilistic_sharpe_ratio(
+            r[sharpe_key], sr0, n_obs, skew, kurt
         )
     return results
 

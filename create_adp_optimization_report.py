@@ -474,18 +474,43 @@ for r in ph2_ranked[:10]:
 # complete. This mutates the dict objects in-place, so PH1_RESULTS/PH2_RESULTS
 # (same references) pick up "dsr"/"validated_dsr" too.
 # ══════════════════════════════════════════════════════════════════════════════
-deflated_sharpe_ratio_family(ALL_RESULTS)
+deflated_sharpe_ratio_family(ALL_RESULTS, pnls_key="oos_pnls")  # strict, whole-search-space family (N=77)
+
+# Also compute a narrower-family DSR restricted to Phase 2 (the actual final
+# candidate pool: PB already fixed from Phase 1, only MR params vary — a
+# genuinely homogeneous/comparable set of N=16 trials, unlike the full 77
+# which mixes many deliberately-miscalibrated Phase 1 PB configs whose
+# extreme negative Sharpes inflate the global SR0 benchmark past what any
+# variant can clear (see deflated_sharpe_ratio_family docstring caveat).
+if PH2_RESULTS:
+    deflated_sharpe_ratio_family(PH2_RESULTS, sharpe_key="sharpe_hat_ph2", dsr_key="dsr_ph2",
+                                  pnls_key="oos_pnls")
+
 for r in ALL_RESULTS:
-    r["validated_dsr"] = r["validated"] and r["dsr"] >= DSR_THRESHOLD
+    r["validated_dsr_global"] = r["validated"] and r["dsr"] >= DSR_THRESHOLD
+    # Authoritative pipeline gate: Phase-2-family DSR where available (more
+    # defensible — comparable trial pool), else fall back to the global one.
+    dsr_local = r.get("dsr_ph2", r["dsr"])
+    r["validated_dsr"] = r["validated"] and dsr_local >= DSR_THRESHOLD
 
 n_trials_dsr = len(ALL_RESULTS)
 print(f"\n{SEP2}")
-print(f"Deflated Sharpe Ratio  (N={n_trials_dsr} trials, threshold={DSR_THRESHOLD})")
+print(f"Deflated Sharpe Ratio — global family  (N={n_trials_dsr} trials, threshold={DSR_THRESHOLD})")
 print(SEP2)
 for r in sorted(ALL_RESULTS, key=lambda r: r["dsr"], reverse=True)[:10]:
-    flag = "✅" if r["validated_dsr"] else ("⚠" if r["validated"] else "✗")
+    flag = "✅" if r["validated_dsr_global"] else ("⚠" if r["validated"] else "✗")
     print(f"  {flag} {r['id']:<36}  SR_hat={r['sharpe_hat']:+.3f}  "
           f"DSR={r['dsr']:.3f}  pp={r['mc_p_profit']:.3f}")
+
+if PH2_RESULTS:
+    print(f"\n{SEP2}")
+    print(f"Deflated Sharpe Ratio — Phase 2 family only  "
+          f"(N={len(PH2_RESULTS)} trials, threshold={DSR_THRESHOLD})")
+    print(SEP2)
+    for r in sorted(PH2_RESULTS, key=lambda r: r["dsr_ph2"], reverse=True)[:10]:
+        flag = "✅" if r["validated_dsr"] else ("⚠" if r["validated"] else "✗")
+        print(f"  {flag} {r['id']:<36}  SR_hat={r['sharpe_hat_ph2']:+.3f}  "
+              f"DSR={r['dsr_ph2']:.3f}  pp={r['mc_p_profit']:.3f}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GLOBAL SUMMARY
@@ -498,14 +523,16 @@ print(f"  Validated (raw pp/p_ruin gate): "
       f"{sum(r['validated'] for r in ALL_RESULTS)}/{len(ALL_RESULTS)}")
 print(f"  Validated (DSR-adjusted gate):  {len(all_valid)}/{len(ALL_RESULTS)}\n")
 print(f"  {'ID':<36}  {'n':>5}  {'WR':>6}  {'Ret':>7}  "
-      f"{'MDD':>6}  {'pp':>5}  {'pr':>5}  {'DSR':>5}")
+      f"{'MDD':>6}  {'pp':>5}  {'pr':>5}  {'DSR(N=77)':>9}  {'DSR(Ph2)':>8}")
 print(f"  {'-'*36}  {'-'*5}  {'-'*6}  {'-'*7}  "
-      f"{'-'*6}  {'-'*5}  {'-'*5}  {'-'*5}")
+      f"{'-'*6}  {'-'*5}  {'-'*5}  {'-'*9}  {'-'*8}")
 for r in all_ranked[:20]:
     flag = "✅" if r["validated_dsr"] else ("⚠" if r["oos_ret"] > 0 else "✗")
+    dsr_ph2_str = f"{r['dsr_ph2']:.3f}" if "dsr_ph2" in r else "n/a"
     print(f"  {flag} {r['id']:<36}  {r['oos_n']:>5}  {r['oos_wr']:>6.1%}  "
           f"{r['oos_ret']:>+6.1f}%  {r['oos_mdd']:>6.1f}%  "
-          f"{r['mc_p_profit']:>5.3f}  {r['mc_p_ruin']:>5.3f}  {r['dsr']:>5.3f}")
+          f"{r['mc_p_profit']:>5.3f}  {r['mc_p_ruin']:>5.3f}  "
+          f"{r['dsr']:>9.3f}  {dsr_ph2_str:>8}")
 print(SEP2)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -618,7 +645,7 @@ def table_rows(results: list[dict], show_params: str = "none") -> str:
         rc = "green" if r["oos_ret"] > 0 else "red"
         pc = "green" if r["mc_p_profit"] > 0.90 else ("yellow" if r["mc_p_profit"] > 0.60 else "red")
         qc = "green" if r["mc_p_ruin"] < 0.05 else "red"
-        dsr = r.get("dsr", 0.0)
+        dsr = r.get("dsr_ph2", r.get("dsr", 0.0))   # gate-driving DSR (local family if available)
         dc = "green" if dsr >= DSR_THRESHOLD else ("yellow" if dsr >= 0.60 else "red")
         flag = ("✅" if r.get("validated_dsr", r["validated"]) else ("⚠" if r["oos_ret"] > 0 else "✗"))
         extra = ""
@@ -743,9 +770,17 @@ html = f"""<!DOCTYPE html>
   Su {len(ALL_RESULTS)} varianti testate, la probabilità di trovare per puro caso il "vincitore" con Sharpe
   elevato è tutt'altro che trascurabile (selection bias). Il DSR (Bailey &amp; López de Prado, 2014) corregge
   lo Sharpe osservato di ogni variante confrontandolo con lo Sharpe massimo atteso "by luck alone" su
-  {len(ALL_RESULTS)} tentativi (SR0), tenendo conto anche di skewness/kurtosis della distribuzione dei trade.
-  Il gate di validazione ora richiede <code>DSR ≥ {DSR_THRESHOLD}</code> oltre a P(profit)&gt;0.90 e P(ruin)&lt;0.05.
-  Colonna <code>DSR</code> nelle tabelle sottostanti; il flag ✅ riflette il gate combinato.
+  N tentativi (SR0), tenendo conto anche di skewness/kurtosis della distribuzione dei trade.
+  <br><br>
+  <em>Due famiglie riportate:</em> DSR "globale" (N={len(ALL_RESULTS)}, l'intero search space) e DSR
+  "Phase 2" (N={len(PH2_RESULTS)}, solo le varianti MR con PB già fissata — l'insieme dei candidati finali
+  realmente comparabili tra loro). Il DSR globale include molte configurazioni Phase 1 palesemente
+  miscalibrate (rendimenti fino a −14%): i loro Sharpe fortemente negativi gonfiano la dispersione
+  cross-sezionale e quindi SR0, rendendo il test globale eccessivamente conservativo (nessuna variante
+  lo supera). Il gate di validazione adottato usa il DSR Phase 2 (famiglia omogenea) quando disponibile.
+  Richiede <code>DSR ≥ {DSR_THRESHOLD}</code> oltre a P(profit)&gt;0.90 e P(ruin)&lt;0.05.
+  Colonna <code>DSR</code> nelle tabelle sottostanti mostra il valore usato dal gate; il flag ✅ riflette
+  il gate combinato.
 </div>
 
 <div class="kpi-row">
