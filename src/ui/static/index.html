@@ -16,6 +16,10 @@
     <span class="brand-dot"></span>
     <span class="brand-name">LIVE TRADING MONITOR</span>
   </div>
+  <div id="pnl-mode-toggle" class="pnl-toggle" title="Display mode for PnL/equity/returns charts">
+    <button class="pnl-toggle-btn active" data-mode="currency">$</button>
+    <button class="pnl-toggle-btn" data-mode="percent">%</button>
+  </div>
   <div id="conn-status" class="conn-ok" title="Overview feed connection">
     <span class="conn-dot"></span><span class="conn-label">connecting…</span>
   </div>
@@ -87,11 +91,12 @@
                 <th>Status</th>
                 <th>Position</th>
                 <th>Realized PnL</th>
+                <th>Unrealized PnL</th>
                 <th>Equity</th>
               </tr>
             </thead>
             <tbody id="overview-table-body">
-              <tr><td colspan="8" class="empty-row">Waiting for data…</td></tr>
+              <tr><td colspan="9" class="empty-row">Waiting for data…</td></tr>
             </tbody>
           </table>
         </div>
@@ -152,20 +157,64 @@
       </div>
 
       <div class="panel">
-        <div class="panel-title">Trade History</div>
+        <div class="panel-title">Drawdown (Underwater)</div>
+        <div id="drawdown-chart" class="chart chart-sm"></div>
+      </div>
+
+      <div class="detail-grid">
+        <div class="panel" id="calendar-card">
+          <div class="panel-title">Daily PnL Calendar</div>
+          <div id="calendar-heatmap">
+            <div class="empty-row">Waiting for data…</div>
+          </div>
+        </div>
+
+        <div class="panel" id="r-multiple-card">
+          <div class="panel-title">R-Multiple Distribution</div>
+          <div id="r-multiple-chart" class="chart chart-sm"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Performance by Session (UTC)</div>
+        <div id="session-chart" class="chart chart-sm"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Trades</div>
         <div class="table-scroll">
           <table class="data-table" id="trades-table">
             <thead>
               <tr>
-                <th>Time</th><th>Event</th><th>Dir</th><th>Price</th><th>Qty</th>
-                <th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th>
-                <th>Composite</th><th>ATR</th><th>PnL (net)</th><th>Equity</th><th>Note</th>
+                <th>Dir</th>
+                <th>Entry</th>
+                <th>Stop</th>
+                <th>Target</th>
+                <th>Partial @</th>
+                <th>Close</th>
+                <th>Exit Reason</th>
+                <th>Duration</th>
+                <th>Qty</th>
+                <th>Invested</th>
+                <th>Invested / Equity</th>
+                <th>Value @ Close</th>
+                <th>Fees</th>
+                <th>PnL</th>
+                <th>PnL %</th>
+                <th>R</th>
               </tr>
             </thead>
             <tbody id="trades-table-body">
-              <tr><td colspan="14" class="empty-row">Waiting for data…</td></tr>
+              <tr><td colspan="16" class="empty-row">Waiting for data…</td></tr>
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Signals</div>
+        <div class="trade-list" id="signals-list-body">
+          <div class="empty-row">Waiting for data…</div>
         </div>
       </div>
 
@@ -177,6 +226,29 @@
     </section>
 
   </main>
+</div>
+
+<div id="trade-modal" class="modal-backdrop hidden">
+  <div class="modal-panel">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" id="trade-modal-title">Trade</div>
+        <div class="modal-subtitle" id="trade-modal-subtitle"></div>
+      </div>
+      <button id="trade-modal-close" class="modal-close" title="Close (Esc)">&times;</button>
+    </div>
+    <div id="trade-modal-chart" class="chart"></div>
+    <div class="detail-grid">
+      <div class="panel">
+        <div class="panel-title">Trade PnL</div>
+        <div id="trade-modal-pnl" class="chart chart-sm"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Trade Drawdown</div>
+        <div id="trade-modal-drawdown" class="chart chart-sm"></div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script type="module" src="app.js"></script>

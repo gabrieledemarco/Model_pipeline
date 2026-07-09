@@ -38,9 +38,13 @@ if str(ROOT) not in sys.path:
 from src.ui.monitor_core import (  # noqa: E402
     StrategyInfo,
     build_equity_series,
+    compute_daily_pnl,
     compute_performance_stats,
+    compute_r_multiples,
+    compute_session_stats,
     current_equity,
     discover_strategies,
+    list_trade_episodes,
     load_analysis,
     load_log_tail,
     load_position,
@@ -163,8 +167,11 @@ def _strategy_overview_entry(info: StrategyInfo, today) -> tuple[dict, Optional[
     realized = realized_pnl_total(trades)
 
     trades_today_count = 0
-    if not trades.empty and "timestamp" in trades.columns:
-        ts = trades["timestamp"].dropna()
+    if not trades.empty and "timestamp" in trades.columns and "event" in trades.columns:
+        # Exclude SIGNAL rows (logged every bar close, no trade) — only
+        # ENTRY/PARTIAL_*/EXIT_* are actual trade activity.
+        real_trades = trades[trades["event"] != "SIGNAL"]
+        ts = real_trades["timestamp"].dropna()
         if not ts.empty:
             trades_today_count = int((ts.dt.date == today).sum())
 
@@ -183,6 +190,13 @@ def _strategy_overview_entry(info: StrategyInfo, today) -> tuple[dict, Optional[
         "position_desc": _position_desc(position),
         "equity": equity,
         "realized_pnl": realized,
+        # Raw fields so the frontend can compute live unrealized P&L against
+        # its own already-open BTCUSDT mark-price feed, without this
+        # (strictly read-only, no-exchange-access) backend needing to fetch
+        # a mark price itself.
+        "position_direction": position.get("direction") if position.get("active") else None,
+        "position_entry_price": position.get("entry_price") if position.get("active") else None,
+        "position_size_remaining": position.get("size_remaining") if position.get("active") else None,
     }
     is_open = 1 if position.get("active") else 0
     return entry, (curve_points or None), trades_today_count, (realized if realized is not None else 0.0), is_open
@@ -254,6 +268,10 @@ def build_detail_payload(info: StrategyInfo) -> dict:
         "equity_curve": _equity_curve_points(trades),
         "trades": _trades_records(trades),
         "stats": compute_performance_stats(trades),
+        "r_multiples": compute_r_multiples(trades),
+        "daily_pnl": compute_daily_pnl(trades),
+        "session_stats": compute_session_stats(trades),
+        "trade_episodes": list_trade_episodes(trades),
         "log_tail": load_log_tail(info.dir_path),
         "analysis": load_analysis(info.dir_path),
     }
@@ -350,6 +368,10 @@ async def ws_strategy_detail(websocket: WebSocket, strategy_id: str):
                     "equity_curve": [],
                     "trades": [],
                     "stats": {"insufficient_data": True},
+                    "r_multiples": [],
+                    "daily_pnl": {},
+                    "session_stats": [],
+                    "trade_episodes": [],
                     "log_tail": [],
                     "analysis": {},
                 }

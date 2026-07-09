@@ -75,7 +75,6 @@ html, body {
 .brand-name { font-size: 13px; color: var(--text); }
 
 #conn-status {
-  margin-left: auto;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -101,6 +100,28 @@ html, body {
 #conn-status.down .conn-dot { background: var(--red); }
 
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+.pnl-toggle {
+  margin-left: auto;
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.pnl-toggle-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.pnl-toggle-btn + .pnl-toggle-btn { border-left: 1px solid var(--border); }
+.pnl-toggle-btn.active { background: var(--bg-elevated); color: var(--text); }
+.pnl-toggle-btn:hover { color: var(--text); }
 
 #server-clock {
   font-family: var(--mono);
@@ -300,12 +321,127 @@ html, body {
 .pnl-pos, .val-pos { color: var(--green); }
 .pnl-neg, .val-neg { color: var(--red); }
 .pnl-zero { color: var(--text-dim); }
+.text-faint { color: var(--text-faint); }
 
 .dir-long { color: var(--green); font-weight: 600; }
 .dir-short { color: var(--red); font-weight: 600; }
 .dir-flat { color: var(--text-dim); }
 
+/* ===================== EVENT BADGES (Trade History) ===================== */
+/* Signal vs. trade is a status distinction (informational / entered / exited
+   win / exited loss) — reuses the same green/red/grey/blue tokens as the
+   rest of the app rather than introducing a new palette. */
+
+.evt-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.evt-signal { background: rgba(139, 148, 158, 0.10); color: var(--text-dim); border-color: rgba(139, 148, 158, 0.3); }
+.evt-entry-long { background: rgba(63, 185, 80, 0.14); color: var(--green); border-color: rgba(63, 185, 80, 0.45); }
+.evt-entry-short { background: rgba(248, 81, 73, 0.14); color: var(--red); border-color: rgba(248, 81, 73, 0.45); }
+.evt-exit-win { background: rgba(63, 185, 80, 0.14); color: var(--green); border-color: rgba(63, 185, 80, 0.45); }
+.evt-exit-loss { background: rgba(248, 81, 73, 0.14); color: var(--red); border-color: rgba(248, 81, 73, 0.45); }
+.evt-exit-flat { background: rgba(88, 166, 255, 0.12); color: var(--blue); border-color: rgba(88, 166, 255, 0.4); }
+
+/* ===================== TRADE LIST (Signal & Trade History) ===================== */
+/* A row-based list instead of a wide table: time/event/direction/price/reason
+   are always on-screen without horizontal scrolling — the numeric detail
+   (SL/TP/composite/ATR/equity) is secondary and wraps onto its own line
+   rather than claiming 9 rigid columns. */
+
+.trade-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 560px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.trade-row {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+}
+.trade-row:last-child { border-bottom: none; }
+.trade-row:hover { background: var(--bg-elevated); }
+
+.trade-row-accent {
+  width: 3px;
+  flex: none;
+  background: var(--text-faint);
+}
+.trade-row-accent.evt-signal { background: var(--text-faint); }
+.trade-row-accent.evt-entry-long,
+.trade-row-accent.evt-exit-win { background: var(--green); }
+.trade-row-accent.evt-entry-short,
+.trade-row-accent.evt-exit-loss { background: var(--red); }
+.trade-row-accent.evt-exit-flat { background: var(--blue); }
+
+.trade-row-body {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.trade-row-main {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 9px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.trade-time { color: var(--text-dim); }
+.trade-price { color: var(--text); font-weight: 600; }
+
+.trade-reason {
+  font-family: var(--sans);
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--text-dim);
+}
+.row-trade .trade-reason { color: var(--text); }
+
+.trade-row-detail {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* Signal-only rows (no trade resulted) read visually lighter than rows
+   that actually moved a position, so the list reads as "mostly quiet,
+   occasionally acts" at a glance. */
+.trade-row.row-signal { opacity: 0.72; }
+.trade-row.row-trade { opacity: 1; }
+
 .badge-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+
+.legs-badge {
+  display: inline-block;
+  font-size: 10px;
+  color: var(--amber);
+  border: 1px dashed var(--amber);
+  border-radius: 4px;
+  padding: 0 4px;
+  margin-left: 4px;
+  cursor: help;
+}
 
 .badge {
   display: inline-flex;
@@ -331,9 +467,13 @@ html, body {
   animation: blink 1.4s infinite;
 }
 .badge-dryrun { background: rgba(88, 166, 255, 0.12); color: var(--blue); border-color: rgba(88, 166, 255, 0.4); }
-.badge-live { background: rgba(248, 81, 73, 0.12); color: var(--red); border-color: rgba(248, 81, 73, 0.4); }
+/* Amber, not red: red is reserved for stopped/error status elsewhere in this
+   palette (.badge-stopped, .status-dot.stopped) — LIVE meaning "real orders,
+   pay attention" would otherwise be visually indistinguishable from "broken". */
+.badge-live { background: rgba(210, 153, 34, 0.14); color: var(--amber); border-color: rgba(210, 153, 34, 0.45); }
 
 .chart { width: 100%; height: 380px; }
+.chart-sm { height: 220px; }
 
 /* ===================== LIVE MARKET CHART ===================== */
 
@@ -545,6 +685,60 @@ html, body {
 .stats-grid .sg-item { display: flex; justify-content: space-between; border-bottom: 1px dashed var(--border); padding: 4px 0; }
 .stats-grid .sg-label { color: var(--text-dim); }
 
+.heatmap-wrap { display: flex; gap: 6px; align-items: flex-start; }
+
+.heatmap-weekday-col {
+  display: grid;
+  grid-template-rows: repeat(7, 15px);
+  gap: 3px;
+  margin-top: 18px;
+  font-size: 9px;
+  line-height: 15px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  flex: none;
+}
+
+.heatmap-main { display: flex; flex-direction: column; gap: 4px; overflow-x: auto; }
+
+.heatmap-months {
+  display: grid;
+  gap: 3px;
+  height: 14px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.heatmap-grid {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: repeat(7, 15px);
+  gap: 3px;
+  padding-bottom: 4px;
+}
+.heatmap-cell {
+  width: 15px;
+  height: 15px;
+  border-radius: 3px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+}
+.heatmap-cell.hm-win-1 { background: rgba(63, 185, 80, 0.35); border-color: transparent; }
+.heatmap-cell.hm-win-2 { background: rgba(63, 185, 80, 0.65); border-color: transparent; }
+.heatmap-cell.hm-win-3 { background: rgba(63, 185, 80, 0.95); border-color: transparent; }
+.heatmap-cell.hm-loss-1 { background: rgba(248, 81, 73, 0.35); border-color: transparent; }
+.heatmap-cell.hm-loss-2 { background: rgba(248, 81, 73, 0.65); border-color: transparent; }
+.heatmap-cell.hm-loss-3 { background: rgba(248, 81, 73, 0.95); border-color: transparent; }
+
+.heatmap-legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
 .log-tail {
   background: #05070a;
   border: 1px solid var(--border);
@@ -606,4 +800,72 @@ html, body {
   .chart { height: 280px; }
 
   #server-clock { display: none; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Trade replay modal                                                   */
+/* ------------------------------------------------------------------ */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 200;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 40px 16px;
+}
+
+.modal-backdrop.hidden { display: none; }
+
+.modal-panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: 100%;
+  max-width: 980px;
+  padding: 18px 22px 22px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.modal-title {
+  font-size: 16px;
+  font-weight: 600;
+  font-family: var(--mono);
+}
+
+.modal-subtitle {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  font-family: var(--mono);
+}
+
+.modal-close {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 20px;
+  line-height: 1;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  cursor: pointer;
+  flex: none;
+}
+.modal-close:hover { color: var(--text); border-color: var(--text-dim); }
+
+.trade-row.row-trade[data-clickable="1"] { cursor: pointer; }
+
+@media (max-width: 700px) {
+  .modal-backdrop { padding: 0; }
+  .modal-panel { max-width: 100%; border-radius: 0; min-height: 100dvh; }
 }

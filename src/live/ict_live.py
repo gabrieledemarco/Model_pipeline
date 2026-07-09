@@ -34,7 +34,9 @@ from src.strategy.ict_silver_bullet import build_silver_bullet_signals, KZ_NY_CO
 MIN_FVG_ATR_FRAC = 0.05
 MAX_AGE          = 16     # 15M bars = 4h re-entry window
 MIN_SL_ATR_FLOOR = 0.5    # sizing floor: sl_dist >= 0.5 x ATR_1H
-MAX_LEVERAGE     = 5.0    # notional <= 5x equity
+MAX_LEVERAGE     = 1.0    # notional <= 1x equity — matches the exchange
+                          # account's fixed 1x leverage config; a higher cap
+                          # here just produces orders Bybit rejects (110007).
 TP_MULT          = 3.0    # tp = entry +/- 3.0 x ref_size (FVG width)
 SL_ATR_MULT      = 0.5    # sl = ref_lo/ref_hi -/+ 0.5 x ATR_1H
 TIME_STOP_HOURS  = 8.0    # 32 bars of 15M

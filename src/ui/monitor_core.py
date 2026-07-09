@@ -263,32 +263,267 @@ def current_equity(trades: pd.DataFrame, meta: dict) -> float:
     return float(meta.get("capital", 0.0) or 0.0)
 
 
+def _pair_closed_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    """Pair each PARTIAL_*/EXIT_* row with its most recent preceding ENTRY to
+    recover the risk distance (|entry_price - sl|) needed for R-multiples,
+    and recover each row's TRUE incremental pnl.
+
+    Quirk in src/live/trader.py this has to correct for: `_partial_close`
+    logs that leg's own net pnl, but `_exit_full` logs
+    `gross - fees + state.realized_pnl` — i.e. the final EXIT_* row's
+    `pnl_net` is the CUMULATIVE total for the whole trade (this leg plus
+    every prior partial already folded in), not that leg's own contribution.
+    Summing raw `pnl_net` across a trade's rows double-counts every partial
+    that preceded a final exit. Fix: track cumulative partial pnl per
+    episode and subtract it back out of the terminal EXIT_* row so every
+    row in the returned frame holds its own true incremental pnl — safe to
+    sum, safe to R-multiple, safe to bucket by day/session.
+
+    trades.csv has no trade_id column. This assumes at most one open position
+    at a time per strategy (true for every strategy this dashboard monitors)
+    and walks rows in chronological order, tracking the active ENTRY's
+    entry_price/sl until the next ENTRY replaces it. Returns one row per
+    closed/partial event: timestamp, event, direction, pnl_net (true,
+    incremental), r_multiple, entry_time (the ISO-parseable timestamp of the
+    ENTRY it was paired with, for grouping into per-trade episodes — see
+    list_trade_episodes). r_multiple is None when sl/qty aren't available.
+    """
+    cols = ["timestamp", "event", "direction", "price", "qty", "pnl_net", "fee", "r_multiple", "entry_time"]
+    required = {"event", "timestamp", "price", "sl", "qty", "pnl_net"}
+    if trades.empty or not required.issubset(trades.columns):
+        return pd.DataFrame(columns=cols)
+
+    df = trades.dropna(subset=["timestamp"]).sort_values("timestamp")
+    rows = []
+    basis = None  # {"entry_price": float, "sl": float, "entry_time": Timestamp}
+    partial_pnl_so_far = 0.0
+    for _, row in df.iterrows():
+        event = row.get("event")
+        if event == "ENTRY":
+            sl, entry_price = row.get("sl"), row.get("price")
+            basis = {
+                "entry_price": float(entry_price), "sl": float(sl), "entry_time": row["timestamp"],
+            } if pd.notna(sl) and pd.notna(entry_price) else None
+            partial_pnl_so_far = 0.0
+            continue
+        if not isinstance(event, str) or not (event.startswith("EXIT") or event.startswith("PARTIAL")):
+            continue
+        raw_pnl = row.get("pnl_net")
+        if pd.isna(raw_pnl):
+            continue
+        raw_pnl = float(raw_pnl)
+        if event.startswith("PARTIAL"):
+            true_pnl = raw_pnl  # already this leg's own incremental net
+            partial_pnl_so_far += true_pnl
+        else:  # EXIT_* — logged value is cumulative, subtract prior partials back out
+            true_pnl = raw_pnl - partial_pnl_so_far
+
+        r_multiple = None
+        if basis is not None:
+            risk_distance = abs(basis["entry_price"] - basis["sl"])
+            qty = row.get("qty")
+            if risk_distance > 0 and pd.notna(qty) and qty:
+                r_multiple = true_pnl / (risk_distance * float(qty))
+        qty = row.get("qty")
+        price = row.get("price")
+        direction = row.get("direction")
+
+        # Fee isn't logged as its own column — trader.py computes it inline
+        # and only writes the net result. Derive it instead of guessing
+        # which of trader.py's two (asymmetric, partial vs full-exit) fee
+        # formulas applies: gross (pure price move, no fees) minus the true
+        # net we already recovered above is exactly the fee charged,
+        # whatever formula produced it.
+        fee = None
+        if basis is not None and pd.notna(qty) and pd.notna(price) and pd.notna(direction):
+            gross = float(direction) * float(qty) * (float(price) - basis["entry_price"])
+            fee = gross - true_pnl
+
+        rows.append({
+            "timestamp": row["timestamp"],
+            "event": event,
+            "direction": direction,
+            "price": float(price) if pd.notna(price) else None,
+            "qty": float(qty) if pd.notna(qty) else None,
+            "pnl_net": true_pnl,
+            "fee": fee,
+            "r_multiple": r_multiple,
+            "entry_time": basis["entry_time"] if basis is not None else None,
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
 def realized_pnl_total(trades: pd.DataFrame) -> float:
-    if trades.empty or "pnl_net" not in trades.columns:
+    """Sum of every trade's TRUE realized pnl — routed through
+    _pair_closed_trades so a trade with partial closes isn't double-counted
+    (see that function's docstring)."""
+    closed = _pair_closed_trades(trades)
+    if closed.empty:
         return 0.0
-    return float(trades["pnl_net"].dropna().sum())
+    return float(closed["pnl_net"].sum())
+
+
+def compute_r_multiples(trades: pd.DataFrame) -> list[dict]:
+    """R-multiple per closed/partial exit: pnl_net / (risk distance * qty)."""
+    closed = _pair_closed_trades(trades)
+    if closed.empty:
+        return []
+    closed = closed.dropna(subset=["r_multiple"])
+    return [
+        {"t": row["timestamp"].isoformat(), "r": float(row["r_multiple"]), "event": row["event"]}
+        for _, row in closed.iterrows()
+    ]
+
+
+def compute_daily_pnl(trades: pd.DataFrame) -> dict:
+    """Realized pnl_net summed per calendar day (UTC), for a calendar heatmap."""
+    closed = _pair_closed_trades(trades)
+    if closed.empty:
+        return {}
+    grouped = closed.groupby(closed["timestamp"].dt.date)["pnl_net"].sum()
+    return {d.isoformat(): float(v) for d, v in grouped.items()}
+
+
+# Approximate UTC session windows for the day/session breakdown. Not exact
+# ICT kill-zone boundaries — coarse enough to spot session-level edge.
+_SESSION_BOUNDS = [
+    ("Asia", 0, 7),
+    ("London", 7, 12),
+    ("NY AM", 12, 16),
+    ("NY PM", 16, 20),
+    ("Late", 20, 24),
+]
+
+
+def _session_for_hour(hour: int) -> str:
+    for name, start, end in _SESSION_BOUNDS:
+        if start <= hour < end:
+            return name
+    return "Late"
+
+
+def compute_session_stats(trades: pd.DataFrame) -> list[dict]:
+    """Win rate / avg R / total pnl per UTC session bucket, in session order."""
+    closed = _pair_closed_trades(trades)
+    if closed.empty:
+        return []
+    closed = closed.copy()
+    closed["session"] = closed["timestamp"].dt.hour.map(_session_for_hour)
+
+    out = []
+    for name, _, _ in _SESSION_BOUNDS:
+        bucket = closed[closed["session"] == name]
+        if bucket.empty:
+            continue
+        wins = bucket[bucket["pnl_net"] > 0]
+        rs = bucket["r_multiple"].dropna()
+        out.append({
+            "session": name,
+            "trades": int(len(bucket)),
+            "win_rate": len(wins) / len(bucket),
+            "avg_r": float(rs.mean()) if not rs.empty else None,
+            "total_pnl": float(bucket["pnl_net"].sum()),
+        })
+    return out
+
+
+def list_trade_episodes(trades: pd.DataFrame) -> list[dict]:
+    """One self-contained record per ENTRY that has at least one close, for
+    the trade-replay chart: entry terms (price/sl/tp1-3/qty) plus every
+    close event, so the frontend can plot markers and floating PnL without
+    re-deriving the ENTRY<->close pairing itself."""
+    closed = _pair_closed_trades(trades)
+    if closed.empty:
+        return []
+    closed = closed.dropna(subset=["entry_time"])
+    if closed.empty:
+        return []
+
+    entries = trades[trades["event"] == "ENTRY"].dropna(subset=["timestamp"])
+    entries_by_time = {row["timestamp"]: row for _, row in entries.iterrows()}
+
+    episodes = []
+    for entry_time, group in closed.groupby("entry_time"):
+        entry_row = entries_by_time.get(entry_time)
+        if entry_row is None:
+            continue
+        qty_total = entry_row.get("qty")
+        equity_at_entry = entry_row.get("equity")
+        episodes.append({
+            "entry_time": entry_time.isoformat(),
+            "direction": entry_row.get("direction"),
+            "entry_price": float(entry_row["price"]) if pd.notna(entry_row.get("price")) else None,
+            "sl": float(entry_row["sl"]) if pd.notna(entry_row.get("sl")) else None,
+            "tp1": float(entry_row["tp1"]) if pd.notna(entry_row.get("tp1")) else None,
+            "tp2": float(entry_row["tp2"]) if pd.notna(entry_row.get("tp2")) else None,
+            "tp3": float(entry_row["tp3"]) if pd.notna(entry_row.get("tp3")) else None,
+            "qty_total": float(qty_total) if pd.notna(qty_total) else None,
+            "equity_at_entry": float(equity_at_entry) if pd.notna(equity_at_entry) else None,
+            "closes": [
+                {
+                    "time": row["timestamp"].isoformat(),
+                    "event": row["event"],
+                    "price": row["price"],
+                    "qty": row["qty"],
+                    "pnl_net": float(row["pnl_net"]),
+                    "fee": None if pd.isna(row["fee"]) else float(row["fee"]),
+                    "r_multiple": None if pd.isna(row["r_multiple"]) else float(row["r_multiple"]),
+                }
+                for _, row in group.sort_values("timestamp").iterrows()
+            ],
+            "pnl_total": float(group["pnl_net"].sum()),
+            "fees_total": float(group["fee"].dropna().sum()) if group["fee"].notna().any() else None,
+            # One risk-adjusted R for the whole trade (pnl_total against the
+            # entry-defined risk on the full size) — distinct from each
+            # individual leg's own R already in `closes`.
+            "r_multiple": (
+                float(group["pnl_net"].sum() / (abs(entry_row["price"] - entry_row["sl"]) * qty_total))
+                if pd.notna(entry_row.get("sl")) and pd.notna(qty_total)
+                and abs(entry_row["price"] - entry_row["sl"]) > 0 and qty_total
+                else None
+            ),
+        })
+
+    episodes.sort(key=lambda e: e["entry_time"])
+    return episodes
 
 
 def compute_performance_stats(trades: pd.DataFrame) -> dict:
     """Win rate / avg win/loss / max drawdown / Sharpe from trades.csv.
 
-    Uses only pandas math on pnl_net / equity columns — kept intentionally
-    simple. Returns {'insufficient_data': True} when there isn't enough
-    closed-trade history to compute anything meaningful.
+    win_rate/avg_win/avg_loss/profit_factor are computed per TRADE (one
+    entry -> one total, summing its true incremental legs via
+    _pair_closed_trades — see that function's docstring for why a trade
+    with a partial close can't just be summed from raw pnl_net), not per
+    close-row, so a partial+final pair counts as one win or loss, not two.
+
+    Returns {'insufficient_data': True} when there isn't enough closed-trade
+    history to compute anything meaningful.
     """
     if trades.empty or "pnl_net" not in trades.columns:
         return {"insufficient_data": True}
 
-    closed = trades.dropna(subset=["pnl_net"])
-    closed = closed[closed["pnl_net"] != 0]
-    if len(closed) < 2:
+    closed = _pair_closed_trades(trades)
+    if closed.empty:
         return {"insufficient_data": True}
 
-    wins = closed[closed["pnl_net"] > 0]["pnl_net"]
-    losses = closed[closed["pnl_net"] < 0]["pnl_net"]
-    win_rate = len(wins) / len(closed) if len(closed) else 0.0
+    episode_pnl = closed.groupby("entry_time")["pnl_net"].sum()
+    episode_pnl = episode_pnl[episode_pnl != 0]
+    if len(episode_pnl) < 2:
+        return {"insufficient_data": True}
+
+    wins = episode_pnl[episode_pnl > 0]
+    losses = episode_pnl[episode_pnl < 0]
+    win_rate = len(wins) / len(episode_pnl)
     avg_win = float(wins.mean()) if not wins.empty else 0.0
     avg_loss = float(losses.mean()) if not losses.empty else 0.0
+
+    gross_win = float(wins.sum()) if not wins.empty else 0.0
+    gross_loss = float(-losses.sum()) if not losses.empty else 0.0
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else None
+
+    r_values = closed["r_multiple"].dropna()
+    expectancy = float(r_values.mean()) if not r_values.empty else None
 
     # Max drawdown & Sharpe from the equity curve (percentage returns).
     max_dd = None
@@ -305,12 +540,14 @@ def compute_performance_stats(trades: pd.DataFrame) -> dict:
 
     return {
         "insufficient_data": False,
-        "n_trades": len(closed),
+        "n_trades": len(episode_pnl),
         "win_rate": win_rate,
         "avg_win": avg_win,
         "avg_loss": avg_loss,
         "max_drawdown": max_dd,
         "sharpe": sharpe,
+        "profit_factor": profit_factor,
+        "expectancy": expectancy,
     }
 
 

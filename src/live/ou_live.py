@@ -36,7 +36,9 @@ from src.strategy.ou_mean_reversion import build_ou_signals
 TP_FRAC = 1.0             # x ATR4H
 SL_FRAC = 1.0             # x ATR4H
 MIN_SL_ATR_FLOOR = 0.25   # MIN_SL_ATR — sizing floor, inert at sl_frac=1.0
-MAX_LEVERAGE = 5.0        # MAX_LEV
+MAX_LEVERAGE = 1.0        # matches the exchange account's fixed 1x leverage
+                          # config; a higher cap here just produces orders
+                          # Bybit rejects (110007: insufficient balance).
 TIME_STOP_HOURS = 96.0    # MAX_HOLD=96 1H bars = 96 hours
 
 

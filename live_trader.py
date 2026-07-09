@@ -45,6 +45,9 @@ Usage
    # S07 OU Mean Reversion (1H, HMM-gated 4H, TP/SL 1.0x ATR4H):
    python live_trader.py --strategy-type ou_hmm --exchange bybit
 
+   # ML RandomForest 8h (1H, 23 causal features, exit @ +8h, safety-stop 4xATR):
+   python live_trader.py --strategy-type ml_rf_8h --exchange bybit
+
 Ogni processo scrive esclusivamente in logs/strategies/{strategy_id}/
 (live_trader.log, trades.csv, position.json, meta.json). Se --strategy-id
 non è passato viene derivato automaticamente da scenario/strategy-type + exchange.
@@ -138,6 +141,10 @@ def _build_signal_source(strategy_type: str, scenario: str):
         from src.live.ou_live import compute_ou_signal
         return "S07 OU Mean Reversion (HMM-gated)", compute_ou_signal, "1h"
 
+    if strategy_type == "ml_rf_8h":
+        from src.live.ml_rf_live import compute_ml_rf_signal
+        return "ML RandomForest 8h", compute_ml_rf_signal, "1h"
+
     raise ValueError(f"Unknown strategy_type: {strategy_type!r}")
 
 
@@ -173,7 +180,7 @@ def parse_args() -> argparse.Namespace:
                     help="Scenario strategia (solo per --strategy-type composite; "
                          "default: 'Strong (≥±18)')")
     ap.add_argument("--strategy-type", default="composite",
-                    choices=["composite", "wyckoff", "ict", "ou_hmm"],
+                    choices=["composite", "wyckoff", "ict", "ou_hmm", "ml_rf_8h"],
                     help="Fonte del segnale: 'composite' (score multi-TF, "
                          "parametrizzato da --scenario), 'wyckoff' (Spring/"
                          "Upthrust 1H), 'ict' (Silver Bullet NY AM+PM 15M), "

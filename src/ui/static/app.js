@@ -87,6 +87,67 @@ function dirLabel(direction) {
   return { text: "--", cls: "dir-flat" };
 }
 
+// Classify a trades.csv row into a badge + row style, so a scan down the
+// table instantly separates "just a signal, nothing happened" from "a
+// position was actually opened/closed" — and, for exits, whether it closed
+// in profit or loss. Reuses the app's existing green/red/grey/blue tokens
+// (see .evt-* in style.css) rather than a new palette.
+// Gross (fee-free) mark-to-market estimate — labeled "unrealized" everywhere
+// it's shown, distinct from the fee-netted `realized_pnl` in trades.csv, so
+// no one mistakes it for the exact number the exchange would report on close.
+function unrealizedPnl(direction, entryPrice, sizeRemaining, markPrice) {
+  if (direction === null || direction === undefined) return null;
+  if (entryPrice === null || entryPrice === undefined) return null;
+  if (sizeRemaining === null || sizeRemaining === undefined) return null;
+  if (markPrice === null || markPrice === undefined) return null;
+  return direction * sizeRemaining * (markPrice - entryPrice);
+}
+
+function currentMarkPrice() {
+  return market.lastCandle ? market.lastCandle.close : null;
+}
+
+// Shared $/% conversion for every equity/PnL/returns chart, driven by the
+// single global toggle in the topbar (state.pnlMode). Percent mode always
+// expresses "return since the first point in this series" — each series
+// (per-strategy equity curve, per-trade PnL, etc.) uses its own baseline,
+// so strategies/trades at different capital sizes stay comparable.
+function equityToDisplay(points) {
+  if (state.pnlMode !== "percent" || !points.length) return points;
+  const base = points[0].e;
+  if (!base) return points.map((p) => ({ t: p.t, e: 0 }));
+  return points.map((p) => ({ t: p.t, e: ((p.e / base) - 1) * 100 }));
+}
+
+function amountToDisplay(value, baseline) {
+  if (state.pnlMode !== "percent" || !baseline) return value;
+  return (value / baseline) * 100;
+}
+
+function fmtDisplayValue(value) {
+  return state.pnlMode === "percent" ? `${value >= 0 ? "+" : ""}${value.toFixed(2)}%` : signedFmt(value);
+}
+
+function eventInfo(event, direction, pnlNet) {
+  if (event === "SIGNAL") {
+    return { text: "SIGNAL", cls: "evt-signal", row: "row-signal" };
+  }
+  if (event === "ENTRY") {
+    const dir = dirLabel(direction);
+    const cls = dir.cls === "dir-long" ? "evt-entry-long" : "evt-entry-short";
+    return { text: `ENTRY ${dir.text}`, cls, row: "row-trade" };
+  }
+  // EXIT_* / PARTIAL_* — color by realized P&L, not by exit reason, since
+  // e.g. a time-stop or even a stop-loss (after a move-to-breakeven) can
+  // close flat or in profit just as often as at a loss.
+  let cls = "evt-exit-flat";
+  if (pnlNet !== null && pnlNet !== undefined && !Number.isNaN(pnlNet)) {
+    if (pnlNet > 0) cls = "evt-exit-win";
+    else if (pnlNet < 0) cls = "evt-exit-loss";
+  }
+  return { text: String(event || "").replace(/_/g, " "), cls, row: "row-trade" };
+}
+
 // Consistent color per strategy_id for the aggregate chart.
 const PALETTE = [
   "#58a6ff", "#3fb950", "#f85149", "#d29922", "#bc8cff",
@@ -222,8 +283,23 @@ const el = {
   analysisBody: document.getElementById("analysis-body"),
   analysisAge: document.getElementById("analysis-age"),
   detailChart: document.getElementById("detail-chart"),
+  drawdownChart: document.getElementById("drawdown-chart"),
+  calendarHeatmap: document.getElementById("calendar-heatmap"),
+  rMultipleChart: document.getElementById("r-multiple-chart"),
+  sessionChart: document.getElementById("session-chart"),
   tradesTableBody: document.getElementById("trades-table-body"),
+  signalsListBody: document.getElementById("signals-list-body"),
   logTail: document.getElementById("log-tail"),
+
+  tradeModal: document.getElementById("trade-modal"),
+  tradeModalTitle: document.getElementById("trade-modal-title"),
+  tradeModalSubtitle: document.getElementById("trade-modal-subtitle"),
+  tradeModalClose: document.getElementById("trade-modal-close"),
+  tradeModalChart: document.getElementById("trade-modal-chart"),
+  tradeModalPnl: document.getElementById("trade-modal-pnl"),
+  tradeModalDrawdown: document.getElementById("trade-modal-drawdown"),
+
+  pnlModeToggle: document.getElementById("pnl-mode-toggle"),
 };
 
 // ---------------------------------------------------------------
@@ -236,10 +312,20 @@ const state = {
   strategyOrder: [],
   overviewChartInitialized: false,
   detailChartInitialized: false,
+  drawdownChartInitialized: false,
+  rMultipleChartInitialized: false,
+  sessionChartInitialized: false,
   detailSocket: null,
   lastLogLines: [],
   lastDetailStrategyId: null,
   lastAnalysisTimestamp: null,
+  currentPosition: null, // detail view's open position, cached for tick-driven unrealized P&L
+  tradeEpisodes: [], // detail view's ENTRY->close groupings, cached for the trade-replay modal
+
+  pnlMode: "currency", // "currency" | "percent" — shared by every PnL/equity/returns chart
+  lastOverviewMsg: null, // cached so toggling pnlMode can re-render without waiting for the next tick
+  lastDetailMsg: null,
+  detailStartingEquity: null, // % baseline for the current detail view's charts
 };
 
 // ---------------------------------------------------------------
@@ -289,6 +375,25 @@ el.sidebarBackdrop.addEventListener("click", closeSidebarMobile);
 
 el.navOverview.addEventListener("click", () => selectOverview());
 
+function setPnlMode(mode) {
+  if (state.pnlMode === mode) return;
+  state.pnlMode = mode;
+  el.pnlModeToggle.querySelectorAll(".pnl-toggle-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.mode === mode);
+  });
+
+  if (state.currentView === "overview" && state.lastOverviewMsg) {
+    renderOverviewPanel(state.lastOverviewMsg);
+  } else if (state.lastDetailMsg) {
+    renderDetailPanel(state.lastDetailMsg);
+  }
+}
+
+el.pnlModeToggle.addEventListener("click", (e) => {
+  const btn = e.target.closest(".pnl-toggle-btn");
+  if (btn) setPnlMode(btn.dataset.mode);
+});
+
 // ---------------------------------------------------------------
 // View switching
 // ---------------------------------------------------------------
@@ -314,6 +419,9 @@ function selectStrategy(id) {
   if (state.lastDetailStrategyId !== id) {
     teardownDetailSocket();
     state.detailChartInitialized = false;
+    state.drawdownChartInitialized = false;
+    state.rMultipleChartInitialized = false;
+    state.sessionChartInitialized = false;
     state.lastLogLines = [];
     state.lastDetailStrategyId = id;
     el.detailError.classList.add("hidden");
@@ -361,6 +469,7 @@ function setConnState(connState) {
 function handleOverviewMessage(msg) {
   if (msg.type !== "overview") return;
 
+  state.lastOverviewMsg = msg;
   el.serverClock.textContent = fmtClock(msg.server_time);
 
   state.strategyOrder = (msg.strategies || []).map((s) => s.strategy_id);
@@ -388,6 +497,11 @@ function renderOverviewPanel(msg) {
       : `<span class="badge badge-live">LIVE</span>`;
     const posCls = /short/i.test(s.position_desc || "") ? "dir-short"
       : /long/i.test(s.position_desc || "") ? "dir-long" : "dir-flat";
+    const upnl = unrealizedPnl(s.position_direction, s.position_entry_price,
+      s.position_size_remaining, currentMarkPrice());
+    const upnlHtml = upnl === null
+      ? `<span class="text-faint">--</span>`
+      : `<span class="${pnlClass(upnl)}">${signedFmt(upnl)}</span>`;
     return `
       <tr class="clickable" data-id="${escapeHtml(s.strategy_id)}">
         <td class="mono">${escapeHtml(s.strategy_id)}</td>
@@ -397,13 +511,14 @@ function renderOverviewPanel(msg) {
         <td><span class="badge badge-${info.cls}">${info.label}</span></td>
         <td class="${posCls}">${escapeHtml(s.position_desc || "flat")}</td>
         <td class="${pnlClass(s.realized_pnl)}">${signedFmt(s.realized_pnl)}</td>
+        <td class="upnl-cell" data-upnl-row="${escapeHtml(s.strategy_id)}">${upnlHtml}</td>
         <td>${fmtNum(s.equity)}</td>
       </tr>
     `;
   });
   el.overviewTableBody.innerHTML = rows.length
     ? rows.join("")
-    : `<tr><td colspan="8" class="empty-row">No strategies reported.</td></tr>`;
+    : `<tr><td colspan="9" class="empty-row">No strategies reported.</td></tr>`;
 
   el.overviewTableBody.querySelectorAll("tr.clickable").forEach((tr) => {
     tr.addEventListener("click", () => selectStrategy(tr.dataset.id));
@@ -414,8 +529,9 @@ function renderOverviewPanel(msg) {
 
 function renderOverviewChart(equityCurves) {
   const ids = Object.keys(equityCurves);
+  const isPct = state.pnlMode === "percent";
   const traces = ids.map((id) => {
-    const pts = equityCurves[id] || [];
+    const pts = equityToDisplay(equityCurves[id] || []);
     return {
       x: pts.map((p) => p.t),
       y: pts.map((p) => p.e),
@@ -423,11 +539,12 @@ function renderOverviewChart(equityCurves) {
       mode: "lines",
       name: id,
       line: { color: colorFor(id), width: 1.6 },
-      hovertemplate: "%{y:.2f}<br>%{x}<extra>" + id + "</extra>",
+      hovertemplate: (isPct ? "%{y:.2f}%" : "%{y:.2f}") + "<br>%{x}<extra>" + id + "</extra>",
     };
   });
 
   const layout = baseChartLayout();
+  layout.yaxis = { ...layout.yaxis, title: isPct ? "Return %" : "Equity" };
 
   if (!traces.length) {
     traces.push({ x: [], y: [], type: "scattergl", mode: "lines", name: "no data" });
@@ -461,7 +578,10 @@ function handleDetailMessage(requestedId, msg) {
 }
 
 function renderDetailPanel(msg) {
+  state.lastDetailMsg = msg;
   const meta = msg.meta || {};
+  const curve = msg.equity_curve || [];
+  state.detailStartingEquity = curve.length ? curve[0].e : (meta.capital || null);
   el.detailTitle.textContent = `${msg.strategy_id}`;
 
   // Badges: status/stalled, dry-run, exchange, scenario
@@ -480,11 +600,18 @@ function renderDetailPanel(msg) {
   el.detailRss.textContent = msg.rss_mb === null || msg.rss_mb === undefined
     ? "--" : `${fmtNum(msg.rss_mb, 1)} MB`;
 
+  state.tradeEpisodes = msg.trade_episodes || [];
+
   renderPosition(msg.position || { active: false });
   renderStats(msg.stats || { insufficient_data: true });
   renderAnalysis(msg.analysis || {});
   renderDetailChart(msg.equity_curve || []);
-  renderTrades(msg.trades || []);
+  renderDrawdownChart(msg.equity_curve || []);
+  renderCalendarHeatmap(msg.daily_pnl || {});
+  renderRMultipleHistogram(msg.r_multiples || []);
+  renderSessionStats(msg.session_stats || []);
+  renderSignalsList(msg.trades || []);
+  renderTradesTable(buildTradeRows());
   renderLogTail(msg.log_tail || []);
 }
 
@@ -569,6 +696,8 @@ function renderAnalysis(analysis) {
 }
 
 function renderPosition(pos) {
+  state.currentPosition = (pos && pos.active) ? pos : null;
+
   if (!pos || !pos.active) {
     el.positionBody.innerHTML = `<div class="position-flat">flat — no open position</div>`;
     return;
@@ -579,6 +708,7 @@ function renderPosition(pos) {
       <span class="pg-label">${label}${hit ? " ✓" : ""}</span>
       <span class="${hit ? "tp-hit" : "tp-open"}">${fmtNum(price)}</span>
     </div>`;
+  const upnl = unrealizedPnl(pos.direction, pos.entry_price, pos.size_remaining, currentMarkPrice());
 
   el.positionBody.innerHTML = `
     <div class="position-grid">
@@ -595,8 +725,39 @@ function renderPosition(pos) {
       <div class="pg-item"><span class="pg-label">Composite</span><span>${fmtNum(pos.composite)}</span></div>
       <div class="pg-item"><span class="pg-label">ATR @ Entry</span><span>${fmtNum(pos.atr_at_entry)}</span></div>
       <div class="pg-item"><span class="pg-label">Realized PnL</span><span class="${pnlClass(pos.realized_pnl)}">${signedFmt(pos.realized_pnl)}</span></div>
+      <div class="pg-item"><span class="pg-label">Unrealized PnL (live)</span><span id="detail-upnl" class="${pnlClass(upnl)}">${upnl === null ? "--" : signedFmt(upnl)}</span></div>
     </div>
   `;
+}
+
+// Called on every live market price tick (far more frequent than the 2s
+// WS payload refresh) so unrealized P&L actually feels "live" rather than
+// stepping every couple of seconds. Updates existing DOM text in place —
+// never rebuilds a table/card on a price tick.
+function refreshUnrealizedPnl() {
+  const mark = currentMarkPrice();
+  if (mark === null) return;
+
+  if (state.currentView === "overview") {
+    for (const id of state.strategyOrder) {
+      const s = state.strategiesById.get(id);
+      if (!s) continue;
+      const cell = el.overviewTableBody.querySelector(`.upnl-cell[data-upnl-row="${CSS.escape(id)}"] span`);
+      if (!cell) continue;
+      const upnl = unrealizedPnl(s.position_direction, s.position_entry_price, s.position_size_remaining, mark);
+      if (upnl === null) continue;
+      cell.textContent = signedFmt(upnl);
+      cell.className = pnlClass(upnl);
+    }
+  } else if (state.currentPosition) {
+    const el2 = document.getElementById("detail-upnl");
+    if (!el2) return;
+    const pos = state.currentPosition;
+    const upnl = unrealizedPnl(pos.direction, pos.entry_price, pos.size_remaining, mark);
+    if (upnl === null) return;
+    el2.textContent = signedFmt(upnl);
+    el2.className = pnlClass(upnl);
+  }
 }
 
 function renderStats(stats) {
@@ -612,6 +773,8 @@ function renderStats(stats) {
       <div class="sg-item"><span class="sg-label">Avg Loss</span><span class="pnl-neg">${signedFmt(stats.avg_loss)}</span></div>
       <div class="sg-item"><span class="sg-label">Max Drawdown</span><span class="pnl-neg">${fmtPct(stats.max_drawdown)}</span></div>
       <div class="sg-item"><span class="sg-label">Sharpe</span><span>${fmtNum(stats.sharpe)}</span></div>
+      <div class="sg-item"><span class="sg-label">Profit Factor</span><span>${stats.profit_factor === null || stats.profit_factor === undefined ? "--" : fmtNum(stats.profit_factor, 2)}</span></div>
+      <div class="sg-item"><span class="sg-label">Expectancy (R)</span><span class="${pnlClass(stats.expectancy)}">${stats.expectancy === null || stats.expectancy === undefined ? "--" : fmtNum(stats.expectancy, 2)}</span></div>
     </div>
   `;
 }
@@ -635,9 +798,11 @@ function plotlyConfig() {
 }
 
 function renderDetailChart(curve) {
+  const isPct = state.pnlMode === "percent";
+  const display = equityToDisplay(curve);
   const trace = {
-    x: curve.map((p) => p.t),
-    y: curve.map((p) => p.e),
+    x: display.map((p) => p.t),
+    y: display.map((p) => p.e),
     type: "scattergl",
     mode: "lines",
     name: "equity",
@@ -646,6 +811,7 @@ function renderDetailChart(curve) {
     fillcolor: "rgba(88, 166, 255, 0.06)",
   };
   const layout = baseChartLayout();
+  layout.yaxis = { ...layout.yaxis, title: isPct ? "Return %" : "Equity" };
   layout.showlegend = false;
 
   if (!state.detailChartInitialized) {
@@ -656,33 +822,300 @@ function renderDetailChart(curve) {
   }
 }
 
-function renderTrades(trades) {
-  if (!trades.length) {
-    el.tradesTableBody.innerHTML = `<tr><td colspan="14" class="empty-row">No trades yet.</td></tr>`;
+function renderDrawdownChart(curve) {
+  const isPct = state.pnlMode === "percent";
+  let peak = -Infinity;
+  const dd = curve.map((p) => {
+    peak = Math.max(peak, p.e);
+    if (isPct) return peak > 0 ? ((p.e - peak) / peak) * 100 : 0;
+    return p.e - peak;
+  });
+  const trace = {
+    x: curve.map((p) => p.t),
+    y: dd,
+    type: "scattergl",
+    mode: "lines",
+    line: { color: "#f85149", width: 1.5 },
+    fill: "tozeroy",
+    fillcolor: "rgba(248, 81, 73, 0.15)",
+  };
+  const layout = baseChartLayout();
+  layout.yaxis = { ...layout.yaxis, title: isPct ? "Drawdown %" : "Drawdown" };
+  layout.showlegend = false;
+
+  if (!state.drawdownChartInitialized) {
+    Plotly.newPlot(el.drawdownChart, [trace], layout, plotlyConfig());
+    state.drawdownChartInitialized = true;
+  } else {
+    Plotly.react(el.drawdownChart, [trace], layout, plotlyConfig());
+  }
+}
+
+// GitHub-style daily PnL calendar. Colored by magnitude relative to the
+// worst/best day in the received window (no fixed $ thresholds — strategies
+// run at different capital/position sizes).
+function heatmapCellClass(pnl, maxAbs) {
+  if (!pnl || !maxAbs || maxAbs <= 0) return "";
+  const tier = Math.min(3, Math.max(1, Math.ceil((Math.abs(pnl) / maxAbs) * 3)));
+  return pnl > 0 ? `hm-win-${tier}` : `hm-loss-${tier}`;
+}
+
+function renderCalendarHeatmap(dailyPnl) {
+  const WEEKS = 14;
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  const start = new Date(today);
+  start.setUTCDate(start.getUTCDate() - (WEEKS * 7 - 1));
+  start.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7)); // roll back to Monday
+
+  const base = state.detailStartingEquity;
+  const display = {};
+  for (const [d, v] of Object.entries(dailyPnl)) display[d] = amountToDisplay(v, base);
+  const maxAbs = Math.max(0, ...Object.values(display).map((v) => Math.abs(v)));
+
+  const totalDays = Math.round((today - start) / 86400000) + 1;
+  const totalCols = Math.ceil(totalDays / 7);
+
+  const cellsHtml = [];
+  const monthMarks = []; // { col, label } — one per calendar-month transition, GitHub style
+  let lastMonthKey = null;
+  const cursor = new Date(start);
+  for (let i = 0; i < totalDays; i++) {
+    const dow = (cursor.getUTCDay() + 6) % 7; // 0=Mon..6=Sun
+    const col = Math.floor(i / 7);
+    if (dow === 0) {
+      const monthKey = `${cursor.getUTCFullYear()}-${cursor.getUTCMonth()}`;
+      if (monthKey !== lastMonthKey) {
+        monthMarks.push({ col, label: cursor.toLocaleString("en-US", { month: "short", timeZone: "UTC" }) });
+        lastMonthKey = monthKey;
+      }
+    }
+    const iso = cursor.toISOString().slice(0, 10);
+    const pnl = Object.prototype.hasOwnProperty.call(display, iso) ? display[iso] : null;
+    const cls = pnl === null ? "" : heatmapCellClass(pnl, maxAbs);
+    // Full weekday + date in the tooltip, not just ISO — "no hover needed to
+    // tell the day/month" is the visible month/weekday labels below; this is
+    // the exact-date detail on top of that.
+    const dateLabel = cursor.toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+    const title = pnl === null ? `${dateLabel}: no closed trades` : `${dateLabel}: ${fmtDisplayValue(pnl)}`;
+    cellsHtml.push(`<div class="heatmap-cell ${cls}" title="${escapeHtml(title)}"></div>`);
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+
+  const colStyle = `grid-template-columns: repeat(${totalCols}, 15px);`;
+  const monthsHtml = monthMarks
+    .map((m) => `<span style="grid-column:${m.col + 1}">${m.label}</span>`)
+    .join("");
+
+  el.calendarHeatmap.innerHTML = `
+    <div class="heatmap-wrap">
+      <div class="heatmap-weekday-col">
+        <span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span>
+      </div>
+      <div class="heatmap-main">
+        <div class="heatmap-months" style="${colStyle}">${monthsHtml}</div>
+        <div class="heatmap-grid" style="${colStyle}">${cellsHtml.join("")}</div>
+      </div>
+    </div>
+    <div class="heatmap-legend">
+      <span>loss</span>
+      <span class="heatmap-cell hm-loss-3"></span><span class="heatmap-cell hm-loss-2"></span><span class="heatmap-cell hm-loss-1"></span>
+      <span class="heatmap-cell"></span>
+      <span class="heatmap-cell hm-win-1"></span><span class="heatmap-cell hm-win-2"></span><span class="heatmap-cell hm-win-3"></span>
+      <span>win</span>
+    </div>
+  `;
+}
+
+function renderRMultipleHistogram(rMultiples) {
+  const wins = rMultiples.filter((d) => d.r >= 0).map((d) => d.r);
+  const losses = rMultiples.filter((d) => d.r < 0).map((d) => d.r);
+  const traces = [
+    { x: wins, type: "histogram", name: "R ≥ 0", marker: { color: "#3fb950" }, opacity: 0.85 },
+    { x: losses, type: "histogram", name: "R < 0", marker: { color: "#f85149" }, opacity: 0.85 },
+  ];
+  const layout = baseChartLayout();
+  layout.yaxis = { ...layout.yaxis, title: "Count" };
+  layout.xaxis = { ...layout.xaxis, title: "R multiple" };
+  layout.barmode = "overlay";
+  layout.showlegend = false;
+
+  if (!state.rMultipleChartInitialized) {
+    Plotly.newPlot(el.rMultipleChart, traces, layout, plotlyConfig());
+    state.rMultipleChartInitialized = true;
+  } else {
+    Plotly.react(el.rMultipleChart, traces, layout, plotlyConfig());
+  }
+}
+
+function renderSessionStats(sessionStats) {
+  const isPct = state.pnlMode === "percent";
+  const base = state.detailStartingEquity;
+  const values = sessionStats.map((s) => amountToDisplay(s.total_pnl, base));
+  const traces = [{
+    x: sessionStats.map((s) => s.session),
+    y: values,
+    type: "bar",
+    marker: { color: values.map((v) => (v >= 0 ? "#3fb950" : "#f85149")) },
+    text: sessionStats.map((s) => `${fmtInt(s.trades)} trades · ${fmtPct(s.win_rate)} win`),
+    hoverinfo: "text+y",
+  }];
+  const layout = baseChartLayout();
+  layout.yaxis = { ...layout.yaxis, title: isPct ? "Total Return %" : "Total PnL" };
+  layout.showlegend = false;
+
+  if (!state.sessionChartInitialized) {
+    Plotly.newPlot(el.sessionChart, traces, layout, plotlyConfig());
+    state.sessionChartInitialized = true;
+  } else {
+    Plotly.react(el.sessionChart, traces, layout, plotlyConfig());
+  }
+}
+
+// Plain-language fallback for rows where the backend didn't write a `note`
+// (older log entries from before that field existed, or ENTRY/EXIT/PARTIAL
+// rows where the event name mostly speaks for itself) — the goal is that
+// *no* row ever shows a blank reason.
+function fallbackReason(t, dir) {
+  const qty = t.qty === null || t.qty === undefined ? null : fmtNum(t.qty, 4);
+  const pnl = t.pnl_net === null || t.pnl_net === undefined ? null : signedFmt(t.pnl_net);
+  if (t.event === "ENTRY") {
+    return `Opened ${dir.text} ${qty ?? ""} @ ${fmtNum(t.price)}`.trim();
+  }
+  if (t.event && t.event.startsWith("EXIT_")) {
+    return `Closed @ ${fmtNum(t.price)}${pnl ? ` — ${pnl} net` : ""}`;
+  }
+  if (t.event && t.event.startsWith("PARTIAL_")) {
+    return `Partial close ${qty ?? ""} @ ${fmtNum(t.price)}${pnl ? ` — ${pnl} net` : ""}`.trim();
+  }
+  return "no reason recorded";
+}
+
+// Signals list: SIGNAL rows only ("no trade, here's why") — actual trades
+// live in the separate Trades table (renderTradesTable) below.
+function renderSignalsList(trades) {
+  const signals = trades.filter((t) => t.event === "SIGNAL");
+  if (!signals.length) {
+    el.signalsListBody.innerHTML = `<div class="empty-row">No signals yet.</div>`;
     return;
   }
-  const rows = trades.map((t) => {
+  const rows = signals.map((t) => {
     const dir = dirLabel(t.direction);
+    const evt = eventInfo(t.event, t.direction, t.pnl_net);
+    const reasonText = escapeHtml(t.note || fallbackReason(t, dir));
     return `
-      <tr>
-        <td>${fmtTime(t.timestamp)}</td>
-        <td>${escapeHtml(t.event || "")}</td>
+      <div class="trade-row ${evt.row}">
+        <div class="trade-row-accent ${evt.cls}"></div>
+        <div class="trade-row-body">
+          <div class="trade-row-main">
+            <span class="trade-time">${fmtTime(t.timestamp)}</span>
+            <span class="evt-badge ${evt.cls}">${evt.text}</span>
+            <span class="${dir.cls}">${dir.text}</span>
+            <span class="trade-price">${fmtNum(t.price)}</span>
+          </div>
+          <div class="trade-reason">${reasonText}</div>
+        </div>
+      </div>
+    `;
+  });
+  el.signalsListBody.innerHTML = rows.join("");
+}
+
+// One row per trade episode (ENTRY plus everything it closed with) — merges
+// state.tradeEpisodes (closed/partially-closed history) with the currently
+// open position when it has zero closes yet (so a brand-new entry shows up
+// immediately, not just after its first partial/exit — see resolveTradeTarget
+// for why position.json's entry_time needs isSameEntry, not exact match).
+function buildTradeRows() {
+  const rows = state.tradeEpisodes.map((ep) => {
+    const isCurrent = state.currentPosition && isSameEntry(state.currentPosition.entry_time, ep.entry_time);
+    return isCurrent ? normalizeTarget(true, state.currentPosition, ep) : normalizeTarget(false, null, ep);
+  });
+  if (state.currentPosition) {
+    const matched = state.tradeEpisodes.some((ep) => isSameEntry(state.currentPosition.entry_time, ep.entry_time));
+    if (!matched) rows.push(normalizeTarget(true, state.currentPosition, null));
+  }
+  rows.sort((a, b) => (b.entryTime || "").localeCompare(a.entryTime || ""));
+  return rows;
+}
+
+function exitReasonLabel(t, lastClose) {
+  if (t.isOpen) return lastClose ? "partial (open)" : "open";
+  if (!lastClose) return "--";
+  return String(lastClose.event || "").replace("EXIT_", "").replace(/_/g, " ");
+}
+
+function renderTradesTable(rows) {
+  if (!rows.length) {
+    el.tradesTableBody.innerHTML = `<tr><td colspan="16" class="empty-row">No trades yet.</td></tr>`;
+    return;
+  }
+  const html = rows.map((t) => {
+    const dir = dirLabel(t.direction);
+    const lastClose = t.closes.length ? t.closes[t.closes.length - 1] : null;
+    const closePrice = t.isOpen ? currentMarkPrice() : (lastClose ? lastClose.price : null);
+    const invested = (t.entryPrice || 0) * (t.qtyTotal || 0);
+    const pctOfEquity = t.equityAtEntry ? (invested / t.equityAtEntry) * 100 : null;
+    const valueAtClose = (closePrice !== null && closePrice !== undefined && t.qtyTotal !== null)
+      ? closePrice * t.qtyTotal : null;
+
+    const realizedSoFar = t.closes.reduce((s, c) => s + c.pnl_net, 0);
+    const closedQty = t.closes.reduce((s, c) => s + (c.qty || 0), 0);
+    const remainingQty = Math.max(0, (t.qtyTotal || 0) - closedQty);
+    const floating = (t.isOpen && closePrice !== null && closePrice !== undefined)
+      ? t.direction * (closePrice - t.entryPrice) * remainingQty : 0;
+    const pnlAbs = realizedSoFar + floating;
+    const pnlPct = invested ? (pnlAbs / invested) * 100 : null;
+
+    const durationMs = (t.isOpen ? Date.now() : (lastClose ? new Date(lastClose.time).getTime() : null))
+      - new Date(t.entryTime).getTime();
+    const feesTotal = t.closes.reduce((s, c) => s + (c.fee || 0), 0) || t.feesTotal;
+
+    // "Close" is only the LAST leg's price — for a partial+final trade most
+    // of the pnl can come from an earlier leg at a very different price
+    // (e.g. a TP1 partial), so a lone close price makes the pnl look
+    // unexplained. Flag it and let hover show every leg's own price/qty/pnl.
+    const legsBadge = t.closes.length > 1
+      ? ` <span class="legs-badge" title="${escapeHtml(t.closes.map((c) =>
+          `${String(c.event || "").replace(/_/g, " ")}: ${fmtNum(c.qty, 4)} @ ${fmtNum(c.price)} (${signedFmt(c.pnl_net)})`
+        ).join(" → "))}">×${t.closes.length}</span>`
+      : "";
+
+    // Partial-close price(s), shown plainly (not just on hover) since most
+    // of a trade's pnl often comes from an earlier partial at a very
+    // different price than the final "Close" column.
+    const partialPrices = t.closes.filter((c) => String(c.event || "").startsWith("PARTIAL"));
+    const partialCell = partialPrices.length
+      ? partialPrices.map((c) => fmtNum(c.price)).join(", ")
+      : "--";
+
+    return `
+      <tr class="clickable" data-entry-time="${escapeHtml(t.entryTime)}">
         <td class="${dir.cls}">${dir.text}</td>
-        <td>${fmtNum(t.price)}</td>
-        <td>${t.qty === null || t.qty === undefined ? "--" : fmtNum(t.qty, 4)}</td>
+        <td>${fmtNum(t.entryPrice)}</td>
         <td>${fmtNum(t.sl)}</td>
         <td>${fmtNum(t.tp1)}</td>
-        <td>${fmtNum(t.tp2)}</td>
-        <td>${fmtNum(t.tp3)}</td>
-        <td>${fmtNum(t.composite)}</td>
-        <td>${fmtNum(t.atr)}</td>
-        <td class="${pnlClass(t.pnl_net)}">${t.pnl_net === null || t.pnl_net === undefined ? "--" : signedFmt(t.pnl_net)}</td>
-        <td>${t.equity === null || t.equity === undefined ? "--" : fmtNum(t.equity)}</td>
-        <td>${escapeHtml(t.note || "")}</td>
+        <td>${partialCell}</td>
+        <td>${t.isOpen ? "open" : fmtNum(closePrice)}${legsBadge}</td>
+        <td>${escapeHtml(exitReasonLabel(t, lastClose))}</td>
+        <td>${durationMs > 0 ? fmtUptime(durationMs / 1000) : "--"}</td>
+        <td>${fmtNum(t.qtyTotal, 4)}</td>
+        <td>${fmtNum(invested)}</td>
+        <td>${pctOfEquity === null ? "--" : fmtNum(pctOfEquity, 1) + "%"}</td>
+        <td>${valueAtClose === null ? "--" : fmtNum(valueAtClose)}</td>
+        <td>${feesTotal ? fmtNum(feesTotal) : "--"}</td>
+        <td class="${pnlClass(pnlAbs)}">${signedFmt(pnlAbs)}</td>
+        <td class="${pnlClass(pnlPct)}">${pnlPct === null ? "--" : `${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%`}</td>
+        <td class="${pnlClass(t.rMultiple)}">${t.rMultiple === null || t.rMultiple === undefined ? "--" : `${t.rMultiple >= 0 ? "+" : ""}${t.rMultiple.toFixed(2)}R`}</td>
       </tr>
     `;
   });
-  el.tradesTableBody.innerHTML = rows.join("");
+  el.tradesTableBody.innerHTML = html.join("");
+
+  el.tradesTableBody.querySelectorAll("tr.clickable").forEach((tr) => {
+    const target = resolveTradeTarget(tr.dataset.entryTime);
+    if (target) tr.addEventListener("click", () => openTradeModal(target));
+  });
 }
 
 function classifyLogLine(line) {
@@ -766,6 +1199,8 @@ const market = {
   lastCandle: null,
   prevClose: null,
 };
+
+const tradeModal = { chart: null, candleSeries: null };
 
 function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -954,6 +1389,7 @@ function handleMarketMessage(msg) {
     market.prevClose = candle.close;
   }
   market.lastCandle = candle;
+  refreshUnrealizedPnl();
 }
 
 function changeTimeframe(tf) {
@@ -965,6 +1401,263 @@ function changeTimeframe(tf) {
   setMarketConnState("connecting");
   loadMarketHistory(tf).then(() => setupMarketSocket(tf));
 }
+
+// ---------------------------------------------------------------
+// Trade replay modal
+// ---------------------------------------------------------------
+
+// position.json's entry_time and trades.csv's ENTRY timestamp are two
+// independent datetime.now() calls a few ms apart in the trader — never
+// byte-identical — so matching "is this the currently open position" needs
+// a tolerance instead of string equality.
+function isSameEntry(tsA, tsB, toleranceMs = 5000) {
+  if (!tsA || !tsB) return false;
+  return Math.abs(new Date(tsA).getTime() - new Date(tsB).getTime()) < toleranceMs;
+}
+
+function normalizeTarget(fromPosition, position, episode) {
+  if (fromPosition) {
+    return {
+      isOpen: true,
+      entryTime: episode ? episode.entry_time : position.entry_time,
+      direction: position.direction,
+      entryPrice: position.entry_price,
+      sl: position.sl,
+      tp1: position.tp1,
+      tp2: position.tp2,
+      tp3: position.tp3,
+      qtyTotal: position.size_total,
+      equityAtEntry: episode ? episode.equity_at_entry : position.equity_at_entry,
+      feesTotal: episode ? episode.fees_total : null,
+      rMultiple: episode ? episode.r_multiple : null,
+      closes: episode ? episode.closes : [],
+    };
+  }
+  return {
+    isOpen: false,
+    entryTime: episode.entry_time,
+    direction: episode.direction,
+    entryPrice: episode.entry_price,
+    sl: episode.sl,
+    tp1: episode.tp1,
+    tp2: episode.tp2,
+    tp3: episode.tp3,
+    qtyTotal: episode.qty_total,
+    equityAtEntry: episode.equity_at_entry,
+    feesTotal: episode.fees_total,
+    rMultiple: episode.r_multiple,
+    closes: episode.closes,
+  };
+}
+
+function resolveTradeTarget(entryTime) {
+  if (!entryTime) return null;
+  const episode = state.tradeEpisodes.find((e) => e.entry_time === entryTime);
+  const isCurrentPosition = state.currentPosition
+    && isSameEntry(state.currentPosition.entry_time, entryTime);
+  if (isCurrentPosition) return normalizeTarget(true, state.currentPosition, episode || null);
+  return episode ? normalizeTarget(false, null, episode) : null;
+}
+
+const REPLAY_INTERVAL_MS = { "1m": 60e3, "5m": 300e3, "15m": 900e3, "1h": 3600e3, "4h": 14400e3 };
+
+function pickReplayInterval(durationMs) {
+  const hours = durationMs / 3600e3;
+  if (hours <= 3) return "1m";
+  if (hours <= 12) return "5m";
+  if (hours <= 48) return "15m";
+  if (hours <= 240) return "1h";
+  return "4h";
+}
+
+// Combined realized-so-far + floating PnL at each candle (not floating-only,
+// which would jump discontinuously at every partial close) and its
+// running-peak drawdown — the "how did this trade's value evolve" pair.
+function computeTradeSeries(candles, target) {
+  const entryMs = new Date(target.entryTime).getTime();
+  const closes = target.closes
+    .map((c) => ({ ...c, ms: new Date(c.time).getTime() }))
+    .sort((a, b) => a.ms - b.ms);
+  const lastCloseMs = closes.length ? closes[closes.length - 1].ms : null;
+
+  let peak = -Infinity;
+  const pnlPoints = [];
+  const ddPoints = [];
+  for (const c of candles) {
+    const cMs = c.time * 1000;
+    if (cMs < entryMs) continue;
+    if (!target.isOpen && lastCloseMs !== null && cMs > lastCloseMs) break;
+
+    let closedQty = 0;
+    let realizedSoFar = 0;
+    for (const cl of closes) {
+      if (cl.ms <= cMs) {
+        closedQty += cl.qty || 0;
+        realizedSoFar += cl.pnl_net;
+      }
+    }
+    const remaining = Math.max(0, (target.qtyTotal || 0) - closedQty);
+    const floating = target.direction * (c.close - target.entryPrice) * remaining;
+    const total = floating + realizedSoFar;
+
+    pnlPoints.push({ t: c.time, v: total });
+    peak = Math.max(peak, total);
+    ddPoints.push({ t: c.time, v: total - peak });
+  }
+  return { pnlPoints, ddPoints };
+}
+
+function renderTradeModalChart(candles, target) {
+  if (tradeModal.chart) {
+    tradeModal.chart.remove();
+    tradeModal.chart = null;
+    tradeModal.candleSeries = null;
+  }
+  if (typeof LightweightCharts === "undefined" || !el.tradeModalChart) return;
+
+  const textColor = cssVar("--text") || "#c9d1d9";
+  const gridColor = cssVar("--border") || "#232a37";
+  const green = cssVar("--green") || "#3fb950";
+  const red = cssVar("--red") || "#f85149";
+
+  tradeModal.chart = LightweightCharts.createChart(el.tradeModalChart, {
+    layout: { background: { type: "solid", color: "transparent" }, textColor, fontFamily: "JetBrains Mono, monospace", fontSize: 11 },
+    grid: { vertLines: { color: gridColor }, horzLines: { color: gridColor } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: gridColor },
+    timeScale: { borderColor: gridColor, timeVisible: true, secondsVisible: false },
+    watermark: { visible: false },
+    autoSize: false,
+    width: el.tradeModalChart.clientWidth,
+    height: el.tradeModalChart.clientHeight || 380,
+  });
+
+  tradeModal.candleSeries = tradeModal.chart.addCandlestickSeries({
+    upColor: green, downColor: red, borderUpColor: green, borderDownColor: red,
+    wickUpColor: green, wickDownColor: red,
+  });
+  tradeModal.candleSeries.setData(candles.map((c) => (
+    { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }
+  )));
+
+  const markers = [{
+    time: Math.floor(new Date(target.entryTime).getTime() / 1000),
+    position: target.direction === 1 ? "belowBar" : "aboveBar",
+    color: target.direction === 1 ? green : red,
+    shape: target.direction === 1 ? "arrowUp" : "arrowDown",
+    text: "ENTRY",
+  }];
+  for (const c of target.closes) {
+    markers.push({
+      time: Math.floor(new Date(c.time).getTime() / 1000),
+      position: "aboveBar",
+      color: c.pnl_net >= 0 ? green : red,
+      shape: "circle",
+      text: String(c.event || "").replace("EXIT_", "").replace("PARTIAL_", "P:").replace(/_/g, " "),
+    });
+  }
+  markers.sort((a, b) => a.time - b.time);
+  tradeModal.candleSeries.setMarkers(markers);
+
+  const priceLine = (price, color, title) => {
+    if (price === null || price === undefined) return;
+    tradeModal.candleSeries.createPriceLine({
+      price, color, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true, title,
+    });
+  };
+  priceLine(target.sl, red, "SL");
+  priceLine(target.tp1, green, "TP1");
+  priceLine(target.tp2, green, "TP2");
+  priceLine(target.tp3, green, "TP3");
+
+  tradeModal.chart.timeScale().fitContent();
+}
+
+function renderTradeModalPnl(pnlPoints, notional) {
+  const isPct = state.pnlMode === "percent" && notional;
+  const trace = {
+    x: pnlPoints.map((p) => new Date(p.t * 1000).toISOString()),
+    y: pnlPoints.map((p) => (isPct ? (p.v / notional) * 100 : p.v)),
+    type: "scattergl",
+    mode: "lines",
+    line: { color: "#58a6ff", width: 1.6 },
+    fill: "tozeroy",
+    fillcolor: "rgba(88, 166, 255, 0.08)",
+  };
+  const layout = baseChartLayout();
+  layout.yaxis = { ...layout.yaxis, title: isPct ? "PnL % (of notional)" : "PnL" };
+  layout.showlegend = false;
+  Plotly.newPlot(el.tradeModalPnl, [trace], layout, plotlyConfig());
+}
+
+function renderTradeModalDrawdown(ddPoints, notional) {
+  const isPct = state.pnlMode === "percent" && notional;
+  const trace = {
+    x: ddPoints.map((p) => new Date(p.t * 1000).toISOString()),
+    y: ddPoints.map((p) => (isPct ? (p.v / notional) * 100 : p.v)),
+    type: "scattergl",
+    mode: "lines",
+    line: { color: "#f85149", width: 1.4 },
+    fill: "tozeroy",
+    fillcolor: "rgba(248, 81, 73, 0.15)",
+  };
+  const layout = baseChartLayout();
+  layout.yaxis = { ...layout.yaxis, title: isPct ? "Drawdown % (of notional)" : "Drawdown" };
+  layout.showlegend = false;
+  Plotly.newPlot(el.tradeModalDrawdown, [trace], layout, plotlyConfig());
+}
+
+async function openTradeModal(target) {
+  el.tradeModal.classList.remove("hidden");
+
+  const dir = dirLabel(target.direction);
+  const lastClose = target.closes[target.closes.length - 1];
+  const exitLabel = target.isOpen ? "open" : fmtNum(lastClose ? lastClose.price : null);
+  el.tradeModalTitle.textContent = `${dir.text} · ${fmtNum(target.entryPrice)} → ${exitLabel}`;
+  el.tradeModalSubtitle.textContent = `Entry ${fmtTime(target.entryTime)}`
+    + (target.isOpen ? " — still open" : ` · pnl ${signedFmt(target.closes.reduce((s, c) => s + c.pnl_net, 0))}`);
+
+  const entryMs = new Date(target.entryTime).getTime();
+  const endMs = target.isOpen ? Date.now() : new Date(lastClose.time).getTime();
+  const durationMs = Math.max(endMs - entryMs, 60000);
+  const interval = pickReplayInterval(durationMs);
+  const padMs = Math.max(durationMs * 0.15, (REPLAY_INTERVAL_MS[interval] || 60000) * 10);
+  const fetchStart = Math.floor(entryMs - padMs);
+  const fetchEnd = Math.min(Math.floor(endMs + padMs), Date.now());
+
+  let candles = [];
+  try {
+    const resp = await fetch(`${BINANCE_REST}?symbol=BTCUSDT&interval=${interval}&startTime=${fetchStart}&endTime=${fetchEnd}&limit=1000`);
+    if (resp.ok) candles = (await resp.json()).map(parseKline);
+  } catch (e) {
+    // leave candles empty — the modal still shows PnL/drawdown computed
+    // from the trade's own recorded prices even if Binance is unreachable.
+  }
+
+  renderTradeModalChart(candles, target);
+  const { pnlPoints, ddPoints } = computeTradeSeries(candles, target);
+  const notional = (target.entryPrice || 0) * (target.qtyTotal || 0) || null;
+  renderTradeModalPnl(pnlPoints, notional);
+  renderTradeModalDrawdown(ddPoints, notional);
+}
+
+function closeTradeModal() {
+  el.tradeModal.classList.add("hidden");
+  if (tradeModal.chart) {
+    tradeModal.chart.remove();
+    tradeModal.chart = null;
+    tradeModal.candleSeries = null;
+  }
+}
+
+el.tradeModalClose.addEventListener("click", closeTradeModal);
+el.tradeModal.addEventListener("click", (e) => {
+  if (e.target === el.tradeModal) closeTradeModal();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !el.tradeModal.classList.contains("hidden")) closeTradeModal();
+});
 
 // ---------------------------------------------------------------
 // Boot

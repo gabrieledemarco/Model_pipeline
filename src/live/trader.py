@@ -8,8 +8,12 @@ composite/Wyckoff, 15M per ICT).
 
 Architettura
 ────────────
-  WebSocket  wss://fstream.binance.com/ws/btcusdt@kline_{ws_interval}
-       │
+  WebSocket  wss://stream.bybit.com/v5/public/linear  (topic kline.{N}.BTCUSDT)
+       │      — usato SOLO come trigger "candela chiusa": fstream.binance.com
+       │        smetteva di consegnare frame dati (pur restando "aperta" a
+       │        livello di ping/pong) per periodi prolungati su questo host;
+       │        Bybit si è dimostrata stabile in test diretti. I dati per il
+       │        calcolo del segnale restano da Binance FAPI via REST (sotto).
        └─► on bar CLOSE ─► signal_fn() ─► entry / flat logic
 
   Background monitor (ogni POLL_SECS):
@@ -45,7 +49,19 @@ ATR_TP3  = 6.0
 RISK_PCT = 0.01    # 1 % equity per trade
 FEE      = 0.0006  # 0.06 % taker Bitget USDT-Futures
 
-WS_URL_TEMPLATE = "wss://fstream.binance.com/ws/btcusdt@kline_{interval}"
+# Fallback notional when the risk-based size (_size_from_stop) hits the
+# max_leverage cap — a very tight structural stop otherwise pushes qty
+# right up to the full leverage cap on every such trade, maxing out
+# available margin instead of just sizing down the risk budget. Falling
+# back to a small fixed % of equity avoids that.
+FALLBACK_SIZE_PCT = 0.01
+
+BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
+# ws_interval ("1h" / "15m", used for logging + Binance REST calls elsewhere)
+# -> Bybit kline topic interval, expressed in minutes.
+BYBIT_WS_INTERVAL = {"1h": "60", "15m": "15"}
+BYBIT_PING_SECS = 20  # per Bybit docs: send an application-level ping every 20s
+
 POLL_SECS = 30
 HEARTBEAT_EVERY_N_POLLS = 10   # ~5 min at POLL_SECS=30 — keeps live_trader.log
                                # from going silent for up to an hour between
@@ -126,7 +142,13 @@ def _size_from_stop(
         return 0.001
     qty     = risk_usd / sl_dist
     max_qty = equity * max_leverage / entry_price
-    return max(round(min(qty, max_qty), 3), 0.001)
+    if qty > max_qty:
+        # Risk budget would need the full leverage cap — the stop is
+        # unusually tight. Fall back to a small fixed-% position instead
+        # of maxing out available margin (and instead of risking an
+        # exchange rejection if max_leverage doesn't match the account).
+        return max(round(equity * FALLBACK_SIZE_PCT / entry_price, 3), 0.001)
+    return max(round(qty, 3), 0.001)
 
 
 def _levels(direction: int, entry: float, atr: float):
@@ -189,11 +211,16 @@ class LiveTrader:
         self.trade_log = TradeLog(log_dir / "trades.csv", strategy_id=strategy_id)
         self.state     = ps.load()
         self._running  = True
-        self._last_heartbeat = time.time()
+        self._last_ws_touch      = time.time()
+        self._last_monitor_touch = time.time()
 
-    def _touch(self) -> None:
-        """Record forward progress. Read by the watchdog thread — see run()."""
-        self._last_heartbeat = time.time()
+    def _touch_ws(self) -> None:
+        """Record forward progress of _ws_loop. Read by the watchdog thread."""
+        self._last_ws_touch = time.time()
+
+    def _touch_monitor(self) -> None:
+        """Record forward progress of _monitor_loop. Read by the watchdog thread."""
+        self._last_monitor_touch = time.time()
 
     def _watchdog(self) -> None:
         """Runs in its own OS thread, not on the asyncio event loop.
@@ -202,15 +229,33 @@ class LiveTrader:
         WebSocket the library's keepalive failed to notice is dead) would
         also block any asyncio-based watchdog task — this has to live
         outside the loop to be able to detect and react to that case.
+
+        _ws_loop and _monitor_loop are tracked separately: they are
+        independent asyncio tasks, and _monitor_loop polling happily every
+        POLL_SECS says nothing about whether _ws_loop is still receiving
+        candle closes. A single shared timestamp touched by either loop
+        would mask a wedged WebSocket for as long as the monitor kept
+        ticking — exactly the failure mode this watchdog exists to catch.
         """
         while self._running:
             time.sleep(30)
-            stale_for = time.time() - self._last_heartbeat
-            if stale_for > WATCHDOG_TIMEOUT_SECS:
+            now = time.time()
+            ws_stale_for      = now - self._last_ws_touch
+            monitor_stale_for = now - self._last_monitor_touch
+            if ws_stale_for > WATCHDOG_TIMEOUT_SECS:
                 log.critical(
-                    "Watchdog: no progress in %.0fs (limit %ds) — event loop "
-                    "appears stuck. Forcing process exit for supervisor restart.",
-                    stale_for, WATCHDOG_TIMEOUT_SECS,
+                    "Watchdog: _ws_loop no progress in %.0fs (limit %ds) — "
+                    "WebSocket appears stuck. Forcing process exit for "
+                    "supervisor restart.",
+                    ws_stale_for, WATCHDOG_TIMEOUT_SECS,
+                )
+                os._exit(1)  # bypass asyncio cleanup: the loop may be wedged
+            if monitor_stale_for > WATCHDOG_TIMEOUT_SECS:
+                log.critical(
+                    "Watchdog: _monitor_loop no progress in %.0fs (limit %ds) "
+                    "— event loop appears stuck. Forcing process exit for "
+                    "supervisor restart.",
+                    monitor_stale_for, WATCHDOG_TIMEOUT_SECS,
                 )
                 os._exit(1)  # bypass asyncio cleanup: the loop may be wedged
 
@@ -497,9 +542,21 @@ class LiveTrader:
 
         self._write_analysis(diagnostics, signal, composite, atr, close)
 
+        # Every SIGNAL row gets a human-readable reason for the dashboard,
+        # so "signal didn't become a trade" is never a silent gap: either
+        # the strategy's own diagnostics (threshold/regime/killzone/cooldown
+        # not met) or, when the strategy *would* have entered, the
+        # engine-level reason it didn't (a position was already open) —
+        # diagnostics alone can't see that, since it's computed independently
+        # of position state.
+        reason = diagnostics.get("reason", "") if diagnostics else ""
+        if signal != 0 and self.state.active:
+            reason = (f"signal={signal:+d} but position already open "
+                      f"(dir={self.state.direction:+d}) — no new entry")
+
         self.trade_log.write(
             event="SIGNAL", direction=signal, price=close,
-            composite=composite, atr=atr,
+            composite=composite, atr=atr, note=reason,
         )
 
         if not self.state.active:
@@ -532,25 +589,39 @@ class LiveTrader:
 
     # ── WebSocket loop ────────────────────────────────────────────────────────
 
+    async def _ws_ping_loop(self, ws) -> None:
+        """Bybit expects an application-level {"op": "ping"} every ~20s
+        (docs: 'send the ping heartbeat packet every 20 seconds') on top of
+        whatever the websockets library does at the protocol level."""
+        while True:
+            await asyncio.sleep(BYBIT_PING_SECS)
+            await ws.send(json.dumps({"op": "ping"}))
+
     async def _ws_loop(self):
         backoff = 5
-        ws_url = WS_URL_TEMPLATE.format(interval=self.ws_interval)
+        topic = f"kline.{BYBIT_WS_INTERVAL[self.ws_interval]}.{SYMBOL}"
         while self._running:
             try:
-                log.info("WebSocket connecting to %s", ws_url)
+                log.info("WebSocket connecting to %s", BYBIT_WS_URL)
                 async with websockets.connect(
-                    ws_url, ping_interval=20, ping_timeout=20,
+                    BYBIT_WS_URL, ping_interval=20, ping_timeout=20,
                 ) as ws:
                     backoff = 5
-                    self._touch()
-                    async for raw in ws:
-                        self._touch()
-                        if not self._running:
-                            break
-                        msg = json.loads(raw)
-                        if msg.get("k", {}).get("x"):   # candle closed
-                            self.on_candle_close()
-                            self._touch()
+                    self._touch_ws()
+                    await ws.send(json.dumps({"op": "subscribe", "args": [topic]}))
+                    ping_task = asyncio.create_task(self._ws_ping_loop(ws))
+                    try:
+                        async for raw in ws:
+                            self._touch_ws()
+                            if not self._running:
+                                break
+                            msg = json.loads(raw)
+                            data = msg.get("data")
+                            if data and data[0].get("confirm"):   # candle closed
+                                self.on_candle_close()
+                                self._touch_ws()
+                    finally:
+                        ping_task.cancel()
             except Exception as e:
                 log.warning("WS error: %s — retry in %ds", e, backoff)
                 await asyncio.sleep(backoff)
@@ -566,7 +637,7 @@ class LiveTrader:
         polls_since_heartbeat = 0
         while self._running:
             await asyncio.sleep(POLL_SECS)
-            self._touch()
+            self._touch_monitor()
             mark = self.check_position() if self.state.active else None
 
             polls_since_heartbeat += 1
@@ -602,7 +673,8 @@ class LiveTrader:
 
         # Calcola il segnale subito all'avvio
         self.on_candle_close()
-        self._touch()
+        self._touch_ws()
+        self._touch_monitor()
 
         await asyncio.gather(self._ws_loop(), self._monitor_loop())
 
