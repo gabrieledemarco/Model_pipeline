@@ -45,13 +45,24 @@ Varianti (confluenza crescente)
 ────────────────────────────────
   V1  Structure Baseline     : bias 30m + zona 15m, nessun filtro statistico
   V2  + Regime + Sweep       : V1 + regime HMM d'accordo + liquidity sweep 5m
+                                (proxy: wick oltre l'estremo + reclaim prezzo)
   V3  + Expected-Return Gate : V2 + P(direzione) RandomForest > soglia
                                 + filtro volatilita' estrema
+  V4  + CVD Order-Flow       : V2 ma il liquidity sweep richiede conferma di
+                                order-flow REALE (taker_buy_base Binance,
+                                CVD/delta cumulato) invece del solo prezzo —
+                                idea nota da letteratura order-flow/FinTwit
+                                ("smart money absorption"). Nota: un segnale
+                                CVD STANDALONE era gia' stato testato e
+                                bocciato (IC FAIL) in create_github_strategies
+                                _report.py — qui e' usato come FILTRO di
+                                conferma su una struttura gia' validata (V2),
+                                ipotesi diversa, mai testata in questa forma.
 
 Validazione (identica al resto del repo)
 ─────────────────────────────────────────
   WFO causale 6m/2m/2m -> holdout genuino 2025-2026 -> Monte Carlo
-  iid + block-bootstrap -> Deflated Sharpe Ratio (famiglia di 3 varianti)
+  iid + block-bootstrap -> Deflated Sharpe Ratio (famiglia di 4 varianti)
 """
 from __future__ import annotations
 
@@ -75,7 +86,7 @@ import matplotlib.ticker as mticker
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 
-from src.strategy.data_fetcher import fetch_binance_vision_klines
+from src.strategy.data_fetcher import fetch_binance_vision_klines, fetch_binance_vision_taker_flow
 from src.strategy.indicators import add_indicators
 from src.strategy.smc import compute_smc_features, smc_trend_signal
 from src.strategy.mtf_swing import causal_trend_state, align_htf_to_ltf
@@ -136,7 +147,12 @@ w(SEP)
 # ═══════════════════════════════════════════════════════════════════════════
 print("\n[DATA] Loading 5m / 15m / 30m BTCUSDT perpetual history...")
 t0 = time.time()
-df5 = add_indicators(fetch_binance_vision_klines(
+# taker_flow (not plain klines): adds taker_buy_base/n_trades, which
+# add_indicators turns into cvd/cvd_slope_4/cvd_div/flow_ratio automatically
+# (src/strategy/indicators.py, gated on "taker_buy_base" being present) —
+# needed for the V4 CVD confluence variant below, no separate fetch/column
+# plumbing required.
+df5 = add_indicators(fetch_binance_vision_taker_flow(
     "5m", START_YEAR, START_MONTH, END_YEAR, END_MONTH, workers=8))
 df15 = add_indicators(fetch_binance_vision_klines(
     "15m", START_YEAR, START_MONTH, END_YEAR, END_MONTH, workers=8))
@@ -204,12 +220,29 @@ sweep_bull15 = sweep_bull_roll.reindex(IDX15, method="ffill").fillna(0).astype(i
 sweep_bear15 = sweep_bear_roll.reindex(IDX15, method="ffill").fillna(0).astype(int).values
 print(f"  bull sweeps: {int(sweep_bull_5m.sum()):,}   bear sweeps: {int(sweep_bear_5m.sum()):,}  (5m bars)")
 
-# df5 and its intermediates are done being useful — only the two derived
+# V4 only: same sweep definition, but additionally require REAL order-flow
+# confirmation at the sweep bar — cvd_slope_4 (4-bar CVD momentum, from real
+# taker_buy_base, not price-derived) must already be turning in the bias
+# direction. This is the "smart money absorption" reading: a genuine sweep
+# should show aggressive real buying (not just a price wick) right as the
+# recent low is taken out.
+cvd_slope_5m = df5["cvd_slope_4"]
+sweep_bull_cvd_5m = sweep_bull_5m & (cvd_slope_5m > 0)
+sweep_bear_cvd_5m = sweep_bear_5m & (cvd_slope_5m < 0)
+sweep_bull_cvd_roll = sweep_bull_cvd_5m.rolling(SWEEP_LOOKBACK_BARS_5M, min_periods=1).max()
+sweep_bear_cvd_roll = sweep_bear_cvd_5m.rolling(SWEEP_LOOKBACK_BARS_5M, min_periods=1).max()
+sweep_bull_cvd15 = sweep_bull_cvd_roll.reindex(IDX15, method="ffill").fillna(0).astype(int).values
+sweep_bear_cvd15 = sweep_bear_cvd_roll.reindex(IDX15, method="ffill").fillna(0).astype(int).values
+print(f"  CVD-confirmed bull sweeps: {int(sweep_bull_cvd_5m.sum()):,}   "
+      f"bear sweeps: {int(sweep_bear_cvd_5m.sum()):,}  (5m bars)")
+
+# df5 and its intermediates are done being useful — only the four derived
 # 15m-grid arrays above are needed downstream. This box has 3.8GB RAM shared
 # with 5 live_trader.py processes; freeing the 472k-row frame before the
 # memory-heavy WFO loop (HMM+RandomForest fits) is the difference between
 # finishing and getting OOM-killed (observed both ways while building this).
 del df5, recent_low_5m, recent_high_5m, sweep_bull_5m, sweep_bear_5m, sweep_bull_roll, sweep_bear_roll
+del cvd_slope_5m, sweep_bull_cvd_5m, sweep_bear_cvd_5m, sweep_bull_cvd_roll, sweep_bear_cvd_roll
 gc.collect()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -352,7 +385,16 @@ print(f"  done in {time.time()-t0:.0f}s  "
 #    convention as the rest of the repo: stop before target.
 # ═══════════════════════════════════════════════════════════════════════════
 def simulate(variant: int, hmm_bull: np.ndarray, hmm_bear: np.ndarray,
-             ml_proba: np.ndarray, restrict_to_oos: bool) -> tuple[pd.DataFrame, float, float]:
+             ml_proba: np.ndarray, restrict_to_oos: bool,
+             sweep_bull_arr: np.ndarray = None, sweep_bear_arr: np.ndarray = None,
+             ) -> tuple[pd.DataFrame, float, float]:
+    # sweep_bull_arr/sweep_bear_arr default to the plain price-based sweep
+    # (V1/V2/V3). V4 passes the CVD-confirmed sweep arrays instead — same
+    # variant==2 gating logic (regime + sweep), different sweep evidence.
+    if sweep_bull_arr is None:
+        sweep_bull_arr = sweep_bull15
+    if sweep_bear_arr is None:
+        sweep_bear_arr = sweep_bear15
     cap = INIT_CAP
     peak = cap
     mdd = 0.0
@@ -404,7 +446,7 @@ def simulate(variant: int, hmm_bull: np.ndarray, hmm_bear: np.ndarray,
             if restrict_to_oos and np.isnan(hmm_bull[i]):
                 continue
             regime_ok = (hmm_bull[i] > 0.5) if b == 1 else (hmm_bear[i] > 0.5)
-            sweep_ok = sweep_bull15[i] if b == 1 else sweep_bear15[i]
+            sweep_ok = sweep_bull_arr[i] if b == 1 else sweep_bear_arr[i]
             if not (regime_ok and sweep_ok):
                 continue
 
@@ -465,6 +507,12 @@ v1_trades, v1_cap, v1_mdd = simulate(1, NAN15, NAN15, NAN15, restrict_to_oos=Fal
 # see the note above the WFO section on why that was dropped).
 v2_oos_trades, v2_oos_cap, v2_oos_mdd = simulate(2, hmm_bull_oos, hmm_bear_oos, NAN15, restrict_to_oos=True)
 v3_oos_trades, v3_oos_cap, v3_oos_mdd = simulate(3, hmm_bull_oos, hmm_bear_oos, ml_proba_oos, restrict_to_oos=True)
+# V4: identical to V2 (same regime gate, same fitted HMM — reused, not
+# refit) except the sweep evidence is real order-flow (CVD) instead of price.
+v4_oos_trades, v4_oos_cap, v4_oos_mdd = simulate(
+    2, hmm_bull_oos, hmm_bear_oos, NAN15, restrict_to_oos=True,
+    sweep_bull_arr=sweep_bull_cvd15, sweep_bear_arr=sweep_bear_cvd15,
+)
 
 VARIANTS = {
     "V1 Structure Baseline": dict(is_trades=v1_trades, is_cap=v1_cap, is_mdd=v1_mdd,
@@ -476,6 +524,9 @@ VARIANTS = {
     "V3 + Expected-Return Gate": dict(is_trades=v3_oos_trades, is_cap=v3_oos_cap, is_mdd=v3_oos_mdd,
                                        oos_trades=v3_oos_trades, oos_cap=v3_oos_cap, oos_mdd=v3_oos_mdd,
                                        fitted=True),
+    "V4 + CVD Order-Flow": dict(is_trades=v4_oos_trades, is_cap=v4_oos_cap, is_mdd=v4_oos_mdd,
+                                 oos_trades=v4_oos_trades, oos_cap=v4_oos_cap, oos_mdd=v4_oos_mdd,
+                                 fitted=True),
 }
 
 for name, v in VARIANTS.items():
@@ -559,7 +610,7 @@ print(f"\n[DONE] backtest+validation runtime: {time.time()-t_start:.0f}s")
 print("\n[REPORT] Building HTML report...")
 t0 = time.time()
 COLORS = {"V1 Structure Baseline": BLUE, "V2 + Regime + Sweep": GOLD,
-          "V3 + Expected-Return Gate": PURPLE}
+          "V3 + Expected-Return Gate": PURPLE, "V4 + CVD Order-Flow": GREEN}
 
 
 def _ax2(ax, title="", xlabel="", ylabel=""):
@@ -705,6 +756,7 @@ nav = """
   <a href="#v1">V1</a>
   <a href="#v2">V2</a>
   <a href="#v3">V3</a>
+  <a href="#v4">V4</a>
   <a href="#years">Per Anno</a>
 </nav>"""
 
@@ -770,12 +822,22 @@ body = f"""
   </p>
   <p>
     <strong>Risultato piu' rilevante:</strong> l'aggiunta di piu' confluenza
-    (regime + liquidity sweep in V2, poi + gate ML in V3) <em>riduce</em>
-    l'edge invece di migliorarlo, e V3 fallisce sia il gate DSR sia l'holdout
-    genuino — segno di overfitting da eccesso di filtri su un modello ML
-    sottopotenziato rispetto ai dati disponibili, non un errore di
-    implementazione (il pattern e' consistente: meno trade, edge via via piu'
-    marginale, holdout che si deteriora prima delle altre metriche).
+    <em>riduce</em> l'edge invece di migliorarlo, in ogni forma testata.
+    V3 (+ gate ML) fallisce DSR e holdout. V4 (+ conferma order-flow reale —
+    CVD da taker_buy_base Binance, non piu' un proxy sul solo prezzo) passa
+    l'holdout genuino ma fallisce comunque il gate DSR: il filtro CVD e'
+    troppo selettivo (22.421 sweep price-based -> 2.949 CVD-confirmed, -87%)
+    e il campione residuo (208 trade OOS) non basta a superare la soglia di
+    selezione multipla su una famiglia di 4 varianti. Pattern consistente su
+    tutta la sessione: ogni filtro aggiuntivo abbassa il numero di trade piu'
+    velocemente di quanto migliori la loro qualita' media — segno che V1/V2
+    stanno gia' catturando la parte robusta dell'edge strutturale, non che
+    l'implementazione dei filtri sia difettosa (V4 in particolare riusa dati
+    di order-flow reali, non un proxy — la stessa idea CVD era gia' stata
+    bocciata come segnale standalone in <code>create_github_strategies_report
+    .py</code> (IC FAIL); qui fallisce di nuovo anche come filtro di conferma,
+    rafforzando che il segnale CVD standalone su BTCUSDT 5m/15m e' debole più
+    in generale, non solo in quella forma).
   </p>
 </section>
 
