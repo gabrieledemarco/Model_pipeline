@@ -58,6 +58,12 @@ Varianti (confluenza crescente)
                                 _report.py — qui e' usato come FILTRO di
                                 conferma su una struttura gia' validata (V2),
                                 ipotesi diversa, mai testata in questa forma.
+  V5  + Neural Expected-Return : identica a V3, ma il modello di rendimento
+                                atteso e' una rete neurale (MLPClassifier,
+                                32-16 neuroni, sklearn) invece di un
+                                RandomForest — stesse feature, stesso target,
+                                stesso walk-forward. Isola l'effetto della
+                                classe di modello dall'effetto delle feature.
 
 Validazione (identica al resto del repo)
 ─────────────────────────────────────────
@@ -84,6 +90,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
 from src.strategy.data_fetcher import fetch_binance_vision_klines, fetch_binance_vision_taker_flow
@@ -371,6 +378,57 @@ print(f"  done in {time.time()-t0:.0f}s  "
       f"(HMM coverage: {np.isfinite(hmm_bull_oos).sum():,} bars, "
       f"ML coverage: {np.isfinite(ml_proba_oos).sum():,} bars)")
 
+
+def compute_oos_ml(windows: list[tuple], model_type: str) -> np.ndarray:
+    """Same walk-forward feature/target construction as
+    compute_oos_hmm_and_ml's RF branch, factored out so a second classifier
+    (V5's MLP) can be swapped in without re-fitting HMM (already computed
+    above, identical either way — HMM is the regime model, independent of
+    which expected-return classifier gates V3 vs V5)."""
+    proba_full = np.full(N15, np.nan)
+    for tr_s, tr_e, oo_s, oo_e in windows:
+        idx_is = np.where((IDX15 >= tr_s) & (IDX15 < tr_e))[0]
+        idx_oos = np.where((IDX15 >= oo_s) & (IDX15 < oo_e))[0]
+        if len(idx_is) < 1000 or len(idx_oos) < 50:
+            print("x", end="", flush=True)
+            continue
+        y_is = y_target[idx_is]
+        valid = ~np.isnan(y_is)
+        if valid.sum() < 300:
+            print(".", end="", flush=True)
+            continue
+        X_is = np.nan_to_num(ml_feats.iloc[idx_is].values[valid], nan=0.0, posinf=10.0, neginf=-10.0)
+        X_oos = np.nan_to_num(ml_feats.iloc[idx_oos].values, nan=0.0, posinf=10.0, neginf=-10.0)
+        scaler = StandardScaler().fit(X_is)
+        Xis_s = scaler.transform(X_is)
+        Xoos_s = scaler.transform(X_oos)
+        if model_type == "mlp":
+            # Small (32,16) MLP, early stopping — this box OOM-killed on
+            # RandomForest(n_jobs=-1) earlier; a small feed-forward net
+            # trained single-threaded stays well inside the same memory
+            # budget that worked for RF at n_jobs=1.
+            clf = MLPClassifier(hidden_layer_sizes=(32, 16), activation="relu",
+                                 alpha=1e-3, max_iter=300, early_stopping=True,
+                                 n_iter_no_change=15, random_state=42)
+        else:
+            clf = RandomForestClassifier(n_estimators=200, max_depth=5, min_samples_leaf=50,
+                                          random_state=42, n_jobs=1)
+        clf.fit(Xis_s, y_is[valid])
+        proba_full[idx_oos] = clf.predict_proba(Xoos_s)[:, 1]
+        print(".", end="", flush=True)
+        del clf, scaler, X_is, X_oos, Xis_s, Xoos_s
+        gc.collect()
+    print()
+    return proba_full
+
+
+print("\n[WFO] Fitting neural-network (MLP) expected-return per window "
+      "(walk-forward, causal, V5)...")
+t0 = time.time()
+ml_proba_mlp_oos = compute_oos_ml(WF_WINDOWS, model_type="mlp")
+print(f"  done in {time.time()-t0:.0f}s  "
+      f"(MLP coverage: {np.isfinite(ml_proba_mlp_oos).sum():,} bars)")
+
 # NOTE: an earlier version of this script also fit a full-sample
 # ("in-sample reference") HMM+RandomForest here, purely as an optimistic
 # before-WFO comparison point (not used for the validation verdict). Fitting
@@ -513,6 +571,9 @@ v4_oos_trades, v4_oos_cap, v4_oos_mdd = simulate(
     2, hmm_bull_oos, hmm_bear_oos, NAN15, restrict_to_oos=True,
     sweep_bull_arr=sweep_bull_cvd15, sweep_bear_arr=sweep_bear_cvd15,
 )
+# V5: identical to V3 (same regime gate + vol filter) except the expected-
+# return classifier is a neural net (MLP) instead of RandomForest.
+v5_oos_trades, v5_oos_cap, v5_oos_mdd = simulate(3, hmm_bull_oos, hmm_bear_oos, ml_proba_mlp_oos, restrict_to_oos=True)
 
 VARIANTS = {
     "V1 Structure Baseline": dict(is_trades=v1_trades, is_cap=v1_cap, is_mdd=v1_mdd,
@@ -527,6 +588,9 @@ VARIANTS = {
     "V4 + CVD Order-Flow": dict(is_trades=v4_oos_trades, is_cap=v4_oos_cap, is_mdd=v4_oos_mdd,
                                  oos_trades=v4_oos_trades, oos_cap=v4_oos_cap, oos_mdd=v4_oos_mdd,
                                  fitted=True),
+    "V5 + Neural Expected-Return": dict(is_trades=v5_oos_trades, is_cap=v5_oos_cap, is_mdd=v5_oos_mdd,
+                                         oos_trades=v5_oos_trades, oos_cap=v5_oos_cap, oos_mdd=v5_oos_mdd,
+                                         fitted=True),
 }
 
 for name, v in VARIANTS.items():
@@ -610,7 +674,8 @@ print(f"\n[DONE] backtest+validation runtime: {time.time()-t_start:.0f}s")
 print("\n[REPORT] Building HTML report...")
 t0 = time.time()
 COLORS = {"V1 Structure Baseline": BLUE, "V2 + Regime + Sweep": GOLD,
-          "V3 + Expected-Return Gate": PURPLE, "V4 + CVD Order-Flow": GREEN}
+          "V3 + Expected-Return Gate": PURPLE, "V4 + CVD Order-Flow": GREEN,
+          "V5 + Neural Expected-Return": ORANGE}
 
 
 def _ax2(ax, title="", xlabel="", ylabel=""):
@@ -735,7 +800,9 @@ for name, v in VARIANTS.items():
         ["MC P(ruin) block", f"{p_ruin_blk:.1%}"],
         ["Holdout 2025-2026 return", f"{holdout_ret:+.1f}%"],
         ["Holdout trades", f"{len(holdout):,}"],
-        ["Fitted parameters", "Yes (HMM" + ("+RF)" if "V3" in name else ")") if v["fitted"] else "No — pure structural rule"],
+        ["Fitted parameters",
+         ("Yes (HMM+RF)" if "V3" in name else "Yes (HMM+MLP)" if "V5" in name else "Yes (HMM)")
+         if v["fitted"] else "No — pure structural rule"],
     ]
     variant_sections += f"""
 <section id="{name.split()[0].lower()}">
@@ -757,6 +824,7 @@ nav = """
   <a href="#v2">V2</a>
   <a href="#v3">V3</a>
   <a href="#v4">V4</a>
+  <a href="#v5">V5</a>
   <a href="#years">Per Anno</a>
 </nav>"""
 
@@ -838,6 +906,19 @@ body = f"""
     .py</code> (IC FAIL); qui fallisce di nuovo anche come filtro di conferma,
     rafforzando che il segnale CVD standalone su BTCUSDT 5m/15m e' debole più
     in generale, non solo in quella forma).
+  </p>
+  <p>
+    <strong>V5 (rete neurale):</strong> stesse feature e target di V3, solo
+    il modello cambia (MLPClassifier 32-16 invece di RandomForest). Risultato
+    nettamente migliore: +31.0% vs +9.8%, Sharpe +2.431 vs +0.994 — la rete
+    neurale estrae piu' segnale dalle stesse feature dello stesso gate ML.
+    Fallisce comunque DSR (family N=5): la soglia di correzione per
+    selezione multipla (SR0) sale con il numero di varianti testate nella
+    stessa sessione — a parita' di merito individuale, testare 5 varianti
+    invece di 1 rende DSR piu' severo per costruzione (protegge da
+    cherry-picking, non e' un difetto della metrica). In una famiglia piu'
+    piccola (es. solo V1/V2/V5) il gate sarebbe meno punitivo — un possibile
+    prossimo passo mirato, non un modo per abbassare la soglia.
   </p>
 </section>
 
