@@ -145,6 +145,14 @@ def _build_signal_source(strategy_type: str, scenario: str):
         from src.live.ml_rf_live import compute_ml_rf_signal
         return "ML RandomForest 8h", compute_ml_rf_signal, "1h"
 
+    if strategy_type == "smc_v1":
+        from src.live.smc_ltf_live import compute_smc_v1_signal, SCENARIO_V1
+        return SCENARIO_V1, compute_smc_v1_signal, "15m"
+
+    if strategy_type == "smc_v2":
+        from src.live.smc_ltf_live import compute_smc_v2_signal, SCENARIO_V2
+        return SCENARIO_V2, compute_smc_v2_signal, "15m"
+
     raise ValueError(f"Unknown strategy_type: {strategy_type!r}")
 
 
@@ -180,12 +188,15 @@ def parse_args() -> argparse.Namespace:
                     help="Scenario strategia (solo per --strategy-type composite; "
                          "default: 'Strong (≥±18)')")
     ap.add_argument("--strategy-type", default="composite",
-                    choices=["composite", "wyckoff", "ict", "ou_hmm", "ml_rf_8h"],
+                    choices=["composite", "wyckoff", "ict", "ou_hmm", "ml_rf_8h",
+                             "smc_v1", "smc_v2"],
                     help="Fonte del segnale: 'composite' (score multi-TF, "
                          "parametrizzato da --scenario), 'wyckoff' (Spring/"
                          "Upthrust 1H), 'ict' (Silver Bullet NY AM+PM 15M), "
-                         "'ou_hmm' (S07 OU Mean Reversion 1H, HMM-gated 4H). "
-                         "Default: composite")
+                         "'ou_hmm' (S07 OU Mean Reversion 1H, HMM-gated 4H), "
+                         "'ml_rf_8h' (ML RandomForest 8h), 'smc_v1' (LTF SMC "
+                         "Structure Baseline 30m/15m), 'smc_v2' (smc_v1 + HMM "
+                         "regime + 5m liquidity sweep). Default: composite")
     ap.add_argument("--strategy-id", default=None,
                     help="Identificatore univoco della strategia (default: "
                          "slug auto-derivato da scenario+exchange, es. "

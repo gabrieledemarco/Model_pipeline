@@ -162,6 +162,34 @@ def fetch_1h_bars_extended(symbol: str = SYMBOL, limit: int = 4500) -> pd.DataFr
     return result.tail(limit)
 
 
+def fetch_30m_bars_extended(symbol: str = SYMBOL, limit: int = 3000) -> pd.DataFrame:
+    """
+    Fetch extended 30M OHLCV history from production FAPI (reuses `_klines`,
+    same helper/pagination pattern as `fetch_15m_bars` / `fetch_4h_bars_extended`).
+    3000 bars ≈ 62 days — used by src/live/smc_ltf_live.py (V1/V2 LTF SMC/MTF
+    strategies, reports/report_ltf_smc_mtf.html) for the 30m structural bias
+    (smc_trend_signal), which only needs enough history to warm up the
+    swing_len=50 pivot detection and reach its current CHoCH-locked state.
+    """
+    chunks: list = []
+    remaining = limit
+    end_time: Optional[int] = None
+    while remaining > 0:
+        batch = min(remaining, 1500)
+        df = _klines("30m", batch, symbol, end_time=end_time)
+        if df.empty:
+            break
+        chunks.append(df)
+        remaining -= len(df)
+        if remaining <= 0 or len(df) < batch:
+            break
+        end_time = int(df.index[0].value // 10 ** 6) - 1  # 1ms before earliest bar
+
+    result = pd.concat(chunks[::-1]).sort_index()
+    result = result[~result.index.duplicated(keep="first")]
+    return result.tail(limit)
+
+
 def fetch_5m_bars_extended(symbol: str = SYMBOL, limit: int = 20000) -> pd.DataFrame:
     """
     Fetch extended 5M OHLCV history from production FAPI (reuses `_klines`,

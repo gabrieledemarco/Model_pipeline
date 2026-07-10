@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hourly health check for the 5 live_trader.py strategy processes.
+# Hourly health check for the 7 live_trader.py strategy processes.
 # Reports status for each strategy and restarts any that are dead.
 set -uo pipefail
 
@@ -13,6 +13,8 @@ declare -A LAUNCH_ARGS=(
   [ict_silver_bullet_ny_am_pm_bybit]="--exchange bybit --strategy-type ict --log-level INFO"
   [s07_ou_mean_reversion_hmm_gated_bybit]="--exchange bybit --strategy-type ou_hmm --log-level INFO"
   [ml_randomforest_8h_bybit]="--exchange bybit --strategy-type ml_rf_8h --log-level INFO"
+  [smc_ltf_v1_structure_baseline_bybit]="--exchange bybit --strategy-type smc_v1 --log-level INFO"
+  [smc_ltf_v2_regime_sweep_bybit]="--exchange bybit --strategy-type smc_v2 --log-level INFO"
 )
 
 NOW=$(date -u +%s)
