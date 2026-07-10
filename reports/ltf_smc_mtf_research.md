@@ -11,18 +11,21 @@ BTCUSDT — LTF Market Structure / SMC / Liquidity — MTF Strategy Research
   V3 + Expected-Return Gate     n=  236  ret=   +9.8%  mdd=  -8.4%  wr= 49.6%  (WFO-OOS chained)
   V4 + CVD Order-Flow           n=  208  ret=   +9.3%  mdd=  -5.1%  wr= 48.6%  (WFO-OOS chained)
   V5 + Neural Expected-Return   n=  364  ret=  +31.0%  mdd=  -7.6%  wr= 52.7%  (WFO-OOS chained)
+  V6 + CVD Single-Bar Fix       n=  450  ret=  +44.0%  mdd=  -8.1%  wr= 51.8%  (WFO-OOS chained)
 
-  Deflated Sharpe Ratio (family N=5, threshold=0.95):
+  Deflated Sharpe Ratio (family N=6, threshold=0.95):
     V1 Structure Baseline         sharpe_hat=+7.394  DSR=1.000  PASS
     V2 + Regime + Sweep           sharpe_hat=+3.895  DSR=1.000  PASS
     V3 + Expected-Return Gate     sharpe_hat=+0.994  DSR=0.000  FAIL
     V4 + CVD Order-Flow           sharpe_hat=+1.073  DSR=0.000  FAIL
     V5 + Neural Expected-Return   sharpe_hat=+2.431  DSR=0.000  FAIL
+    V6 + CVD Single-Bar Fix       sharpe_hat=+2.969  DSR=0.108  FAIL
   V1 Structure Baseline         n>=30:True  OOS>0:True  P(ruin)<10%:True  DSR>=0.95:True  holdout>0:True  -> VALIDATA
   V2 + Regime + Sweep           n>=30:True  OOS>0:True  P(ruin)<10%:True  DSR>=0.95:True  holdout>0:True  -> VALIDATA
   V3 + Expected-Return Gate     n>=30:True  OOS>0:True  P(ruin)<10%:True  DSR>=0.95:False  holdout>0:False  -> NON VALIDATA
   V4 + CVD Order-Flow           n>=30:True  OOS>0:True  P(ruin)<10%:True  DSR>=0.95:False  holdout>0:True  -> NON VALIDATA
   V5 + Neural Expected-Return   n>=30:True  OOS>0:True  P(ruin)<10%:True  DSR>=0.95:False  holdout>0:True  -> NON VALIDATA
+  V6 + CVD Single-Bar Fix       n>=30:True  OOS>0:True  P(ruin)<10%:True  DSR>=0.95:False  holdout>0:True  -> NON VALIDATA
 
   Breakdown per anno (OOS chained):
 
@@ -65,4 +68,12 @@ BTCUSDT — LTF Market Structure / SMC / Liquidity — MTF Strategy Research
         2024    136    +13.2%   52.2%
         2025     74     -1.0%   51.4%
         2026     41     +6.4%   53.7%
+
+    V6 + CVD Single-Bar Fix
+        Year      n      Ret%      WR
+        2022     56     +5.0%   51.8%
+        2023     66     +7.5%   53.0%
+        2024    155     +9.0%   45.8%
+        2025    132    +17.2%   57.6%
+        2026     41     +5.3%   53.7%
 ```

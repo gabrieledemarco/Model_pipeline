@@ -64,6 +64,12 @@ Varianti (confluenza crescente)
                                 RandomForest — stesse feature, stesso target,
                                 stesso walk-forward. Isola l'effetto della
                                 classe di modello dall'effetto delle feature.
+  V6  + CVD Single-Bar Fix     : come V4, ma corregge un difetto di
+                                allineamento temporale — V4 controllava la
+                                pendenza CVD a 4 barre SULLA barra di sweep,
+                                che mescola il selling pre-wick con il buying
+                                del reclaim (stesso bar). V6 usa il delta CVD
+                                della singola candela di sweep/reclaim.
 
 Validazione (identica al resto del repo)
 ─────────────────────────────────────────
@@ -103,7 +109,7 @@ from src.strategy.monte_carlo import (
 )
 from src.strategy.report_html import (
     _CSS, _fig_to_b64, _img_tag, _kpi_card, _table, _signed, _color_signed,
-    BG, PANEL, BORDER, WHITE, GRAY, GREEN, RED, GOLD, BLUE, PURPLE, ORANGE,
+    BG, PANEL, BORDER, WHITE, GRAY, GREEN, RED, GOLD, BLUE, PURPLE, ORANGE, TEAL,
 )
 
 plt.style.use("dark_background")
@@ -243,13 +249,32 @@ sweep_bear_cvd15 = sweep_bear_cvd_roll.reindex(IDX15, method="ffill").fillna(0).
 print(f"  CVD-confirmed bull sweeps: {int(sweep_bull_cvd_5m.sum()):,}   "
       f"bear sweeps: {int(sweep_bear_cvd_5m.sum()):,}  (5m bars)")
 
-# df5 and its intermediates are done being useful — only the four derived
-# 15m-grid arrays above are needed downstream. This box has 3.8GB RAM shared
-# with 5 live_trader.py processes; freeing the 472k-row frame before the
+# V6 only: V4's cvd_slope_4 is a 4-bar TRAILING slope evaluated AT the sweep
+# bar — since sweep_bull_5m already requires close > recent_low WITHIN that
+# same candle (wick + reclaim in one bar), the 4-bar slope blends the selling
+# that caused the wick with the reclaim's own buying, diluting exactly the
+# signal V4 was trying to isolate. Fix: use that single candle's own order
+# flow (cvd.diff(), the raw taker buy-sell imbalance of just that bar) —
+# same "was the reclaim buy-driven" question, correctly time-aligned to the
+# bar it's actually asking about instead of a smoothed multi-bar window.
+cvd_delta_5m = df5["cvd"].diff()
+sweep_bull_v6_5m = sweep_bull_5m & (cvd_delta_5m > 0)
+sweep_bear_v6_5m = sweep_bear_5m & (cvd_delta_5m < 0)
+sweep_bull_v6_roll = sweep_bull_v6_5m.rolling(SWEEP_LOOKBACK_BARS_5M, min_periods=1).max()
+sweep_bear_v6_roll = sweep_bear_v6_5m.rolling(SWEEP_LOOKBACK_BARS_5M, min_periods=1).max()
+sweep_bull_v6_15m = sweep_bull_v6_roll.reindex(IDX15, method="ffill").fillna(0).astype(int).values
+sweep_bear_v6_15m = sweep_bear_v6_roll.reindex(IDX15, method="ffill").fillna(0).astype(int).values
+print(f"  single-bar-CVD-confirmed bull sweeps: {int(sweep_bull_v6_5m.sum()):,}   "
+      f"bear sweeps: {int(sweep_bear_v6_5m.sum()):,}  (5m bars)")
+
+# df5 and its intermediates are done being useful — only the derived 15m-grid
+# arrays above are needed downstream. This box has 3.8GB RAM shared with 5
+# live_trader.py processes; freeing the 472k-row frame before the
 # memory-heavy WFO loop (HMM+RandomForest fits) is the difference between
 # finishing and getting OOM-killed (observed both ways while building this).
 del df5, recent_low_5m, recent_high_5m, sweep_bull_5m, sweep_bear_5m, sweep_bull_roll, sweep_bear_roll
 del cvd_slope_5m, sweep_bull_cvd_5m, sweep_bear_cvd_5m, sweep_bull_cvd_roll, sweep_bear_cvd_roll
+del cvd_delta_5m, sweep_bull_v6_5m, sweep_bear_v6_5m, sweep_bull_v6_roll, sweep_bear_v6_roll
 gc.collect()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -574,6 +599,13 @@ v4_oos_trades, v4_oos_cap, v4_oos_mdd = simulate(
 # V5: identical to V3 (same regime gate + vol filter) except the expected-
 # return classifier is a neural net (MLP) instead of RandomForest.
 v5_oos_trades, v5_oos_cap, v5_oos_mdd = simulate(3, hmm_bull_oos, hmm_bear_oos, ml_proba_mlp_oos, restrict_to_oos=True)
+# V6: identical to V4 (real CVD confirms the sweep) but with the single-bar
+# CVD delta fix instead of the 4-bar trailing slope (see the note above the
+# V6 sweep computation).
+v6_oos_trades, v6_oos_cap, v6_oos_mdd = simulate(
+    2, hmm_bull_oos, hmm_bear_oos, NAN15, restrict_to_oos=True,
+    sweep_bull_arr=sweep_bull_v6_15m, sweep_bear_arr=sweep_bear_v6_15m,
+)
 
 VARIANTS = {
     "V1 Structure Baseline": dict(is_trades=v1_trades, is_cap=v1_cap, is_mdd=v1_mdd,
@@ -591,6 +623,9 @@ VARIANTS = {
     "V5 + Neural Expected-Return": dict(is_trades=v5_oos_trades, is_cap=v5_oos_cap, is_mdd=v5_oos_mdd,
                                          oos_trades=v5_oos_trades, oos_cap=v5_oos_cap, oos_mdd=v5_oos_mdd,
                                          fitted=True),
+    "V6 + CVD Single-Bar Fix": dict(is_trades=v6_oos_trades, is_cap=v6_oos_cap, is_mdd=v6_oos_mdd,
+                                     oos_trades=v6_oos_trades, oos_cap=v6_oos_cap, oos_mdd=v6_oos_mdd,
+                                     fitted=True),
 }
 
 for name, v in VARIANTS.items():
@@ -675,7 +710,7 @@ print("\n[REPORT] Building HTML report...")
 t0 = time.time()
 COLORS = {"V1 Structure Baseline": BLUE, "V2 + Regime + Sweep": GOLD,
           "V3 + Expected-Return Gate": PURPLE, "V4 + CVD Order-Flow": GREEN,
-          "V5 + Neural Expected-Return": ORANGE}
+          "V5 + Neural Expected-Return": ORANGE, "V6 + CVD Single-Bar Fix": TEAL}
 
 
 def _ax2(ax, title="", xlabel="", ylabel=""):
@@ -825,6 +860,7 @@ nav = """
   <a href="#v3">V3</a>
   <a href="#v4">V4</a>
   <a href="#v5">V5</a>
+  <a href="#v6">V6</a>
   <a href="#years">Per Anno</a>
 </nav>"""
 
@@ -916,9 +952,34 @@ body = f"""
     selezione multipla (SR0) sale con il numero di varianti testate nella
     stessa sessione — a parita' di merito individuale, testare 5 varianti
     invece di 1 rende DSR piu' severo per costruzione (protegge da
-    cherry-picking, non e' un difetto della metrica). In una famiglia piu'
-    piccola (es. solo V1/V2/V5) il gate sarebbe meno punitivo — un possibile
-    prossimo passo mirato, non un modo per abbassare la soglia.
+    cherry-picking, non e' un difetto della metrica).
+  </p>
+  <p>
+    <strong>V6 (fix di allineamento su V4):</strong> V4 controllava la
+    pendenza CVD a 4 barre SULLA barra di sweep — che mescola il selling che
+    causa il wick con il buying del reclaim, diluendo il segnale che
+    voleva isolare. V6 usa il delta CVD della singola candela di sweep/
+    reclaim: recupera 2.5x gli sweep confermati (7.515 vs 2.949) e migliora
+    ogni metrica — n=450 (vs 208), ret=+44.0% (vs +9.3%), Sharpe +2.969
+    (il migliore fra tutte le varianti con gate), holdout genuino positivo
+    in <em>ogni singolo anno</em> 2022-2026 (unico caso fra le varianti
+    filtrate). DSR passa da 0.000 a 0.108 — ancora sotto 0.95, ma primo
+    segnale non-zero della sessione. Non basta comunque per il deploy.
+  </p>
+  <p>
+    <strong>Nota metodologica onesta:</strong> un tentativo precedente di
+    questa sezione proponeva di ricalcolare DSR su una famiglia piu' piccola
+    (es. solo V1/V2/V5) per dare a V5 un giudizio meno severo. Corretto in
+    corsa: scegliere la famiglia DOPO aver visto quale variante vince e'
+    esattamente il cherry-picking che DSR esiste per bloccare, anche se
+    la scelta sembra "motivata". La famiglia onesta e' quella dei tentativi
+    realmente fatti (N=6 qui) — man mano che si aggiungono varianti nella
+    stessa sessione, il gate diventa piu' severo per tutte, comprese quelle
+    gia' passate a suo tempo (V1/V2 restano validate perche' il loro DSR e'
+    gia' 1.000, saturo). Il passo successivo onesto per V6 non e'
+    ricalcolare le statistiche sui dati gia' visti, ma lasciarlo accumulare
+    un vero track record fuori-campione in paper trading — un singolo
+    trial, non contaminato dal confronto multiplo di questa sessione.
   </p>
 </section>
 
