@@ -94,7 +94,11 @@ OBV_  = df["obv"].values
 yr_   = np.array([t.year for t in IDX], dtype=int)
 ATR1H = np.where(ATR > 0, ATR, 1.0)
 
-# ── 4H ATR mapped to 1H (shift 1 bar: use only the previous *closed* 4H bar) ──
+# ── 4H ATR mapped to 1H ──────────────────────────────────────────────────────
+# .shift(1): a 4H bar (indexed by its OPEN time) only becomes known once it
+# CLOSES, 4H after its index timestamp. Shifting one slot forward before the
+# ffill-reindex ensures every 1H bar only ever sees the most recently CLOSED
+# 4H bar's ATR — never the still-forming one (no lookahead).
 atr4h_raw = df4h["atr_14"].shift(1).reindex(IDX, method="ffill")
 ATR4H     = np.where(atr4h_raw.values > 0, atr4h_raw.values, ATR1H)
 
@@ -133,7 +137,9 @@ print(f"  Mean 4H log-ret: { {s: f'{v:.3f}%' for s,v in mean_ret_per.items()} }"
 print(f"  BULL={BULL_FULL}  BEAR={BEAR_FULL}  "
       f"SIDEWAYS={[s for s in range(HMM_STATES) if s not in (BULL_FULL,BEAR_FULL)][0]}")
 
-# Map to 1H resolution (shift 1 bar: use only the previous *closed* 4H bar)
+# Map to 1H resolution
+# .shift(1) for the same no-lookahead reason as ATR4H above: a 4H bar's HMM
+# state (derived from its close) is only known once that bar closes.
 hmm_regime_1h = (pd.Series(states_full, index=df4h.index)
                  .shift(1)
                  .reindex(IDX, method="ffill").values.astype(float))
@@ -388,12 +394,18 @@ def run_wf_hmm(events_all, tp_frac, sl_frac):
             states_tail = hmm_w.predict(X_tail)
         except Exception:
             continue
+        # .shift(1) BEFORE masking to OOS: a 4H bar's state is only known once
+        # it closes, so the state that becomes "visible" at timestamp T is the
+        # PREVIOUS bar's (the one that closed exactly at T). Shifting the full
+        # tail series first (then masking) correctly carries over the state of
+        # the last IS/tail bar that closes exactly at tr_e into the first OOS
+        # slot — shifting after masking would instead just drop it as NaN.
+        states_tail_shifted = pd.Series(states_tail, index=tail_close.index).shift(1)
         oo_mask = np.asarray(tail_close.index >= tr_e)
-        oo_regime = pd.Series(states_tail[oo_mask],
-                              index=tail_close.index[oo_mask])
-        # map to 1H (shift 1 bar: use only the previous *closed* 4H bar)
+        oo_regime = states_tail_shifted[oo_mask]
+        # map to 1H
         idx_oos_1h  = IDX[(IDX>=tr_e)&(IDX<oo_e)]
-        oo_reg_1h   = oo_regime.shift(1).reindex(idx_oos_1h, method="ffill")
+        oo_reg_1h   = oo_regime.reindex(idx_oos_1h, method="ffill")
 
         # ── filter OOS events ─────────────────────────────────────────────
         oo_ev_all = [e for e in events_all if tr_e<=e["ts"]<oo_e]
@@ -537,7 +549,10 @@ print("  IC comparison — BASE / MTF_EMA_FILT / MTF_HMM_FILT")
 print(SEP)
 
 # EMA filter (4H EMA30 from create_mtf_report)
+# .shift(1): same no-lookahead fix as ATR4H/HMM regime above — the 4H EMA
+# value is only known once that 4H bar closes.
 ema30_4h_s = (df4h["close"].ewm(span=30,adjust=False).mean()
+              .shift(1)
               .reindex(IDX,method="ffill").values)
 ema_long_ok  = CL > ema30_4h_s
 ema_short_ok = CL < ema30_4h_s

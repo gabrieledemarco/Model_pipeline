@@ -134,11 +134,24 @@ def align_htf_to_ltf(htf_index: pd.DatetimeIndex, htf_df: pd.DataFrame,
     each HTF bar's close.
     """
     htf = htf_df.copy()
+    # rename_axis(None) before reset_index(): callers may pass an index with
+    # a name (e.g. "open_time" from src.live.data_live's klines fetchers),
+    # which would make reset_index() emit that name as the column instead of
+    # "index", leaving the rename below a no-op and merge_asof's on="ts"
+    # unresolvable.
     htf.index = htf_index
-    ltf_frame = pd.DataFrame(index=ltf_index)
+    # merge_asof requires both join keys to share the exact same datetime64
+    # unit (ms/us/ns). Callers routinely build htf_index via arithmetic like
+    # `some_index + pd.Timedelta(days=1)` (the day+1 causality trick used by
+    # volume_profile.py / the vol-regime daily bucket), which silently
+    # upcasts the result to a different unit than ltf_index — normalize here
+    # once so every caller doesn't have to remember to cast back.
+    if htf.index.dtype != ltf_index.dtype:
+        htf.index = htf.index.astype(ltf_index.dtype)
+    ltf_frame = pd.DataFrame(index=ltf_index).rename_axis(None)
     merged = pd.merge_asof(
         ltf_frame.reset_index().rename(columns={"index": "ts"}),
-        htf.reset_index().rename(columns={"index": "ts"}),
+        htf.rename_axis(None).reset_index().rename(columns={"index": "ts"}),
         on="ts", direction="backward",
     )
     merged.index = ltf_index
