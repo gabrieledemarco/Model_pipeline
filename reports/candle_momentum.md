@@ -240,21 +240,21 @@ trade indipendenti. La metrica corretta da guardare è **mean/trade**
 (circa -0,08% per trade, sorprendentemente stabile su tutti gli hold) e
 il **win rate**.
 
-**Interpretazione**: il segnale non è debole, è **invertito**. Dopo una
-candela verde, il prezzo tende a MUOVERSI IN SENSO CONTRARIO (mean-reversion
-di brevissimo termine / bid-ask bounce) molto più spesso di quanto continui
-— specialmente a 1 minuto, dove solo il 9,7% dei trade momentum è vincente.
-Il filtro volume non cambia la sostanza (win rate quasi identico con o
-senza). All'aumentare dell'hold (5→15 min) il win rate sale (9,7%→31,1%)
-perché il rumore di brevissimo termine viene progressivamente diluito da
-movimento più genuinamente direzionale, ma resta comunque ben sotto il 50%.
+**⚠️ CORREZIONE (dopo il test della strategia speculare in
+`candle_fade.md`): l'interpretazione "segnale invertito / bid-ask bounce"
+scritta qui sotto in origine era SBAGLIATA.** Testando la fade (short dopo
+verde, long dopo rosso) il win rate è risultato quasi identico a questo
+report (9,9% vs 9,7% a 1 minuto), non il suo complementare (~90% come
+l'ipotesi di reversal avrebbe previsto). La causa reale, verificata con un
+diagnostico sul return lordo (senza fee): il colore della candela non ha
+ALCUN potere predittivo (win rate lordo ≈ 48,8-49,1%, un coin-flip in
+entrambe le direzioni) — il crollo del win rate netto è dovuto alla fee
+(0,08% round-trip) che a 1 minuto supera il movimento di prezzo tipico
+nell'80% dei casi. Dettagli completi e un ulteriore tentativo di soluzione
+(filtro sulla dimensione della candela) in `reports/candle_fade.md`.
 
-**Implicazione interessante (non testata qui)**: se il momentum a 1 minuto
-ha un win rate del 9,7%, la strategia SPECULARE — FADARE la candela (short
-dopo una candela verde, long dopo una candela rossa) — avrebbe un win rate
-implicito del ~90,3% a 1 minuto. Questo è un classico effetto di
-microstruttura (bid-ask bounce) ben documentato in letteratura, ma non
-dice ancora nulla sulla profittabilità netta: serve verificare la
-dimensione media di vincita/perdita e il netto delle fee prima di
-concludere che sia sfruttabile — un test naturale da fare come prossimo
-passo se interessa.
+~~**Interpretazione (ERRATA, lasciata per traccia)**: il segnale non è
+debole, è invertito. Dopo una candela verde, il prezzo tende a MUOVERSI IN
+SENSO CONTRARIO (mean-reversion di brevissimo termine / bid-ask bounce)
+molto più spesso di quanto continui — specialmente a 1 minuto, dove solo
+il 9,7% dei trade momentum è vincente.~~
