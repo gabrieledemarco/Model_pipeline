@@ -92,11 +92,53 @@ for hold in HOLD_TESTS:
     w()
 
 w("=" * 78)
-w("[CONCLUSIONE] Il colore della candela 1m non ha potere predittivo lordo "
-  "(win rate ~48.8-49.1%, un coin-flip). Filtrare per body grande rivela una "
-  "leggera tendenza a INVERTIRSI (win rate di continuazione scende con la "
+w("[CONCLUSIONE parziale] Il colore della candela 1m non ha potere predittivo "
+  "lordo (win rate ~48.8-49.1%, un coin-flip). Filtrare per body grande rivela "
+  "una leggera tendenza a INVERTIRSI (win rate di continuazione scende con la "
   "dimensione del body), ma l'effetto (<2bps anche nei casi estremi) resta "
   "un ordine di grandezza sotto la fee round-trip (8bps) — non sfruttabile.")
+w("=" * 78)
+
+# ── [3] "Big trades hold information for the next 20 minutes" — claim specifica
+# citata dall'utente (fonte: reel Instagram @matfinog). Testata con una
+# soglia di volume molto più selettiva (percentile su finestra scorrevole di
+# 24h, non la media mobile 20 barre usata sopra) e orizzonti fino a 8 ore,
+# sia in direzione MOMENTUM (segui il big trade) sia FADE.
+w("\n[3] Claim specifica: 'big trades hold information for the next 20 minutes' "
+  "(volume = top X% della finestra scorrevole 24h, causale)")
+
+WIN_BIG = 1440
+roll_rank = pd.Series(VOL).rolling(WIN_BIG).apply(lambda x: (x[-1] > x[:-1]).mean(), raw=True).values
+HOLDS_EXT = [1, 2, 5, 10, 15, 20, 30, 60, 120, 240, 480]
+
+for pct_thresh in [0.99, 0.999]:
+    w(f"\n  Soglia: volume nel top {(1-pct_thresh)*100:.2f}% della finestra 24h — "
+      f"direzione FADE (short big-green, long big-red):")
+    w(f"  {'Hold':>6}  {'n':>8}  {'fade WR':>9}  {'fade gross%':>13}  {'fade net%':>11}")
+    for hold in HOLDS_EXT:
+        entry_i = np.arange(WIN_BIG, N - hold - 2)
+        ep = OP[entry_i + 1]; xp = OP[entry_i + 1 + hold]
+        gross_ret_long = (xp - ep) / ep
+        d_mom = np.where(green[entry_i], 1, np.where(red[entry_i], -1, 0))
+        d_fade = -d_mom
+        big = roll_rank[entry_i] >= pct_thresh
+        mask = (d_mom != 0) & big & ~np.isnan(roll_rank[entry_i])
+        if mask.sum() < 100: continue
+        gm = d_fade[mask] * gross_ret_long[mask]
+        w(f"  {hold:>4}m  {mask.sum():>8}  {(gm>0).mean():>8.1%}  {gm.mean()*100:>12.5f}%  "
+          f"{(gm.mean()-FEE_RT)*100:>10.5f}%")
+
+w(f"\n{'=' * 78}")
+w("[CONCLUSIONE FINALE] Anche isolando le candele con volume genuinamente "
+  "estremo (top 1% e top 0.1% di una finestra di 24h, non solo 'sopra la "
+  "media 20 barre') e testando orizzonti fino a 8 ore, l'effetto lordo "
+  "massimo osservato è ~2.2 bps (fade, top 1%, hold 30min) — un quarto "
+  "della fee round-trip (8bps) — e decade verso il rumore su orizzonti più "
+  "lunghi (240-480min). La claim 'big trades hold information for the next "
+  "20 minutes' non è verificabile con dati OHLCV aggregati a 1 minuto: "
+  "servirebbero dati order-flow/Level 2 (aggressore reale, bid/ask "
+  "imbalance) per isolare i 'big trade' veri, di cui il volume di barra 1m "
+  "è solo un proxy molto rumoroso.")
 w("=" * 78)
 
 out_path = Path("reports/candle_diagnostics.md")
