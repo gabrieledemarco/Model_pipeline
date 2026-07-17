@@ -74,6 +74,8 @@ FEE_MAKER = 0.00020              # fill a livello griglia (ordine limite)
 FEE_TAKER = 0.00055              # chiusure forzate (stop / fine periodo)
 CUTOFF = pd.Timestamp("2025-01-01")
 N_SIMS = 5_000
+MC_MAX_TRADES = 1_500   # grid trading produces very large trade counts (>100k for
+MC_N_SIMS = 1_000       # fine grids); subsample for MC as done for candle-momentum/VWAP-trend
 N_GRID_GRID = [5, 10, 20]
 STOP_BUFFER_ATR = 0.25
 SLIPPAGE_TESTS_BPS = [0, 2, 5, 10]
@@ -201,14 +203,23 @@ def run_variant(df, period_freq_or_norm, label):
         return dict(n=n, wr=wr, ret=(cap / INIT_CAP - 1) * 100, mdd=mdd * 100, net_pnls=net_pnls,
                     bar_idx=bar_idx_of_trade, n_buy=n_buy, n_sl_force=n_sl_force, n_period_force=n_period_force)
 
+    def _maybe_subsample(pnls, seed=42):
+        if len(pnls) <= MC_MAX_TRADES:
+            return pnls
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(pnls), size=MC_MAX_TRADES, replace=False)
+        return [pnls[k] for k in idx]
+
     def mc_summary(pnls):
         if len(pnls) < 5: return dict(p_profit=0.0, p_ruin=1.0)
-        mc = run_monte_carlo(pd.DataFrame({"net_pnl": pnls}), INIT_CAP, N_SIMS)
+        sub = _maybe_subsample(pnls)
+        mc = run_monte_carlo(pd.DataFrame({"net_pnl": sub}), INIT_CAP, MC_N_SIMS)
         return dict(p_profit=float(mc.get("p_profit", 0.0)), p_ruin=float(mc.get("p_ruin", 1.0)))
 
     def mc_block_summary(pnls, block_size=10):
         if len(pnls) < 5: return dict(p_profit=0.0, p_ruin=1.0)
-        mc = run_monte_carlo_block(pd.DataFrame({"net_pnl": pnls}), INIT_CAP, N_SIMS, block_size=block_size)
+        sub = _maybe_subsample(pnls)
+        mc = run_monte_carlo_block(pd.DataFrame({"net_pnl": sub}), INIT_CAP, MC_N_SIMS, block_size=block_size)
         return dict(p_profit=float(mc.get("p_profit", 0.0)), p_ruin=float(mc.get("p_ruin", 1.0)))
 
     w(f"\n{SEP}")
