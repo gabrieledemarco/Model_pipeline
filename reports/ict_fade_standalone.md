@@ -182,3 +182,11 @@ questa sessione (DSR, holdout genuino, Monte Carlo i.i.d.+block, frizioni
 Bybit reali, slippage-stress) — il risultato più solido e completo
 dell'intera esplorazione ICT/SMC, e il migliore in assoluto per
 consistenza anno-su-anno.
+
+**Evoluzione del capitale vs buy & hold**: `ict_fade_equity_vs_bh.png`.
+La strategia (+513%) rende meno del buy & hold (+717%) in termini
+assoluti, ma con una curva nettamente più regolare — senza i drawdown
+severi del 2020 (crollo COVID), 2022 (bear market) o dell'holdout
+2025-2026, dove il buy & hold perde circa un terzo dal picco mentre la
+strategia continua a salire. Un profilo rischio/rendimento migliore, non
+solo un rendimento più alto.
