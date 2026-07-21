@@ -220,7 +220,7 @@ EUR_CAPITALS = [1000, 2000, 3000]
 COMMISSION_EUR = 1.5   # flat cost per ETF order leg, typical low-cost EU broker
 
 
-def run_small_account_simulation(panel, cash_nav, plan, start_date):
+def run_small_account_simulation(panel, cash_nav, plan, start_date, sectors=None):
     """
     Re-run the final strategy at retail account sizes, in EUR, contrasting an
     idealized (fractional-share) fill against a realistic one (whole shares +
@@ -229,6 +229,7 @@ def run_small_account_simulation(panel, cash_nav, plan, start_date):
     A single-purchase SPY buy & hold at the same capital is included as the
     "do nothing fancy" alternative.
     """
+    sectors = ALL_SECTORS if sectors is None else sectors
     fx = fetch_daily_ohlcv("EURUSD=X")
     fx_close = fx["close"].reindex(panel.index).ffill().bfill()
     fx_start = float(fx_close.loc[start_date])
@@ -237,8 +238,8 @@ def run_small_account_simulation(panel, cash_nav, plan, start_date):
     for cap_eur in EUR_CAPITALS:
         cap_usd = cap_eur * fx_start
 
-        ideal_bt = run_portfolio_backtest(panel, cash_nav, plan, ALL_SECTORS, initial_capital=cap_usd)
-        real_bt = run_portfolio_backtest(panel, cash_nav, plan, ALL_SECTORS, initial_capital=cap_usd,
+        ideal_bt = run_portfolio_backtest(panel, cash_nav, plan, sectors, initial_capital=cap_usd)
+        real_bt = run_portfolio_backtest(panel, cash_nav, plan, sectors, initial_capital=cap_usd,
                                           whole_shares=True, commission_per_leg=COMMISSION_EUR)
 
         spy_px_start = float(panel["SPY"].loc[start_date])
@@ -309,12 +310,13 @@ def _spy_dca_whole_share(spy_px: pd.Series, exec_dates: pd.DatetimeIndex,
     return pd.Series(values, index=exec_dates), months_skipped
 
 
-def run_dca_simulation(panel, cash_nav, plan, start_date):
+def run_dca_simulation(panel, cash_nav, plan, start_date, sectors=None):
     """
     €1,000 initial + €150/month recurring contribution. CAGR is not meaningful
     once external cash is added mid-period, so results are summarised with
     final value, total contributed, and the money-weighted IRR instead.
     """
+    sectors = ALL_SECTORS if sectors is None else sectors
     exec_dates = plan.index
     fx = fetch_daily_ohlcv("EURUSD=X")
     fx_close = fx["close"].reindex(panel.index).ffill().bfill()
@@ -323,9 +325,9 @@ def run_dca_simulation(panel, cash_nav, plan, start_date):
     contrib_usd.loc[exec_dates[1:]] = DCA_MONTHLY_EUR * fx_close.loc[exec_dates[1:]].values
     initial_usd = DCA_INITIAL_EUR * float(fx_close.loc[start_date])
 
-    ideal_bt = run_portfolio_backtest(panel, cash_nav, plan, ALL_SECTORS,
+    ideal_bt = run_portfolio_backtest(panel, cash_nav, plan, sectors,
                                        initial_capital=initial_usd, contributions=contrib_usd)
-    real_bt = run_portfolio_backtest(panel, cash_nav, plan, ALL_SECTORS,
+    real_bt = run_portfolio_backtest(panel, cash_nav, plan, sectors,
                                       initial_capital=initial_usd, contributions=contrib_usd,
                                       whole_shares=True, commission_per_leg=COMMISSION_EUR)
     spy_dca_usd, spy_months_skipped = _spy_dca_whole_share(
