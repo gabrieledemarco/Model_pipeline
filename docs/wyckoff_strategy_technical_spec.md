@@ -1,6 +1,22 @@
 # Wyckoff Spring/Upthrust Strategy — Specifiche Tecniche
 ## BTCUSDT Perpetual Futures | Implementazione Live
 
+> **⚠️ NOTA DI CORREZIONE (2026-08-04):** questo documento (e il motore di
+> backtest `src/strategy/engine.py` su cui si basa) usa `FEE=0.04%` per lato
+> (round-trip 0.08%), stile Binance spot/taker light — **non** le frizioni
+> Bybit derivatives reali (taker 0.055% + slippage 0.015%/lato, round-trip
+> 0.14%) usate come standard obbligatorio nel resto di questa sessione di
+> validazione. Una ri-validazione indipendente con frizioni Bybit corrette
+> (`create_wyckoff_bybit_validation_report.py`, stesso segnale causale
+> `src/strategy/wyckoff.py`, stop ATR fisso + griglia RR con DSR family al
+> posto della WFO Calmar-based di questo documento) **non supera la
+> correzione DSR sul full-sample** (DSR max = 0.099 a RR=2.0, mai 1.000) —
+> vedi `reports/wyckoff_bybit_validation.md`. L'edge documentato qui sotto
+> (+12.7/+18.3% su 6.5 anni) era già sottile con frizioni più leggere;
+> **non risulta validato sotto lo standard di costo reale Bybit di questa
+> sessione.** Trattare questo documento come archivio storico, non come
+> spec pronta per il live.
+
 **Documento:** Specifiche Tecniche v1.0  
 **Data:** 2026-06-25  
 **Asset:** BTCUSDT Perpetual Futures (Binance)  

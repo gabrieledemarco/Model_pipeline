@@ -1,11 +1,19 @@
-# BTCUSDT Perpetual — Time-Series Momentum (TSMOM-sign pool) Strategy (Candidata a Paper Trading)
+# BTCUSDT Perpetual — Time-Series Momentum (TSMOM-sign pool) Strategy (ARCHIVIATA — non idonea al live)
+
+> **⛔ ESCLUSA dal set di strategie live (2026-08-04).** Nuovo requisito di sessione:
+> le strategie candidate al live devono operare su timeframe **intraday**. Questa
+> strategia usa timeframe **1D**, quindi non è idonea a prescindere dalla qualità
+> statistica del risultato (che resta valida e documentata qui sotto come
+> **archivio storico di ricerca**). Non validarla per il live. Vedi
+> `reports/carver_intraday_4h.md` per il tentativo di porting a timeframe
+> intraday e il relativo esito.
 
 **Simbolo:** BTCUSDT Perpetual (Bybit)
 **Timeframe base:** 1D (segnale, sizing ed esecuzione — nessun altro timeframe richiesto)
 **Periodo di validazione (backtest):** Gennaio 2020 – Luglio 2026
-**Stato:** Validata — DSR=1.000 sia full-sample sia holdout genuino 2025-2026. **L'unica strategia della sessione positiva in OGNI singolo anno del campione 2020-2026 e la più robusta allo slippage** (holdout resta positivo fino a +10bps extra).
+**Stato:** Validata su 1D — DSR=1.000 sia full-sample sia holdout genuino 2025-2026. **L'unica strategia della sessione positiva in OGNI singolo anno del campione 2020-2026 e la più robusta allo slippage** (holdout resta positivo fino a +10bps extra). **Esclusa dal live per vincolo di timeframe (Sezione di apertura).**
 **⚠️ Non ancora validata su book/tick reali — vedi "Avvertenze critiche" prima di allocare capitale reale.**
-**Prossimo passo raccomandato:** Paper trading live in parallelo a Carver Breakout pool (bassa correlazione attesa: costruzione basata sul segno del rendimento, non sull'ampiezza).
+**Prossimo passo raccomandato:** Nessuno — strategia archiviata. Vedi il porting intraday.
 
 ---
 
