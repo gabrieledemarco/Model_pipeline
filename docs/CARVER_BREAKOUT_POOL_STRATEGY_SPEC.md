@@ -4,10 +4,10 @@
 > le strategie candidate al live devono operare su timeframe **intraday**. Questa
 > strategia usa timeframe **1D**, quindi non è idonea a prescindere dalla qualità
 > statistica del risultato (che resta valida e documentata qui sotto come
-> **archivio storico di ricerca**). Non validarla per il live. Vedi
-> `docs/CARVER_BREAKOUT_INTRADAY_4H_STRATEGY_SPEC.md` (o il report più recente
-> `reports/carver_intraday_4h.md`) per il tentativo di porting a timeframe
-> intraday e il relativo esito.
+> **archivio storico di ricerca**). Non validarla per il live. Il porting a
+> timeframe intraday (4H) è **riuscito** (DSR=1.000 full-sample+holdout) — vedi
+> `docs/CARVER_BREAKOUT_INTRADAY_4H_STRATEGY_SPEC.md` (spec live) e
+> `reports/carver_intraday_4h.md` (report completo).
 
 **Simbolo:** BTCUSDT Perpetual (Bybit)
 **Timeframe base:** 1D (segnale, sizing ed esecuzione — nessun altro timeframe richiesto)
